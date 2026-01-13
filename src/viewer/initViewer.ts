@@ -19,6 +19,26 @@ export type ViewerContext = {
   classifier: any;
 };
 
+
+// Compute an ISO start pose given an object and its bounding sphere
+async function waitForNonEmptyBounds(obj: THREE.Object3D, maxFrames = 30) {
+  const box = new THREE.Box3();
+
+  for (let i = 0; i < maxFrames; i++) {
+    box.setFromObject(obj);
+
+    if (!box.isEmpty()) return box.clone();
+
+    // wait one frame and try again
+    await new Promise<void>((r) => requestAnimationFrame(() => r()));
+  }
+
+  return null;
+}
+
+
+
+
 export async function initViewer(viewerDiv: HTMLDivElement): Promise<ViewerContext> {
   const components = new OBC.Components();
 
@@ -35,6 +55,10 @@ export async function initViewer(viewerDiv: HTMLDivElement): Promise<ViewerConte
 
   world.renderer = new OBC.SimpleRenderer(components, viewerDiv);
   world.camera = new OBC.OrthoPerspectiveCamera(components);
+
+  // Ensure snapshots include rendered image data
+(world.renderer.three as any).preserveDrawingBuffer = true;
+
 
   // your initial pose
   await world.camera.controls.setLookAt(78, 20, -2.2, 26, -4, 25);
@@ -68,12 +92,59 @@ export async function initViewer(viewerDiv: HTMLDivElement): Promise<ViewerConte
     world.scene.three.add(model.object);
     fragments.core.update(true);
 
-    // fit camera
-    const box = new THREE.Box3().setFromObject(model.object);
-    const sphere = box.getBoundingSphere(new THREE.Sphere());
-    world.camera.controls.fitToSphere(sphere, true);
 
-    await new Promise(requestAnimationFrame);
+
+
+    // fit camera
+// fit camera (robust baseline)
+// ensure fragments update (sometimes necessary before bounds are valid)
+fragments.core.update(true);
+
+// Wait until geometry exists so Box3 isn't empty
+const box = await waitForNonEmptyBounds(model.object, 40);
+
+if (!box) {
+  console.warn("[Viewer] Model bounds still empty after waiting; keeping current camera pose");
+} else {
+  const sphere = box.getBoundingSphere(new THREE.Sphere());
+
+  // Baseline fit (good fallback)
+  world.camera.controls.fitToSphere(sphere, true);
+
+  await new Promise<void>((r) => requestAnimationFrame(() => r()));
+  await new Promise<void>((r) => requestAnimationFrame(() => r()));
+
+  try {
+    // --- deterministic ISO from box (your previous approach) ---
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const radius = size.length() * 0.5;
+
+    const dir = new THREE.Vector3(1, 0.8, 1).normalize();
+    const dist = Math.max(radius * 2.2, 15);
+
+    const eye = center.clone().add(dir.clone().multiplyScalar(dist));
+    const target = center.clone().add(dir.clone().multiplyScalar(-radius * 0.6));
+
+    // clipping
+    world.camera.three.near = Math.max(radius / 2000, 0.02);
+    world.camera.three.far = Math.max(radius * 80, 8000);
+    world.camera.three.updateProjectionMatrix();
+
+    await world.camera.controls.setLookAt(
+      eye.x, eye.y, eye.z,
+      target.x, target.y, target.z,
+      true
+    );
+  } catch (e) {
+    console.warn("[Viewer] ISO start view failed; keeping fitToSphere pose", e);
+  }
+
+  await new Promise<void>((r) => requestAnimationFrame(() => r()));
+}
+
+
+
 
     _setActiveModel(model, modelId);
     viewerEvents.emit("modelLoaded", { modelId, model });

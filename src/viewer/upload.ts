@@ -17,67 +17,65 @@ export type ToastFn = (msg: string, ms?: number) => void;
 
 export function createIfcUpload(params: {
   ifcLoader: any;
+  viewerApi: { clearModel: () => Promise<void>; hasModelLoaded: () => boolean };
   toast?: ToastFn;
+  onLoadingChange?: (isLoading: boolean) => void;
 }) {
-  const { ifcLoader, toast } = params;
+  const { ifcLoader, viewerApi, toast, onLoadingChange } = params;
 
-  // Hidden input so the panel can trigger it.
+  let isLoading = false;
+
+  function setLoading(v: boolean) {
+    isLoading = v;
+    onLoadingChange?.(v);
+  }
+
   const fileInput = document.createElement("input");
   fileInput.type = "file";
   fileInput.accept = ".ifc";
   fileInput.style.display = "none";
   document.body.appendChild(fileInput);
 
-  /**
-   * Load IFC from a File object.
-   * Separated so you can reuse it later for drag&drop or remote fetching.
-   */
   async function loadIfcFromFile(file: File) {
+    setLoading(true);
     toast?.(`Loading IFC: ${file.name}`);
 
-    const data = await file.arrayBuffer();
-    const buffer = new Uint8Array(data);
-
-    console.log("[IFC] starting load:", file.name, file.size);
-
-    // same call you used previously:
-    // - second arg false: do not coordinate-to-origin? (depends on thatopen)
-    // - third arg: model name
-    await ifcLoader.load(buffer, false, file.name);
-
-    console.log("[IFC] finished load:", file.name);
-    toast?.(`Loaded IFC: ${file.name}`);
-
-    // Important: allow selecting the same file again
-    fileInput.value = "";
-  }
-
-  /**
-   * Opens the file picker.
-   * Must be called from a user gesture (button click).
-   */
-  function openFileDialog() {
-    fileInput.click();
-  }
-
-  // When user picks a file, load it
-  fileInput.addEventListener("change", async () => {
-    const file = fileInput.files?.[0];
-    console.log("[UI] fileInput change fired:", file?.name);
-
-    if (!file) return;
-
     try {
-      await loadIfcFromFile(file);
+      if (viewerApi.hasModelLoaded()) {
+        await viewerApi.clearModel();
+      }
+
+      const data = await file.arrayBuffer();
+      const buffer = new Uint8Array(data);
+
+      console.log("[IFC] starting load:", file.name, file.size);
+      await ifcLoader.load(buffer, false, file.name);
+      console.log("[IFC] finished load:", file.name);
+
+      toast?.(`Loaded IFC: ${file.name}`);
     } catch (err) {
       console.error("[IFC] load failed", err);
       toast?.("IFC load failed. Check console for details.");
+    } finally {
       fileInput.value = "";
+      setLoading(false); // <-- only this (no extra onLoadingChange call)
     }
+  }
+
+  function openFileDialog() {
+    if (isLoading) return;
+    fileInput.click();
+  }
+
+  fileInput.addEventListener("change", async () => {
+    const file = fileInput.files?.[0];
+    if (!file) return;
+    await loadIfcFromFile(file);
   });
 
   return {
     openFileDialog,
-    loadIfcFromFile, // exported for future drag/drop or tests
+    loadIfcFromFile,
+    isLoading: () => isLoading,
   };
 }

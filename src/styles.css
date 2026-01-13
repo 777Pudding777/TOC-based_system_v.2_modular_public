@@ -110,6 +110,16 @@ html, body {
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
 }
 
+/* Tip text below panel buttons */
+#overlay-top-right .panel-tip {
+  color: rgba(255, 255, 255, 0.92) !important;
+  opacity: 1 !important;
+  font-size: 12px;
+  margin-top: 8px;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.6);
+}
+
+
 /* Bottom-left toast stack */
 #overlay-bottom-left {
   position: absolute;
