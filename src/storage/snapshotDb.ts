@@ -96,13 +96,30 @@ function tx<T>(
  * Helper: base64 PNG -> Blob
  * Critical: base64 is convenient but bulky. Blob is efficient for IndexedDB.
  */
-function base64PngToBlob(dataUrl: string): Blob {
-  const [meta, base64] = dataUrl.split(",");
+function normalizeToBase64(dataUrlOrBase64: string): string {
+  const s = String(dataUrlOrBase64 ?? "").trim();
+  if (!s) return "";
+
+  // If it's a data URL: "data:image/png;base64,AAAA..."
+  if (s.startsWith("data:image/")) {
+    const parts = s.split(",");
+    return parts[1] ?? "";
+  }
+
+  // Otherwise assume it's already raw base64
+  return s;
+}
+
+function base64PngToBlob(dataUrlOrBase64: string): Blob {
+  const base64 = normalizeToBase64(dataUrlOrBase64);
+  if (!base64) return new Blob([], { type: "image/png" });
+
   const bytes = atob(base64);
   const arr = new Uint8Array(bytes.length);
   for (let i = 0; i < bytes.length; i++) arr[i] = bytes.charCodeAt(i);
   return new Blob([arr], { type: "image/png" });
 }
+
 
 export function createSnapshotDb() {
   async function ensureRun(run: StoredRun) {

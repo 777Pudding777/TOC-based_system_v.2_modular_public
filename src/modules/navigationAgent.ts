@@ -65,18 +65,20 @@ export function createNavigationAgent(params: {
     hasModelLoaded: () => boolean;
     getCameraPose: () => Promise<CameraPose>;
     setCameraPose: (pose: CameraPose, smooth?: boolean) => Promise<void>;
-
-    // NEW viewer helpers we will add (tiny, stable):
     getSelectionWorldBox: (map: OBC.ModelIdMap) => Promise<THREE.Box3 | null>;
-    getSelectionMeshes?: (map: OBC.ModelIdMap) => Promise<THREE.Object3D[]>; // optional, for occlusion raycasts
+    getSelectionMeshes?: (map: OBC.ModelIdMap) => Promise<THREE.Object3D[]>;
     getCurrentIsolateSelection: () => OBC.ModelIdMap | null;
     getThreeCamera: () => THREE.Camera;
     getRendererDomElement: () => HTMLCanvasElement;
     renderNow: () => void;
+
+    // ✅ add this here (recommended: keep it on viewerApi, not top-level)
+    getSceneObjects?: () => THREE.Object3D[];
   };
   toast?: ToastFn;
 }) : NavigationAgent {
-  const { viewerApi, toast } = params;
+const { viewerApi, toast, getSceneObjects } = params;
+
 
   // --- utilities ---
   const clamp01 = (x: number) => Math.max(0, Math.min(1, x));
@@ -145,27 +147,34 @@ export function createNavigationAgent(params: {
    * - Expensive if you do too many samples.
    * - Useful as a heuristic (not ground truth).
    */
-  async function computeOcclusionRatio(box: THREE.Box3, map: OBC.ModelIdMap, samples = 16): Promise<number | null> {
+  async function computeOcclusionRatio(
+    box: THREE.Box3,
+    map: OBC.ModelIdMap,
+    samples = 16
+  ): Promise<number | null> {
+    // Need a way to know which meshes are the target
     if (!viewerApi.getSelectionMeshes) return null;
 
     const camera = viewerApi.getThreeCamera() as THREE.PerspectiveCamera | THREE.OrthographicCamera;
     const canvas = viewerApi.getRendererDomElement();
     const rect = projectBoxToScreenRect(box, camera, canvas);
 
-    // if rect is tiny, occlusion metric is noisy; return 0 to avoid blocking
     if (rect.w * rect.h < 50) return 0;
 
     const targetRoots = await viewerApi.getSelectionMeshes(map);
     if (!targetRoots.length) return null;
 
-    // Put all target objects into a Set for fast contains checks:
+    // Build a set of all target objects (fast membership test)
     const targetSet = new Set<THREE.Object3D>();
-    for (const root of targetRoots) {
-      root.traverse((o) => targetSet.add(o));
-    }
+    for (const root of targetRoots) root.traverse((o) => targetSet.add(o));
+
+    // Raycast against the whole scene (not just target)
+    const sceneObjects = params.getSceneObjects?.() ?? [];
+    if (!sceneObjects.length) return null;
 
     const raycaster = new THREE.Raycaster();
     const step = Math.max(1, Math.floor(Math.sqrt(samples)));
+
     let total = 0;
     let occluded = 0;
 
@@ -173,7 +182,6 @@ export function createNavigationAgent(params: {
       for (let ix = 0; ix < step; ix++) {
         total++;
 
-        // sample at cell center
         const u = (ix + 0.5) / step;
         const v = (iy + 0.5) / step;
         const sx = rect.x + u * rect.w;
@@ -186,22 +194,26 @@ export function createNavigationAgent(params: {
 
         raycaster.setFromCamera(ndc, camera);
 
-        // intersect whole scene: we can start with model root later; PoC uses everything
-        // NOTE: you could pass scene children here for speed, but viewerApi doesn't expose scene.
-        const hits = raycaster.intersectObjects(targetRoots, true);
+        // Intersect full scene
+        const hits = raycaster.intersectObjects(sceneObjects, true);
 
-        // This simplified approach checks if target itself is hittable.
-        // True occlusion requires checking scene geometry before target.
-        // We'll upgrade this later once we expose scene root.
         if (!hits.length) {
-          // If ray doesn't hit target, treat as occluded (likely blocked or outside)
+          // If nothing hit, treat as occluded/no-signal
           occluded++;
+          continue;
         }
+
+        const first = hits[0].object;
+        const visible = targetSet.has(first);
+
+        if (!visible) occluded++;
       }
     }
 
     return total > 0 ? clamp01(occluded / total) : null;
   }
+
+
 
   function orbitPoseAroundTarget(current: CameraPose, center: THREE.Vector3, radiansYaw: number): CameraPose {
     const eye = new THREE.Vector3(current.eye.x, current.eye.y, current.eye.z);

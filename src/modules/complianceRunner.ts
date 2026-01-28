@@ -40,6 +40,7 @@ export function createComplianceRunner(params: {
     setPresetView: (preset: StartPosePreset, smooth?: boolean) => Promise<void>;
     setCameraPose: (pose: CameraPose, smooth?: boolean) => Promise<void>;
     getCameraPose: () => Promise<CameraPose>;
+    isolateCategory?: (category: string) => Promise<any>; // ideally OBC.ModelIdMap | null
   };
 
   // inside createComplianceRunner(...)
@@ -71,11 +72,15 @@ export function createComplianceRunner(params: {
     clearAll?: () => Promise<void>;
   };
 
-  // optional for later: plug navigation here
+  // optional navigation agent for follow-ups
   navigationAgent?: {
-    // keep it optional so runner still works without nav
-    navigateToSelection?: (map: any, opts?: any) => Promise<any>;
-    // or your helper like goToCurrentIsolateSelection once you add it
+    navigateToSelection?: (map: any, opts?: any) => Promise<{
+      targetAreaRatio: number;
+      occlusionRatio: number | null;
+      steps: number;
+      success: boolean;
+      reason: string;
+    }>;
     goToCurrentIsolateSelection?: (opts?: any) => Promise<any>;
   };
 
@@ -116,11 +121,12 @@ export function createComplianceRunner(params: {
     await viewerApi.setCameraPose(d.pose, true);
   }
 
-  function enrichNote(base: string, d: DeterministicStart) {
-    if (!d.enabled) return base + " | start=userPose";
-    if (d.mode === "custom") return base + " | start=customPose";
-    return base + ` | start=${d.mode}`;
-  }
+function enrichNote(base: string, d: DeterministicStart) {
+  if (!d.enabled) return base + " | start=free";
+  if (d.mode === "custom") return base + " | start=customPose";
+  return base + ` | start=${d.mode}`;
+}
+
 
   // Minimal follow-up executor (no nav yet unless you added goToCurrentIsolateSelection)
   async function executeFollowUp(f: VlmFollowUp | undefined) {
@@ -136,19 +142,37 @@ export function createComplianceRunner(params: {
       return { didSomething: true, reason: "top" as const };
     }
 
-    if (f.request === "NEW_VIEW") {
-      // for now: do a small orbit-like change by moving camera relative
-      // (we avoid adding new viewerApi funcs; you can upgrade later)
-      const pose = await viewerApi.getCameraPose();
-      await viewerApi.setCameraPose(
-        {
-          eye: { x: pose.eye.x + 0.5, y: pose.eye.y + 0.25, z: pose.eye.z + 0.5 },
-          target: pose.target,
-        },
-        true
-      );
-      return { didSomething: true, reason: "nudge" as const };
-    }
+if (f.request === "NEW_VIEW") {
+  const pose = await viewerApi.getCameraPose();
+
+  const ex = pose.eye.x, ey = pose.eye.y, ez = pose.eye.z;
+  const tx = pose.target.x, ty = pose.target.y, tz = pose.target.z;
+
+  // Vector from target to eye
+  const vx = ex - tx;
+  const vy = ey - ty;
+  const vz = ez - tz;
+
+  // Orbit 20 degrees around world-up (Y). Deterministic and scale-invariant.
+  const deg = 20;
+  const rad = (deg * Math.PI) / 180;
+  const cos = Math.cos(rad);
+  const sin = Math.sin(rad);
+
+  const nx = vx * cos - vz * sin;
+  const nz = vx * sin + vz * cos;
+
+  await viewerApi.setCameraPose(
+    {
+      eye: { x: tx + nx, y: ty + vy, z: tz + nz },
+      target: pose.target,
+    },
+    true
+  );
+
+  return { didSomething: true, reason: "orbit20deg" as const };
+}
+
     
     if (f.request === "ZOOM_IN") {
   const factor = Math.max(0.1, Math.min(4, f.params?.factor ?? 1.5));
@@ -172,17 +196,41 @@ export function createComplianceRunner(params: {
 }
 
 if (f.request === "ISOLATE_CATEGORY") {
-  // Forward-compatible: only act if navigationAgent exposes a hook.
-  // This preserves determinism: no best-effort guessing.
-  if (navigationAgent?.navigateToSelection) {
-    await navigationAgent.navigateToSelection(
-      { type: "CATEGORY", value: f.params.category },
-      { mode: "ISOLATE" }
-    );
-    return { didSomething: true, reason: "isolate-category" as const };
+  if (!viewerApi.isolateCategory) {
+    console.warn("[FollowUp] isolateCategory not wired");
+    return { didSomething: false, reason: "isolate-category-not-wired" as const };
   }
-  return { didSomething: false, reason: "isolate-category-not-wired" as const };
+
+  const category = f.params.category;
+  console.log("[FollowUp] ISOLATE_CATEGORY", { category });
+
+  const map = await viewerApi.isolateCategory(category);
+
+  const count =
+    map && typeof map === "object"
+      ? Object.values(map).reduce((acc: number, s: any) => acc + (s?.size ?? 0), 0)
+      : 0;
+
+  console.log("[FollowUp] isolateCategory result", { hasMap: !!map, count, map });
+
+  if (!map || count === 0) {
+    return { didSomething: false, reason: "isolate-category-empty" as const };
+  }
+
+  // Optional: navigation-derived metrics for next snapshot
+  if (navigationAgent?.navigateToSelection) {
+    const m = await navigationAgent.navigateToSelection(map, { maxSteps: 20 });
+    const nav: NavMetrics = {
+      projectedAreaRatio: m.targetAreaRatio,
+      occlusionRatio: m.occlusionRatio ?? undefined,
+      convergenceScore: m.success ? 1 : 0,
+    };
+    return { didSomething: true, reason: "isolate-category" as const, nav };
+  }
+
+  return { didSomething: true, reason: "isolate-category" as const };
 }
+
 
     // Optional: if nav exists and you want to support it
     if (f.request === "ORBIT" && navigationAgent?.goToCurrentIsolateSelection) {
@@ -242,12 +290,26 @@ if (f.request === "ISOLATE_CATEGORY") {
       };
     }
 
+let lastActionReason: string | null = null;
+let pendingNav: NavMetrics | undefined = undefined;
+
+
     // Step loop
     for (let step = 1; step <= maxSteps; step++) {
-      const note = enrichNote(`compliance_step_${step}_view`, params.deterministic);
-      const artifact = await snapshotCollector.capture(note, "RENDER_PLUS_JSON_METADATA");
+const note = enrichNote(`compliance_step_${step}_view`, params.deterministic) +
+  (lastActionReason ? ` | prevAction=${lastActionReason}` : "");
 
-      pushEvidence({ artifact, nav: undefined });
+      const artifact = await snapshotCollector.capture(note, "RENDER_PLUS_JSON_METADATA");
+      if (artifact.mode !== "RENDER_PLUS_JSON_METADATA") {
+  console.warn("[Compliance] unexpected snapshot mode", artifact.mode);
+}
+
+// then after you capture the next snapshot:
+pushEvidence({ artifact, nav: pendingNav });
+pendingNav = undefined;
+
+
+
 
       const windowed = getEvidenceWindow();
       const decision = await vlmChecker.check({
@@ -276,6 +338,10 @@ if (f.request === "ISOLATE_CATEGORY") {
 
       if ((decision.verdict === "PASS" || decision.verdict === "FAIL") && !confident) {
         const acted = await executeFollowUp(decision.followUp);
+        lastActionReason = acted.reason;
+        pendingNav = (acted as any).nav ?? undefined;
+
+
         if (!acted.didSomething) {
           toast?.(`Low-confidence ${decision.verdict} with no actionable follow-up. Stopping.`);
           return { ok: true as const, runId: activeRunId, final: decision };
@@ -291,6 +357,10 @@ if (f.request === "ISOLATE_CATEGORY") {
       }
 
       const acted = await executeFollowUp(decision.followUp);
+      lastActionReason = acted.reason;
+      pendingNav = (acted as any).nav ?? undefined;
+
+
       if (!acted.didSomething) {
         toast?.("UNCERTAIN with no actionable follow-up. Stopping.");
         return { ok: true as const, runId: activeRunId, final: decision };
@@ -301,3 +371,4 @@ if (f.request === "ISOLATE_CATEGORY") {
     return { ok: false as const, reason: "max-steps-reached" as const };
   }
 return { start, getActiveRunId: () => activeRunId, parseCustomPose, }; }
+

@@ -17,6 +17,16 @@ export type ViewerContext = {
   fragments: any;
   hider: any;
   classifier: any;
+    ifcApi?: {
+    /** Return EXPRESS IDs for a given IFC type. */
+    getAllItemsOfType: (modelId: number, ifcType: number, verbose?: boolean) => Promise<number[]>;
+
+    /**
+     * Convert a string like "IfcDoor" into the IFC type constant used by the manager.
+     * Return null if unknown in this build.
+     */
+    ifcTypeMap: (ifcTypeName: string) => number | null;
+  };
 };
 
 
@@ -150,5 +160,43 @@ if (!box) {
     viewerEvents.emit("modelLoaded", { modelId, model });
   });
 
-  return { components, world, ifcLoader, fragments, hider, classifier };
+  return { components, 
+    world, 
+    ifcLoader, 
+    fragments, 
+    hider, 
+    classifier,
+    ifcApi: {
+  getAllItemsOfType: async (modelId: number, ifcType: number, verbose?: boolean) => {
+    // OpenBIM / ThatOpen loaders typically expose ifcManager under ifcLoader.ifcManager
+    const mgr: any = (ifcLoader as any)?.ifcManager;
+    if (!mgr?.getAllItemsOfType) {
+      throw new Error("ifcApi.getAllItemsOfType: ifcManager.getAllItemsOfType not available");
+    }
+    // Deterministic: verbose defaults false
+    return await mgr.getAllItemsOfType(modelId, ifcType, verbose ?? false);
+  },
+
+  ifcTypeMap: (ifcTypeName: string) => {
+    const mgr: any = (ifcLoader as any)?.ifcManager;
+    if (!mgr) return null;
+
+    // Common patterns across builds:
+    // 1) mgr.types.IfcDoor
+    const t1 = mgr.types?.[ifcTypeName];
+    if (typeof t1 === "number") return t1;
+
+    // 2) global IFC constants (web-ifc): window[ifcTypeName]
+    const t2 = (globalThis as any)[ifcTypeName];
+    if (typeof t2 === "number") return t2;
+
+    // 3) manager.IFC.* (rare)
+    const t3 = mgr.IFC?.[ifcTypeName];
+    if (typeof t3 === "number") return t3;
+
+    return null;
+  },
+},
+
+   };
 }

@@ -4,6 +4,8 @@
 import * as THREE from "three";
 import * as OBC from "@thatopen/components";
 import { getActiveModel, getActiveModelId } from "./state";
+import { getActiveIfcModelId } from "./state";
+import { getActiveIfcTypeIndex } from "./state";
 import { viewerEvents } from "./events";
 import type { ViewerContext } from "./initViewer";
 
@@ -35,9 +37,59 @@ export function createViewerApi(ctx: ViewerContext) {
   const { world, fragments, hider } = ctx;
 
 
+// Depending on OBC version, components live in ctx.components or fragments.components
 
+function getComponentsAny(): any {
+  // Depending on OBC version, components live in ctx.components or fragments.components
+  return (ctx as any).components ?? (fragments as any).components ?? null;
+}
 
-  // --- Navigation helpers / state ---
+function findClassifier(components: any): any | null {
+  if (!components) return null;
+
+  // common patterns: components.get(ClassName) or components.tools[...]
+  // We probe deterministically by checking known keys and known method shapes.
+  const candidates: any[] = [];
+
+  // A) components.get("IfcClassifier") style
+  if (typeof components.get === "function") {
+    for (const key of ["IfcClassifier", "Classifier", "FragmentClassifier"]) {
+      try {
+        const c = components.get(key);
+        if (c) candidates.push(c);
+      } catch {}
+    }
+  }
+
+  // B) components.tools map
+  const tools = (components as any).tools;
+  if (tools && typeof tools === "object") {
+    for (const key of ["IfcClassifier", "Classifier", "FragmentClassifier"]) {
+      const c = tools[key];
+      if (c) candidates.push(c);
+    }
+  }
+
+  // C) brute: scan enumerable values once (still deterministic order by sorted keys)
+  const keys = Object.keys(components).sort();
+  for (const k of keys) {
+    const v = (components as any)[k];
+    if (!v) continue;
+    // identify by method signature
+    if (typeof v.getMap === "function" || typeof v.getAll === "function" || typeof v.find === "function") {
+      candidates.push(v);
+    }
+  }
+
+  // pick first that looks like classifier by having category→map method
+  for (const c of candidates) {
+    if (typeof c.getMap === "function") return c;
+    if (typeof c.getModelIdMap === "function") return c;
+    if (typeof c.find === "function") return c;
+  }
+  return null;
+}
+
 
   // Keep a copy of the last isolate map (so navigation can "go to what is currently isolated")
   let lastIsolateMap: OBC.ModelIdMap | null = null;
@@ -174,6 +226,70 @@ async function stabilizeSceneForSnapshot() {
     };
   }
 
+  // Helpers for IFC type ID extraction from various shapes of output
+function extractNumericIdsFromUnknown(out: any, preferredKey?: string): number[] | null {
+  if (!out) return null;
+
+  // direct array
+  if (Array.isArray(out) && out.every((x) => typeof x === "number" && isFinite(x))) return out;
+
+  // Set<number>
+  if (out instanceof Set) {
+    const arr = Array.from(out).filter((x) => typeof x === "number" && isFinite(x));
+    return arr.length ? arr : null;
+  }
+
+  // Map<any, any>
+  if (out instanceof Map) {
+    // try preferred key first
+    if (preferredKey != null && out.has(preferredKey)) {
+      const v = out.get(preferredKey);
+      const ids = extractNumericIdsFromUnknown(v);
+      if (ids?.length) return ids;
+    }
+
+    // deterministic fallback: scan entries by sorted key string
+    const entries = Array.from(out.entries()).sort((a, b) => String(a[0]).localeCompare(String(b[0])));
+    for (const [, v] of entries) {
+      const ids = extractNumericIdsFromUnknown(v);
+      if (ids?.length) return ids;
+    }
+    return null;
+  }
+
+  // plain object: try preferred key, then scan keys deterministically
+  if (typeof out === "object") {
+    if (preferredKey != null) {
+      const v =
+        (out as any)[preferredKey] ??
+        (out as any)[preferredKey.toUpperCase()] ??
+        (out as any)[preferredKey.toLowerCase()];
+      const ids = extractNumericIdsFromUnknown(v);
+      if (ids?.length) return ids;
+    }
+
+    // common container fields
+    for (const k of ["ids", "items", "expressIds", "elements"]) {
+      const ids = extractNumericIdsFromUnknown((out as any)[k]);
+      if (ids?.length) return ids;
+    }
+
+    // scan all keys in sorted order for first numeric array/set/map
+    const keys = Object.keys(out).sort();
+    for (const k of keys) {
+      const ids = extractNumericIdsFromUnknown((out as any)[k]);
+      if (ids?.length) return ids;
+    }
+  }
+
+  return null;
+}
+
+function debugDescribeOut(out: any) {
+  const kind = Object.prototype.toString.call(out);
+  const keys = out && typeof out === "object" && !(out instanceof Map) && !(out instanceof Set) ? Object.keys(out).slice(0, 30) : [];
+  return { kind, keys };
+}
 
 
 
@@ -204,6 +320,12 @@ async function stabilizeSceneForSnapshot() {
     getLastSelection(): OBC.ModelIdMap | null {
   return lastSelection;
 },
+
+    getSceneObjects(): THREE.Object3D[] {
+      // safest: the model root only, not helpers/grid
+      const model = getActiveModel();
+      return model?.object ? [model.object] : [];
+    },
 
     async clearModel(): Promise<void> {
       const model = getActiveModel();
@@ -306,6 +428,160 @@ async function stabilizeSceneForSnapshot() {
       return { ...visibilityState };
     },
 
+async isolateCategory(category: string): Promise<OBC.ModelIdMap | null> {
+  const modelKey = getActiveModelId();
+  if (!modelKey) return null;
+
+  const listAny: any = (fragments as any).list;
+  const group = typeof listAny?.get === "function" ? listAny.get(modelKey) : listAny?.[modelKey];
+  if (!group) return null;
+
+  const norm = String(category).trim().toUpperCase(); // IFCDOOR
+
+  if (typeof group.getItemsOfCategories !== "function") {
+    console.warn("[viewerApi] isolateCategory: getItemsOfCategories not available");
+    return null;
+  }
+
+  const re = new RegExp(`^${norm}$`, "i");
+
+  let out: any;
+  try {
+    out = await group.getItemsOfCategories([re]); // ✅ await (your build returns Promise)
+  } catch (e) {
+    console.warn("[viewerApi] isolateCategory: getItemsOfCategories threw", e);
+    return null;
+  }
+
+  const ids = extractNumericIdsFromUnknown(out, norm);
+
+
+  if (!ids || ids.length === 0) {
+    console.warn("[viewerApi] isolateCategory: no ids returned", {
+      category,
+      norm,
+      modelKey,
+      outInfo: debugDescribeOut(out),
+    });
+    return null;
+  }
+
+  const map: OBC.ModelIdMap = { [modelKey]: new Set(ids) };
+  await this.isolate(map);
+  return map;
+},
+
+
+
+
+__debug: {
+  getActiveModelKeys: () => Object.keys((getActiveModel() as any) || {}),
+  getActiveModel: () => getActiveModel(),
+  getFragmentsKeys: () => Object.keys((fragments as any) || {}),
+  getFragmentsCoreKeys: () => Object.keys(((fragments as any)?._core) || {}),
+  getFragmentsComponentsKeys: () => Object.keys(((fragments as any)?.components) || {}),
+getFragmentsListKeys: () => {
+  const l: any = (fragments as any).list;
+  if (!l) return [];
+  // Map keys if possible
+  if (typeof l.keys === "function") return Array.from(l.keys());
+  return Object.getOwnPropertyNames(l);
+},
+getActiveFragmentsGroupKeys: () => {
+  const modelKey = getActiveModelId();
+  const l: any = (fragments as any).list;
+  const g = modelKey && typeof l?.get === "function" ? l.get(modelKey) : null;
+  if (!g) return [];
+  return Object.getOwnPropertyNames(g).sort();
+},
+getActiveFragmentsGroupProtoKeys: () => {
+  const modelKey = getActiveModelId();
+  const l: any = (fragments as any).list;
+  const g = modelKey && typeof l?.get === "function" ? l.get(modelKey) : null;
+  if (!g) return [];
+  return Object.getOwnPropertyNames(Object.getPrototypeOf(g) || {}).sort();
+},
+sampleGroupProperties: () => {
+  const modelKey = getActiveModelId();
+  const l: any = (fragments as any).list;
+  const g = modelKey && typeof l?.get === "function" ? l.get(modelKey) : null;
+  const pm: any = g?.properties;
+  if (!pm?.entries) return null;
+  const it = pm.entries();
+  const first = it.next();
+  if (first.done) return null;
+  const [k, v] = first.value;
+  return { keyType: typeof k, key: k, value: v };
+},
+getGroupCategories: () => {
+  const modelKey = getActiveModelId();
+  const listAny: any = (fragments as any).list;
+  const group = modelKey && typeof listAny?.get === "function" ? listAny.get(modelKey) : null;
+  if (!group) return [];
+  if (typeof group.getCategories === "function") {
+    try { return group.getCategories(); } catch { return []; }
+  }
+  return [];
+},
+sampleCategoryCount: (cat: string) => {
+  const modelKey = getActiveModelId();
+  const listAny: any = (fragments as any).list;
+  const group = modelKey && typeof listAny?.get === "function" ? listAny.get(modelKey) : null;
+  if (!group) return { ok: false, reason: "no-group" };
+
+  const norm = String(cat).trim().toUpperCase();
+
+  if (typeof group.getItemsOfCategories !== "function") {
+    return { ok: false, reason: "no-getItemsOfCategories" };
+  }
+
+  try {
+    const re = new RegExp(`^${norm}$`, "i");
+    out = group.getItemsOfCategories([re]);
+
+
+    const asArray = Array.isArray(out)
+      ? out
+      : out instanceof Set
+        ? Array.from(out)
+        : typeof out?.get === "function"
+          ? (out.get(norm) ?? out.get(norm.toLowerCase()) ?? out.get(norm.toUpperCase()) ?? [])
+          : (out?.[norm] ?? out?.[norm.toLowerCase()] ?? out?.[norm.toUpperCase()] ?? []);
+
+    return { ok: true, norm, count: Array.isArray(asArray) ? asArray.length : 0, outKind: Object.prototype.toString.call(out) };
+  } catch (e: any) {
+    return { ok: false, norm, reason: String(e?.message ?? e) };
+  }
+},
+
+dumpItemsOfCategories: async (cat: string) =>{
+  const modelKey = getActiveModelId();
+  const listAny: any = (fragments as any).list;
+  const group = modelKey && typeof listAny?.get === "function" ? listAny.get(modelKey) : null;
+  if (!group?.getItemsOfCategories) return { ok: false, reason: "no-getItemsOfCategories" };
+
+  const norm = String(cat).trim().toUpperCase();
+  const re = new RegExp(`^${norm}$`, "i");
+  const out = await group.getItemsOfCategories([re]);
+
+
+
+  return {
+    ok: true,
+    norm,
+    outInfo: debugDescribeOut(out),
+    // show a small sample deterministically (won’t blow up console)
+    sampleIds: (extractNumericIdsFromUnknown(out, norm) ?? []).slice(0, 20),
+  };
+},
+
+
+
+
+},
+
+
+
         getCurrentIsolateSelection(): OBC.ModelIdMap | null {
       return lastIsolateMap ? cloneModelIdMap(lastIsolateMap) : null;
     },
@@ -357,6 +633,52 @@ async function stabilizeSceneForSnapshot() {
       return box;
     },
 
+    async getSelectionMeshes(map: OBC.ModelIdMap): Promise<THREE.Object3D[]> {
+  const modelKey = Object.keys(map ?? {})[0];
+  if (!modelKey) return [];
+
+  const ids = Array.from(map[modelKey] ?? []);
+  if (!ids.length) return [];
+
+  const listAny: any = (fragments as any).list;
+  const group = typeof listAny?.get === "function" ? listAny.get(modelKey) : listAny?.[modelKey];
+  if (!group) return [];
+
+  const out: THREE.Object3D[] = [];
+  const seen = new Set<string>();
+
+  // Prefer batch method if available
+  if (typeof group.getMeshesByItems === "function") {
+    const meshes: THREE.Object3D[] = await group.getMeshesByItems(ids);
+    for (const m of meshes ?? []) {
+      if (!m) continue;
+      if (!seen.has(m.uuid)) {
+        seen.add(m.uuid);
+        out.push(m);
+      }
+    }
+    return out;
+  }
+
+  // Fallback: per-item
+  if (typeof group.getMeshesByItem === "function") {
+    for (const id of ids) {
+      const meshes: THREE.Object3D[] = await group.getMeshesByItem(id);
+      for (const m of meshes ?? []) {
+        if (!m) continue;
+        if (!seen.has(m.uuid)) {
+          seen.add(m.uuid);
+          out.push(m);
+        }
+      }
+    }
+    return out;
+  }
+
+  return [];
+},
+
+
 
     async getSnapshot(opts?: { note?: string }): Promise<ViewerSnapshot> {
       // 1) Ensure fragments update (geometry + visibility state)
@@ -372,7 +694,11 @@ async function stabilizeSceneForSnapshot() {
       world.renderer.three.render(world.scene.three, world.camera.three);
 
       const canvas = world.renderer.three.domElement;
-      const imageBase64Png = canvas.toDataURL("image/png");
+const dataUrl = canvas.toDataURL("image/png");
+const imageBase64Png = dataUrl.startsWith("data:image/")
+  ? dataUrl.split(",")[1] ?? ""
+  : dataUrl;
+
 
       const pose = await this.getCameraPose();
 

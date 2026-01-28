@@ -76,7 +76,7 @@ export type VlmAdapter = {
   check: (input: VlmCheckInput) => Promise<Omit<VlmDecision, "decisionId" | "timestampIso">>;
 };
 
-function hashPrompt(s: string) {
+export function hashPrompt(s: string) {
   // Tiny deterministic hash for logging (NOT crypto, but stable)
   let h = 2166136261;
   for (let i = 0; i < s.length; i++) {
@@ -89,6 +89,56 @@ function hashPrompt(s: string) {
 function clamp01(x: number) {
   return Math.max(0, Math.min(1, x));
 }
+
+function isFollowUp(x: any): x is VlmFollowUp {
+  if (!x || typeof x !== "object") return false;
+
+  if (x.request === "NEW_VIEW") return !x.params || typeof x.params === "object";
+  if (x.request === "ISO_VIEW") return true;
+  if (x.request === "TOP_VIEW") return true;
+  if (x.request === "ZOOM_IN") return !x.params || typeof x.params === "object";
+  if (x.request === "ORBIT") return x.params && typeof x.params.degrees === "number";
+  if (x.request === "ISOLATE_CATEGORY") return x.params && typeof x.params.category === "string";
+
+  return false;
+}
+
+function normalizeInput(input: VlmCheckInput): VlmCheckInput {
+  const artifacts = Array.isArray(input.artifacts) ? input.artifacts : [];
+  // deterministically refuse empty windows early (single rule = one run still true)
+  if (artifacts.length === 0) {
+    throw new Error("VlmCheckInput.artifacts must include at least one SnapshotArtifact.");
+  }
+
+  const views = Array.isArray(input.evidenceViews) ? input.evidenceViews : [];
+
+  // EvidenceViews should be parallel. If missing/short, synthesize deterministically from artifacts.
+  if (views.length !== artifacts.length) {
+    const synthesized: EvidenceView[] = artifacts.map(a => ({
+      snapshotId: a.id,
+      mode: a.mode,
+      note: a.meta?.note,
+      nav: undefined,
+    }));
+
+    // If some views exist, keep them in order for the overlapping prefix; fill the rest.
+    const min = Math.min(views.length, synthesized.length);
+    for (let i = 0; i < min; i++) {
+      const v = views[i];
+      synthesized[i] = {
+        snapshotId: typeof v?.snapshotId === "string" ? v.snapshotId : artifacts[i].id,
+        mode: (v?.mode as any) ?? artifacts[i].mode,
+        note: v?.note ?? artifacts[i].meta?.note,
+        nav: v?.nav,
+      };
+    }
+
+    return { ...input, artifacts, evidenceViews: synthesized };
+  }
+
+  return { ...input, artifacts, evidenceViews: views };
+}
+
 
 function finalizeDecision(
   core: Omit<VlmDecision, "decisionId" | "timestampIso">,
@@ -149,10 +199,11 @@ function finalizeDecision(
     },
     evidence: {
       snapshotIds,
-      mode: core.evidence?.mode ?? input.artifacts[input.artifacts.length - 1]?.mode ?? "UNKNOWN",
+      mode: (core.evidence?.mode as any) ?? input.artifacts[input.artifacts.length - 1].mode,
       note: core.evidence?.note,
     },
-    followUp: core.followUp,
+followUp: isFollowUp(core.followUp) ? core.followUp : undefined,
+
     meta: {
       modelId: core.meta?.modelId ?? input.artifacts[input.artifacts.length - 1]?.meta.modelId ?? null,
       promptHash: core.meta?.promptHash ?? hashPrompt(input.prompt),
@@ -237,9 +288,11 @@ export function createVlmChecker(adapter: VlmAdapter) {
   return {
     adapterName: adapter.name,
 
-    async check(input: VlmCheckInput): Promise<VlmDecision> {
-      const core = await adapter.check(input);
-      return finalizeDecision(core, input, adapter.name);
-    },
+async check(input: VlmCheckInput): Promise<VlmDecision> {
+  const norm = normalizeInput(input);
+  const core = await adapter.check(norm);
+  return finalizeDecision(core, norm, adapter.name);
+},
+
   };
 }
