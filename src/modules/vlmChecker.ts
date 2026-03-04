@@ -12,13 +12,43 @@ import type { SnapshotArtifact } from "./snapshotCollector";
 
 export type VlmVerdict = "PASS" | "FAIL" | "UNCERTAIN";
 
+export type ViewPreset = "TOP" | "ISO" | "ORBIT";
+
 export type VlmFollowUp =
+  // Generic "get me another look" (orchestrator decides how)
   | { request: "NEW_VIEW"; params?: { reason?: string } }
-  | { request: "ISO_VIEW" }
-  | { request: "TOP_VIEW" }
-  | { request: "ZOOM_IN"; params?: { factor?: number } }
+
+  // View controls
+  | { request: "SET_VIEW_PRESET"; params: { preset: ViewPreset } }
+  | { request: "TOP_VIEW" } // keep backwards-compat
+  | { request: "ISO_VIEW" } // keep backwards-compat
   | { request: "ORBIT"; params: { degrees: number } }
-  | { request: "ISOLATE_CATEGORY"; params: { category: string } };
+  | { request: "ZOOM_IN"; params?: { factor?: number } }
+
+  // Scope tools (context)
+  | { request: "ISOLATE_STOREY"; params: { storeyId: string } }
+  | { request: "ISOLATE_SPACE"; params: { spaceId: string } }
+
+  // Relevance filtering / visibility edits
+  | { request: "ISOLATE_CATEGORY"; params: { category: string } }
+  | { request: "HIDE_IDS"; params: { ids: string[]; reason?: string } }
+  | { request: "SHOW_IDS"; params: { ids: string[] } }
+  | { request: "RESET_VISIBILITY" }
+
+  // Category visibility toggles
+| { request: "HIDE_CATEGORY"; params: { category: string; reason?: string } }
+| { request: "SHOW_CATEGORY"; params: { category: string } }
+| { request: "PICK_CENTER"; params?: { reason?: string } }
+
+// Object interaction
+  | { request: "PICK_OBJECT"; params: { x: number; y: number } } // screen coords
+  | { request: "GET_PROPERTIES"; params: { objectId: string } }
+  | { request: "HIGHLIGHT_IDS"; params: { ids: string[]; style?: "primary" | "warn" } }
+  | { request: "HIDE_SELECTED" }
+
+  | { request: "SET_PLAN_CUT"; params: { height: number; thickness?: number; mode?: "WORLD_UP" | "CAMERA" } }
+| { request: "CLEAR_PLAN_CUT" };
+
 
 export type VlmDecision = {
   decisionId: string;
@@ -63,6 +93,7 @@ export type EvidenceView = {
   mode: SnapshotArtifact["mode"];
   note?: string;
   nav?: NavigationMetrics; // authoritative visibility metrics (nav computes)
+  context?: any;           // runner-attached evidence context (pose, scope, hiddenIds, etc.)
 };
 
 export type VlmCheckInput = {
@@ -93,15 +124,89 @@ function clamp01(x: number) {
 function isFollowUp(x: any): x is VlmFollowUp {
   if (!x || typeof x !== "object") return false;
 
-  if (x.request === "NEW_VIEW") return !x.params || typeof x.params === "object";
-  if (x.request === "ISO_VIEW") return true;
-  if (x.request === "TOP_VIEW") return true;
-  if (x.request === "ZOOM_IN") return !x.params || typeof x.params === "object";
-  if (x.request === "ORBIT") return x.params && typeof x.params.degrees === "number";
-  if (x.request === "ISOLATE_CATEGORY") return x.params && typeof x.params.category === "string";
+  const req = x.request;
 
-  return false;
+  switch (req) {
+    case "NEW_VIEW":
+      return !x.params || typeof x.params === "object";
+
+    case "ISO_VIEW":
+    case "TOP_VIEW":
+      return true;
+
+    case "SET_VIEW_PRESET":
+      return (
+        x.params &&
+        (x.params.preset === "TOP" || x.params.preset === "ISO" || x.params.preset === "ORBIT")
+      );
+
+    case "ORBIT":
+      return x.params && typeof x.params.degrees === "number" && isFinite(x.params.degrees);
+
+    case "ZOOM_IN":
+      return (
+        !x.params ||
+        (typeof x.params === "object" &&
+          (x.params.factor === undefined ||
+            (typeof x.params.factor === "number" && isFinite(x.params.factor))))
+      );
+
+    case "ISOLATE_CATEGORY":
+      return x.params && typeof x.params.category === "string" && x.params.category.length > 0;
+
+    case "ISOLATE_STOREY":
+      return x.params && typeof x.params.storeyId === "string" && x.params.storeyId.length > 0;
+
+    case "ISOLATE_SPACE":
+      return x.params && typeof x.params.spaceId === "string" && x.params.spaceId.length > 0;
+
+    case "HIDE_IDS":
+      return (
+        x.params &&
+        Array.isArray(x.params.ids) &&
+        x.params.ids.every((id: any) => typeof id === "string") &&
+        (x.params.reason === undefined || typeof x.params.reason === "string")
+      );
+
+    case "SHOW_IDS":
+      return x.params && Array.isArray(x.params.ids) && x.params.ids.every((id: any) => typeof id === "string");
+
+    case "RESET_VISIBILITY":
+      return true;
+
+    case "PICK_OBJECT":
+      return (
+        x.params &&
+        typeof x.params.x === "number" &&
+        typeof x.params.y === "number" &&
+        isFinite(x.params.x) &&
+        isFinite(x.params.y)
+      );
+
+    case "GET_PROPERTIES":
+      return x.params && typeof x.params.objectId === "string" && x.params.objectId.length > 0;
+
+    case "HIGHLIGHT_IDS":
+      return (
+        x.params &&
+        Array.isArray(x.params.ids) &&
+        x.params.ids.every((id: any) => typeof id === "string") &&
+        (x.params.style === undefined || x.params.style === "primary" || x.params.style === "warn")
+      );
+
+    case "HIDE_SELECTED":
+    case "HIDE_CATEGORY":
+    case "SHOW_CATEGORY":
+    case "PICK_CENTER":
+    case "SET_PLAN_CUT":
+    case "CLEAR_PLAN_CUT":
+      return true;
+
+    default:
+      return false;
+  }
 }
+
 
 function normalizeInput(input: VlmCheckInput): VlmCheckInput {
   const artifacts = Array.isArray(input.artifacts) ? input.artifacts : [];
@@ -114,12 +219,13 @@ function normalizeInput(input: VlmCheckInput): VlmCheckInput {
 
   // EvidenceViews should be parallel. If missing/short, synthesize deterministically from artifacts.
   if (views.length !== artifacts.length) {
-    const synthesized: EvidenceView[] = artifacts.map(a => ({
-      snapshotId: a.id,
-      mode: a.mode,
-      note: a.meta?.note,
-      nav: undefined,
-    }));
+const synthesized: EvidenceView[] = artifacts.map(a => ({
+  snapshotId: a.id,
+  mode: a.mode,
+  note: a.meta?.note,
+  nav: undefined,
+  context: (a.meta as any)?.context, // best-effort carry if snapshot meta includes it
+}));
 
     // If some views exist, keep them in order for the overlapping prefix; fill the rest.
     const min = Math.min(views.length, synthesized.length);
@@ -130,6 +236,7 @@ function normalizeInput(input: VlmCheckInput): VlmCheckInput {
         mode: (v?.mode as any) ?? artifacts[i].mode,
         note: v?.note ?? artifacts[i].meta?.note,
         nav: v?.nav,
+        context: (v as any)?.context ?? (artifacts[i].meta as any)?.context,
       };
     }
 

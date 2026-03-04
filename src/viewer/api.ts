@@ -90,9 +90,184 @@ function findClassifier(components: any): any | null {
   return null;
 }
 
+function logPlaneTest(plane: THREE.Plane, abs: number, upAxis: "y" | "z") {
+  const above = upAxis === "y"
+    ? new THREE.Vector3(0, abs + 0.5, 0)
+    : new THREE.Vector3(0, 0, abs + 0.5);
+
+  const below = upAxis === "y"
+    ? new THREE.Vector3(0, abs - 0.5, 0)
+    : new THREE.Vector3(0, 0, abs - 0.5);
+
+  const da = plane.distanceToPoint(above);
+  const db = plane.distanceToPoint(below);
+
+  console.log("[PlanCut:PlaneTest]", { abs, daAbove: da, dbBelow: db });
+}
+
+function calibratePlaneKeepBelow(plane: THREE.Plane, absHeight: number, upAxis: "y" | "z") {
+  // We want: keep BELOW the cut (below = visible), clip ABOVE.
+  const above = upAxis === "y"
+    ? new THREE.Vector3(0, absHeight + 0.5, 0)
+    : new THREE.Vector3(0, 0, absHeight + 0.5);
+
+  const below = upAxis === "y"
+    ? new THREE.Vector3(0, absHeight - 0.5, 0)
+    : new THREE.Vector3(0, 0, absHeight - 0.5);
+
+  const dAbove = plane.distanceToPoint(above);
+  const dBelow = plane.distanceToPoint(below);
+
+  // Empirical rule for Three clipping:
+  // If your result is inverted, negate() flips it.
+  // We expect: above should be "more clipped side" than below.
+  // So if dAbove < dBelow, the plane is likely inverted for your pipeline → flip.
+  if (dAbove < dBelow) {
+    plane.negate();
+    return { flipped: true, dAbove, dBelow };
+  }
+  return { flipped: false, dAbove, dBelow };
+}
+
+// Get active group in fragments.list for active model (any version)
+function getActiveGroupAny(): any | null {
+  const modelKey = getActiveModelId();
+  if (!modelKey) return null;
+  const listAny: any = (fragments as any).list;
+  return typeof listAny?.get === "function" ? listAny.get(modelKey) : listAny?.[modelKey] ?? null;
+}
 
   // Keep a copy of the last isolate map (so navigation can "go to what is currently isolated")
   let lastIsolateMap: OBC.ModelIdMap | null = null;
+  // Track hidden items so we can report evidence metadata to the VLM deterministically.
+  // Keys are modelIds; values are sets of localIds.
+  const hiddenMapByModel: Record<string, Set<number>> = {};
+
+  function ensureHiddenSet(modelId: string) {
+    hiddenMapByModel[modelId] ??= new Set<number>();
+    return hiddenMapByModel[modelId];
+  }
+
+  // Accepts:
+  // - "123" (localId on active model)
+  // - "modelId:123"
+  // Returns null if it can't be parsed.
+  function parseObjectId(id: string): { modelId: string; localId: number } | null {
+    const raw = String(id ?? "").trim();
+    if (!raw) return null;
+
+    const activeModelId = getActiveModelId();
+    if (!activeModelId) return null;
+
+    // modelId:localId
+    if (raw.includes(":")) {
+      const [m, l] = raw.split(":");
+      const localId = Number(l);
+      if (!m || !Number.isFinite(localId)) return null;
+      return { modelId: m, localId };
+    }
+
+    // localId only -> assume active model
+    const localId = Number(raw);
+    if (!Number.isFinite(localId)) return null;
+    return { modelId: activeModelId, localId };
+  }
+
+  // ----------------------------
+  // Highlight / selection state
+  // ----------------------------
+  let lastPickedObjectId: string | null = null;
+
+  // Store original materials so we can restore them after highlighting.
+  // Keyed by mesh uuid (stable enough for session).
+  const originalMaterialByMeshUuid = new Map<string, THREE.Material | THREE.Material[]>();
+
+  // Single shared highlight materials (deterministic)
+  const highlightPrimaryMat = new THREE.MeshBasicMaterial({
+    color: 0xffd54a,
+    transparent: true,
+    opacity: 0.95,
+    depthTest: true,
+  });
+
+  const highlightWarnMat = new THREE.MeshBasicMaterial({
+    color: 0xff4a4a,
+    transparent: true,
+    opacity: 0.95,
+    depthTest: true,
+  });
+
+  function pickHighlightMaterial(style?: "primary" | "warn") {
+    return style === "warn" ? highlightWarnMat : highlightPrimaryMat;
+  }
+
+  function restoreAllHighlights() {
+    for (const [uuid, mat] of originalMaterialByMeshUuid.entries()) {
+      const obj = world.scene.three.getObjectByProperty("uuid", uuid) as any;
+      if (obj && obj.material) obj.material = mat;
+    }
+    originalMaterialByMeshUuid.clear();
+  }
+
+  function buildModelIdMapFromObjectIds(objectIds: string[]): OBC.ModelIdMap {
+    const map: OBC.ModelIdMap = {};
+    for (const raw of objectIds ?? []) {
+      const parsed = parseObjectId(raw);
+      if (!parsed) continue;
+      (map[parsed.modelId] ??= new Set<number>()).add(parsed.localId);
+    }
+    return map;
+  }
+
+  // Try hard to extract a localId from a raycast hit.
+  // Works across OBC/fragments versions by probing common shapes.
+  function extractLocalIdFromIntersection(hit: THREE.Intersection): number | null {
+    const obj: any = hit.object as any;
+
+    // A) Common userData patterns
+    const ud = obj?.userData;
+    for (const k of ["expressID", "expressId", "localId", "itemID", "itemId"]) {
+      const v = ud?.[k];
+      if (typeof v === "number" && isFinite(v)) return v;
+    }
+
+    // B) Geometry attribute per-vertex (expressID / itemID)
+    const geom: any = obj?.geometry;
+    const attrs = geom?.attributes;
+    const attr =
+      attrs?.expressID ??
+      attrs?.expressId ??
+      attrs?.itemID ??
+      attrs?.itemId ??
+      null;
+
+    // Need indices + faceIndex to map triangle -> vertices
+    if (!attr || !hit.faceIndex || !geom?.index) return null;
+
+    const index = geom.index;
+    const tri = hit.faceIndex;
+
+    const a = index.getX(tri * 3 + 0);
+    const b = index.getX(tri * 3 + 1);
+    const c = index.getX(tri * 3 + 2);
+
+    const va = attr.getX(a);
+    const vb = attr.getX(b);
+    const vc = attr.getX(c);
+
+    // Pick majority value (robust)
+    const arr = [va, vb, vc].filter((n) => typeof n === "number" && isFinite(n));
+    if (!arr.length) return null;
+
+    arr.sort((x, y) => x - y);
+    // majority of 3: middle is majority if there is one
+    const mid = arr[Math.floor(arr.length / 2)];
+    return typeof mid === "number" && isFinite(mid) ? mid : null;
+  }
+
+  function toObjectId(modelId: string, localId: number) {
+    return `${modelId}:${localId}`;
+  }
 
   function cloneModelIdMap(map: OBC.ModelIdMap): OBC.ModelIdMap {
     const out: OBC.ModelIdMap = {};
@@ -100,6 +275,114 @@ function findClassifier(components: any): any | null {
     return out;
   }
 
+  // Normalize user-provided category string to IFC standard form
+function normalizeIfcCategory(raw: string): string {
+  const upper = String(raw ?? "").trim().toUpperCase();
+  const synonymToIfc: Record<string, string> = {
+    DOOR: "IFCDOOR",
+    DOORS: "IFCDOOR",
+    SLAB: "IFCSLAB",
+    SLABS: "IFCSLAB",
+    STAIR: "IFCSTAIR",
+    STAIRS: "IFCSTAIR",
+    CEILING: "IFCCOVERING",
+    CEILINGS: "IFCCOVERING",
+    ROOF: "IFCROOF",
+    ROOFS: "IFCROOF",
+    WINDOW: "IFCWINDOW",
+    WINDOWS: "IFCWINDOW",
+    WALL: "IFCWALL",
+    WALLS: "IFCWALL",
+  };
+  if (!upper) return upper;
+  if (upper.startsWith("IFC")) return upper;
+  return synonymToIfc[upper] ?? upper;
+}
+
+// Plan cut state
+let planCutState:
+  | { enabled: false }
+  | { enabled: true; planes: THREE.Plane[] } = { enabled: false };
+
+type SavedMatState = {
+  side: number;
+  clippingPlanes?: THREE.Plane[] | null;
+  clipIntersection?: boolean;
+  clipping?: boolean;
+};
+
+let savedMaterialState: Map<string, SavedMatState> | null = null;
+
+function forEachMaterial(obj: THREE.Object3D, fn: (m: THREE.Material) => void) {
+  obj.traverse((child: any) => {
+    const mat = child?.material;
+    if (!mat) return;
+    if (Array.isArray(mat)) mat.forEach(fn);
+    else fn(mat);
+  });
+}
+
+function applyClippingPlanes(planes: THREE.Plane[]) {
+  const model = getActiveModel();
+  if (!model?.object) return;
+
+  // ✅ enable clipping
+  world.renderer.three.localClippingEnabled = true;
+
+  // ✅ ALSO set global clipping planes (important for fragments/instancing edge cases)
+  world.renderer.three.clippingPlanes = planes;
+
+  // Save material state once when enabling plan cut
+  if (!savedMaterialState) savedMaterialState = new Map();
+
+  forEachMaterial(model.object, (m) => {
+    const key = (m as any).uuid as string;
+    if (!savedMaterialState!.has(key)) {
+      savedMaterialState!.set(key, {
+        side: (m as any).side,
+        clippingPlanes: (m as any).clippingPlanes ?? null,
+        clipIntersection: (m as any).clipIntersection,
+      });
+    }
+
+    (m as any).side = THREE.DoubleSide;
+    (m as any).clippingPlanes = planes;
+    (m as any).clipIntersection = planes.length > 1;
+    m.needsUpdate = true;
+  });
+}
+
+function clearClippingPlanes() {
+  const model = getActiveModel();
+  if (!model?.object) return;
+
+  // ✅ clear global clipping planes
+  world.renderer.three.clippingPlanes = [];
+
+  if (savedMaterialState) {
+    forEachMaterial(model.object, (m) => {
+      const key = (m as any).uuid as string;
+      const prev = savedMaterialState!.get(key);
+      if (!prev) return;
+
+      (m as any).side = prev.side;
+      (m as any).clippingPlanes = prev.clippingPlanes ?? null;
+      (m as any).clipIntersection = prev.clipIntersection;
+      m.needsUpdate = true;
+    });
+
+    savedMaterialState = null;
+  }
+}
+
+
+
+function getUpAxis(): "y" | "z" {
+  const up = world.camera.three.up;
+  // tolerate small float drift
+  if (Math.abs(up.z) > Math.abs(up.y)) return "z";
+  return "y";
+}
 
 /**
  * Wait for camera controls to finish moving.  
@@ -292,7 +575,10 @@ function debugDescribeOut(out: any) {
 }
 
 
-
+  //---------------------------------------------------//
+  //--------------- Viewer API methods ----------------//
+  //------------------Returned object -----------------//
+  //---------------------------------------------------//
   // Return object with viewer API methods
   return {
     // Event: model loaded
@@ -417,11 +703,20 @@ function debugDescribeOut(out: any) {
       visibilityState = { mode: "isolate", lastIsolateCount: count };
     },
 
-    async resetVisibility() {
-      await hider.set(true);
-      lastIsolateMap = null;
-      visibilityState = { mode: "all", lastIsolateCount: undefined };
-    },
+async resetVisibility() {
+  await hider.set(true);
+  lastIsolateMap = null;
+  visibilityState = { mode: "all", lastIsolateCount: undefined };
+  for (const k of Object.keys(hiddenMapByModel)) delete hiddenMapByModel[k];
+
+  // ✅ clear plan cut too
+  planCutState = { enabled: false, planes: [] }
+  clearClippingPlanes();
+
+  fragments.core.update(true);
+  world.renderer.three.render(world.scene.three, world.camera.three);
+},
+
 
     getVisibilityState(): VisibilityState {
       // Return a copy so external modules can't mutate internal state by accident.
@@ -436,43 +731,500 @@ async isolateCategory(category: string): Promise<OBC.ModelIdMap | null> {
   const group = typeof listAny?.get === "function" ? listAny.get(modelKey) : listAny?.[modelKey];
   if (!group) return null;
 
-  const norm = String(category).trim().toUpperCase(); // IFCDOOR
-
   if (typeof group.getItemsOfCategories !== "function") {
     console.warn("[viewerApi] isolateCategory: getItemsOfCategories not available");
     return null;
   }
+  
+  // ---- NEW: normalize + synonyms ----
+  const raw = String(category ?? "").trim();
+  if (!raw) return null;
 
-  const re = new RegExp(`^${norm}$`, "i");
+  const upper = raw.toUpperCase();
 
-  let out: any;
-  try {
-    out = await group.getItemsOfCategories([re]); // ✅ await (your build returns Promise)
-  } catch (e) {
-    console.warn("[viewerApi] isolateCategory: getItemsOfCategories threw", e);
+  // deterministic synonym mapping for common user words
+  const synonymToIfc: Record<string, string> = {
+    DOOR: "IFCDOOR",
+    DOORS: "IFCDOOR",
+    STAIR: "IFCSTAIR",
+    STAIRS: "IFCSTAIR",
+    STAIRCASE: "IFCSTAIR",
+    WALL: "IFCWALL",
+    WALLS: "IFCWALL",
+    SLAB: "IFCSLAB",
+    SLABS: "IFCSLAB",
+    CEILING: "IFCCOVERING",
+    CEILINGS: "IFCCOVERING",
+    WINDOW: "IFCWINDOW",
+    WINDOWS: "IFCWINDOW",
+    SPACE: "IFCSPACE",
+    SPACES: "IFCSPACE",
+    RAMP: "IFCRAMP",
+    RAMPS: "IFCRAMP",
+  };
+
+  // If user passed "IfcDoor" -> "IFCDOOR"
+  const ifcLike = upper.startsWith("IFC") ? upper : synonymToIfc[upper] ?? upper;
+
+  // Build candidate category patterns in priority order (deterministic)
+  const candidates: string[] = [];
+  candidates.push(ifcLike);
+
+  // also try adding IFC prefix if user provided e.g. "DOOR" (already mapped) or "DOORFITTING"
+  if (!ifcLike.startsWith("IFC")) candidates.push(`IFC${ifcLike}`);
+
+  // if user passed "IFCDOOR", also try "IfcDoor" style is not needed because regex is i
+  // ---- END NEW ----
+
+  // Try exact matches first
+  let out: any = null;
+  for (const c of candidates) {
+    const re = new RegExp(`^${c}$`, "i");
+    try {
+      out = await group.getItemsOfCategories([re]);
+    } catch (e) {
+      console.warn("[viewerApi] isolateCategory: getItemsOfCategories threw", e);
+      return null;
+    }
+
+    const ids = extractNumericIdsFromUnknown(out, c);
+    if (ids && ids.length) {
+      const map: OBC.ModelIdMap = { [modelKey]: new Set(ids) };
+      await this.isolate(map);
+      return map;
+    }
+  }
+
+  // Fallback: if getCategories exists, try to pick a best category by containment
+  if (typeof group.getCategories === "function") {
+    let cats: string[] = [];
+    try {
+      cats = (await group.getCategories()) ?? [];
+    } catch {
+      cats = [];
+    }
+
+    const want = ifcLike; // e.g., IFCDOOR
+    const sorted = Array.from(new Set(cats.map((x) => String(x)))).sort();
+
+    // deterministic fallback order: exact -> contains -> startsWith
+    const pick =
+      sorted.find((k) => k.toUpperCase() === want) ??
+      sorted.find((k) => k.toUpperCase().includes(want)) ??
+      sorted.find((k) => k.toUpperCase().startsWith(want));
+
+    if (pick) {
+      const re = new RegExp(`^${pick}$`, "i");
+      try {
+        out = await group.getItemsOfCategories([re]);
+      } catch (e) {
+        console.warn("[viewerApi] isolateCategory fallback threw", e);
+        return null;
+      }
+
+      const ids = extractNumericIdsFromUnknown(out, pick.toUpperCase());
+      if (ids && ids.length) {
+        const map: OBC.ModelIdMap = { [modelKey]: new Set(ids) };
+        await this.isolate(map);
+        return map;
+      }
+    }
+  }
+
+  console.warn("[viewerApi] isolateCategory: no ids returned", {
+    category,
+    modelKey,
+    candidates,
+    outInfo: out ? debugDescribeOut(out) : null,
+  });
+  return null;
+},
+
+async listStoreys(): Promise<string[]> {
+  const levels = (ctx as any).classifier?.list?.get?.("Levels");
+  if (!levels) return [];
+  return Array.from(levels.keys()).map((k) => String(k));
+},
+
+async isolateStorey(storeyId: string): Promise<OBC.ModelIdMap | null> {
+  const levels = (ctx as any).classifier?.list?.get?.("Levels");
+  if (!levels) {
+    console.warn("[viewerApi] isolateStorey: Levels not available");
     return null;
   }
 
-  const ids = extractNumericIdsFromUnknown(out, norm);
-
-
-  if (!ids || ids.length === 0) {
-    console.warn("[viewerApi] isolateCategory: no ids returned", {
-      category,
-      norm,
-      modelKey,
-      outInfo: debugDescribeOut(out),
-    });
+  // storeyId here is the levelName shown in the UI tree (e.g. "First floor")
+  const entry = levels.get(String(storeyId));
+  if (!entry?.get) {
+    console.warn("[viewerApi] isolateStorey: unknown storeyId", storeyId);
     return null;
   }
 
-  const map: OBC.ModelIdMap = { [modelKey]: new Set(ids) };
+  const map = await entry.get();
+  const count =
+    map && typeof map === "object"
+      ? Object.values(map).reduce((acc: number, s: any) => acc + (s?.size ?? 0), 0)
+      : 0;
+
+  if (!map || count === 0) {
+    console.warn("[viewerApi] isolateStorey: empty map", storeyId);
+    return null;
+  }
+
+  await this.isolate(map);
+  return map;
+},
+
+async isolateSpace(spaceId: string): Promise<OBC.ModelIdMap | null> {
+  const spaces = (ctx as any).classifier?.list?.get?.("Spaces");
+  if (!spaces) {
+    console.warn("[viewerApi] isolateSpace: Spaces not available");
+    return null;
+  }
+
+  const entry = spaces.get(String(spaceId));
+  if (!entry?.get) {
+    console.warn("[viewerApi] isolateSpace: unknown spaceId", spaceId);
+    return null;
+  }
+
+  const map = await entry.get();
+  const count =
+    map && typeof map === "object"
+      ? Object.values(map).reduce((acc: number, s: any) => acc + (s?.size ?? 0), 0)
+      : 0;
+
+  if (!map || count === 0) {
+    console.warn("[viewerApi] isolateSpace: empty map", spaceId);
+    return null;
+  }
+
   await this.isolate(map);
   return map;
 },
 
 
 
+async setPlanCut(params: { height: number; thickness?: number; mode?: "WORLD_UP" | "CAMERA" }) {
+  const height = params.height;
+  if (!Number.isFinite(height)) return;
+
+  const upAxis = getUpAxis();
+
+  // Base: if storey isolated -> use its min; else use camera target (stable)
+  let base = 0;
+  const current = (this as any).getCurrentIsolateSelection?.() as OBC.ModelIdMap | null;
+
+  if (current) {
+    const box = await this.getSelectionWorldBox(current);
+    if (box && !box.isEmpty()) base = upAxis === "y" ? box.min.y : box.min.z;
+    else {
+      const pose = await this.getCameraPose();
+      base = upAxis === "y" ? pose.target.y : pose.target.z;
+    }
+  } else {
+    const pose = await this.getCameraPose();
+    base = upAxis === "y" ? pose.target.y : pose.target.z;
+  }
+
+  let abs = base + height;
+
+  // Clamp inside model bounds so we never clip everything by accident
+  const model = getActiveModel();
+  if (model?.object) {
+    const box = new THREE.Box3().setFromObject(model.object);
+    if (!box.isEmpty()) {
+      const minH = upAxis === "y" ? box.min.y : box.min.z;
+      const maxH = upAxis === "y" ? box.max.y : box.max.z;
+      const eps = (maxH - minH) * 0.01;
+      abs = Math.max(minH + eps, Math.min(maxH - eps, abs));
+    }
+  }
+
+  // Build plane intended to CLIP ABOVE abs and KEEP below abs.
+  // We'll verify with distanceToPoint and flip if needed.
+  const n = upAxis === "y" ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(0, 0, 1);
+  const p0 = upAxis === "y" ? new THREE.Vector3(0, abs, 0) : new THREE.Vector3(0, 0, abs);
+
+  let plane = new THREE.Plane().setFromNormalAndCoplanarPoint(n, p0);
+  // Debug + auto-fix direction
+  logPlaneTest(plane, abs, upAxis);
+
+  // We want "above" to be clipped. If your renderer keeps the wrong side,
+  // flip the plane. This condition is the robust part:
+  //
+  // If after applying plane you observe it keeps ABOVE and clips BELOW,
+  // then you need plane.negate().
+  //
+  // We can't "apply then check" easily here, but we CAN use a deterministic
+  // rule based on plane distances:
+  //
+  // If plane.distance(above) is NOT greater than plane.distance(below),
+  // the orientation is likely wrong for our intended semantic.
+  const abovePt = upAxis === "y" ? new THREE.Vector3(0, abs + 0.5, 0) : new THREE.Vector3(0, 0, abs + 0.5);
+  const belowPt = upAxis === "y" ? new THREE.Vector3(0, abs - 0.5, 0) : new THREE.Vector3(0, 0, abs - 0.5);
+
+  const da = plane.distanceToPoint(abovePt);
+  const db = plane.distanceToPoint(belowPt);
+
+  // If "above" isn't more on the normal side than "below", flip.
+  if (!(da > db)) {
+    plane = plane.clone().negate();
+    console.log("[PlanCut] plane flipped");
+    logPlaneTest(plane, abs, upAxis);
+  }
+
+  const planes = [plane];
+
+  planCutState = { enabled: true, planes };
+  applyClippingPlanes(planes);
+
+  fragments.core.update(true);
+  world.renderer.three.render(world.scene.three, world.camera.three);
+
+  console.log("[PlanCut]", { upAxis, base, height, absoluteHeight: abs });
+},
+
+
+async clearPlanCut() {
+  planCutState = { enabled: false, planes: [] };
+  clearClippingPlanes();
+  fragments.core.update(true);
+  world.renderer.three.render(world.scene.three, world.camera.three);
+},
+
+getPlanCutState() {
+  return planCutState.enabled
+    ? { enabled: true, planes: planCutState.planes.length }
+    : { enabled: false };
+},
+
+
+async hideCategory(category: string): Promise<boolean> {
+  const modelKey = getActiveModelId();
+  if (!modelKey) return false;
+
+  const listAny: any = (fragments as any).list;
+  const group = typeof listAny?.get === "function" ? listAny.get(modelKey) : listAny?.[modelKey];
+  if (!group?.getItemsOfCategories) return false;
+
+  const norm = normalizeIfcCategory(category);
+  if (!norm) return false;
+
+  const re = new RegExp(`^${norm}$`, "i");
+
+  let out: any;
+  try {
+    out = await group.getItemsOfCategories([re]);
+  } catch (e) {
+    console.warn("[viewerApi] hideCategory: getItemsOfCategories threw", e);
+    return false;
+  }
+
+  const ids = extractNumericIdsFromUnknown(out, norm);
+  if (!ids?.length) return false;
+
+  const map: OBC.ModelIdMap = { [modelKey]: new Set(ids) };
+
+  // track hidden for evidence (if you added hidden tracking earlier)
+  for (const id of ids) ensureHiddenSet(modelKey).add(id);
+
+  await hider.set(false, map);
+  fragments.core.update(true);
+  world.renderer.three.render(world.scene.three, world.camera.three);
+  return true;
+},
+
+async showCategory(category: string): Promise<boolean> {
+  const modelKey = getActiveModelId();
+  if (!modelKey) return false;
+
+  const listAny: any = (fragments as any).list;
+  const group = typeof listAny?.get === "function" ? listAny.get(modelKey) : listAny?.[modelKey];
+  if (!group?.getItemsOfCategories) return false;
+
+  const norm = normalizeIfcCategory(category);
+  if (!norm) return false;
+
+  const re = new RegExp(`^${norm}$`, "i");
+
+  let out: any;
+  try {
+    out = await group.getItemsOfCategories([re]);
+  } catch (e) {
+    console.warn("[viewerApi] showCategory: getItemsOfCategories threw", e);
+    return false;
+  }
+
+  const ids = extractNumericIdsFromUnknown(out, norm);
+  if (!ids?.length) return false;
+
+  const map: OBC.ModelIdMap = { [modelKey]: new Set(ids) };
+
+  const hs = (hiddenMapByModel as any)?.[modelKey] as Set<number> | undefined;
+  if (hs) for (const id of ids) hs.delete(id);
+
+  await hider.set(true, map);
+  fragments.core.update(true);
+  world.renderer.three.render(world.scene.three, world.camera.three);
+  return true;
+},
+
+
+    async hideIds(ids: string[]) {
+      const activeModelId = getActiveModelId();
+      if (!activeModelId) return;
+
+      // Build a ModelIdMap grouped by model
+      const map: OBC.ModelIdMap = {};
+      for (const raw of ids ?? []) {
+        const parsed = parseObjectId(raw);
+        if (!parsed) continue;
+        (map[parsed.modelId] ??= new Set<number>()).add(parsed.localId);
+        ensureHiddenSet(parsed.modelId).add(parsed.localId);
+      }
+
+      // Nothing to hide
+      if (Object.keys(map).length === 0) return;
+
+      // Hide just these items
+      await hider.set(false, map); // <- This is the intended usage. :contentReference[oaicite:1]{index=1}
+      fragments.core.update(true);
+    },
+
+    async showIds(ids: string[]) {
+      const map: OBC.ModelIdMap = {};
+      for (const raw of ids ?? []) {
+        const parsed = parseObjectId(raw);
+        if (!parsed) continue;
+        (map[parsed.modelId] ??= new Set<number>()).add(parsed.localId);
+
+        const s = hiddenMapByModel[parsed.modelId];
+        if (s) s.delete(parsed.localId);
+      }
+
+      if (Object.keys(map).length === 0) return;
+
+      // Show just these items (inverse of hide)
+      await hider.set(true, map);
+      fragments.core.update(true);
+    },
+
+    async getHiddenIds(): Promise<string[]> {
+      // Return canonical "modelId:localId" strings (stable & multi-model safe)
+      const out: string[] = [];
+      const modelIds = Object.keys(hiddenMapByModel).sort();
+      for (const mid of modelIds) {
+        const ids = Array.from(hiddenMapByModel[mid] ?? []).filter(Number.isFinite).sort((a, b) => a - b);
+        for (const localId of ids) out.push(toObjectId(mid, localId));
+      }
+      return out;
+    },
+
+async highlightIds(ids: string[], style?: "primary" | "warn") {
+  const modelId = getActiveModelId();
+  if (!modelId) return;
+
+  const group = getActiveGroupAny();
+  if (!group) return;
+
+  // reset previous highlights
+  if (typeof group.resetHighlight === "function") {
+    group.resetHighlight();
+  }
+
+  // Convert objectIds to local numeric ids
+  const localIds: number[] = [];
+  for (const raw of ids ?? []) {
+    const parsed = parseObjectId(raw);
+    if (!parsed) continue;
+    if (parsed.modelId !== modelId) continue;
+    localIds.push(parsed.localId);
+  }
+  if (!localIds.length) return;
+
+  // Best effort: group.highlight(ids, materialOrStyle?)
+  // We keep it deterministic: same style string passed through if supported.
+  if (typeof group.highlight === "function") {
+    try {
+      group.highlight(localIds, { style: style ?? "primary" });
+    } catch {
+      // many versions accept just ids
+      group.highlight(localIds);
+    }
+  }
+
+  fragments.core.update(true);
+  world.renderer.three.render(world.scene.three, world.camera.three);
+},
+
+
+async pickObjectAt(x: number, y: number): Promise<string | null> {
+  const modelId = getActiveModelId();
+  if (!modelId) return null;
+
+  const group = getActiveGroupAny();
+  if (!group) return null;
+
+  const canvas = world.renderer.three.domElement;
+  const rect = canvas.getBoundingClientRect();
+
+  // Convert to normalized device coords
+  const nx = (x / rect.width) * 2 - 1;
+  const ny = -(y / rect.height) * 2 + 1;
+
+  // Prefer FragmentsGroup.raycast if available (it is, per your proto keys)
+  if (typeof group.raycast === "function") {
+    const hit = group.raycast(world.camera.three, new THREE.Vector2(nx, ny));
+    // hit shape varies by version; try best-effort extraction
+    const ids =
+      (hit && (hit.ids ?? hit.items ?? hit.itemIds ?? hit.id)) ??
+      null;
+
+    const pickFirstNumber = (v: any): number | null => {
+      if (typeof v === "number" && isFinite(v)) return v;
+      if (Array.isArray(v)) {
+        const n = v.find((q) => typeof q === "number" && isFinite(q));
+        return n ?? null;
+      }
+      if (v instanceof Set) {
+        for (const q of v) if (typeof q === "number" && isFinite(q)) return q;
+      }
+      return null;
+    };
+
+    const localId = pickFirstNumber(ids) ?? pickFirstNumber(hit?.item) ?? pickFirstNumber(hit?.localId);
+    if (localId != null) {
+      const objectId = `${modelId}:${localId}`;
+      lastPickedObjectId = objectId;
+      return objectId;
+    }
+  }
+
+  return null;
+},
+
+
+        async getProperties(objectId: string): Promise<Record<string, unknown> | null> {
+      const parsed = parseObjectId(objectId);
+      if (!parsed) return null;
+
+      // Current implementation only supports active model properties reliably.
+      const active = getActiveModelId();
+      if (!active || parsed.modelId !== active) return null;
+
+      const props = await this.getElementProperties(parsed.localId);
+      return (props ?? null) as any;
+    },
+
+async hideSelected(): Promise<void> {
+  if (!lastPickedObjectId) return;
+  await this.hideIds([lastPickedObjectId]);
+},
+
+        getLastPickedObjectId(): string | null {
+      return lastPickedObjectId;
+    },
 
 __debug: {
   getActiveModelKeys: () => Object.keys((getActiveModel() as any) || {}),
@@ -678,7 +1430,9 @@ dumpItemsOfCategories: async (cat: string) =>{
   return [];
 },
 
-
+async stabilizeForSnapshot(): Promise<void> {
+  await stabilizeSceneForSnapshot();
+},
 
     async getSnapshot(opts?: { note?: string }): Promise<ViewerSnapshot> {
       // 1) Ensure fragments update (geometry + visibility state)
@@ -713,6 +1467,9 @@ const imageBase64Png = dataUrl.startsWith("data:image/")
       };
     },
 
+async stabilizeForSnapshot(): Promise<void> {
+  await stabilizeSceneForSnapshot();
+},    
     async getElementProperties(localId: number): Promise<Record<string, any> | null> {
       const model = getActiveModel();
       if (!model) return null;

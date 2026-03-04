@@ -75,6 +75,9 @@ export function buildDeterministicVlmPrompt(args: {
     "- 0.0 = no confidence, 1.0 = absolute confidence.",
     "If verdict is UNCERTAIN OR confidence < minConfidence, request exactly one followUp from allowedFollowUps when helpful.",
     "If no followUp would help, omit followUp.",
+    "For ISOLATE_CATEGORY, always use IFC class names like IfcDoor, IfcStair, IfcSlab (not “doors”, “stairs”).",
+    "For NAVIGATE_TO, do not invent locations; only request if you think a better view would help.",
+    "In evidence.note, briefly explain which parts of the evidence were most relevant to your decision.",
   ].join("\n");
 
   const user = JSON.stringify(payload);

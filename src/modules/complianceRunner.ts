@@ -15,8 +15,25 @@ type NavMetrics = {
 type EvidenceItem = {
   artifact: SnapshotArtifact;
   nav?: NavMetrics;
+  context?: any;
 };
 
+
+type EvidenceContext = {
+  step: number;
+  phase: "context" | "refined" | "final";
+  viewPreset?: "iso" | "top";            // or StartPosePreset
+  cameraPose: CameraPose;               // already accessible
+  scope?: { storeyId?: string; spaceId?: string };
+  isolatedCategories?: string[];
+  hiddenIds?: string[];
+  highlightedIds?: string[];
+  selectedId?: string | null;
+  lastActionReason?: string | null;
+  availableStoreys?: string[];
+  availableSpaces?: string[];
+
+};
 
 type ToastFn = (msg: string, ms?: number) => void;
 
@@ -41,6 +58,34 @@ export function createComplianceRunner(params: {
     setCameraPose: (pose: CameraPose, smooth?: boolean) => Promise<void>;
     getCameraPose: () => Promise<CameraPose>;
     isolateCategory?: (category: string) => Promise<any>; // ideally OBC.ModelIdMap | null
+
+    stabilizeForSnapshot?: () => Promise<void>;
+
+    isolateStorey?: (storeyId: string) => Promise<any>;
+    isolateSpace?: (spaceId: string) => Promise<any>;
+
+    hideIds?: (ids: string[]) => Promise<void>;
+    showIds?: (ids: string[]) => Promise<void>;
+    getHiddenIds?: () => Promise<string[]>;
+
+    hideCategory?: (category: string) => Promise<boolean>;
+    showCategory?: (category: string) => Promise<boolean>;
+    getRendererDomElement?: () => HTMLCanvasElement;
+
+    highlightIds?: (ids: string[], style?: "primary" | "warn") => Promise<void>;
+    pickObjectAt?: (x: number, y: number) => Promise<string | null>;
+    getProperties?: (objectId: string) => Promise<Record<string, unknown> | null>;
+    hideSelected?: () => Promise<void>;
+
+    getActiveScope?: () => Promise<{ storeyId?: string; spaceId?: string }>;
+    getIsolatedCategories?: () => Promise<string[]>;
+
+    setPlanCut?: (p: { height: number; thickness?: number; mode?: "WORLD_UP" | "CAMERA" }) => Promise<void>;
+    clearPlanCut?: () => Promise<void>;
+
+   listStoreys?: () => Promise<string[]>;
+   listSpaces?: () => Promise<string[]>;
+
   };
 
   // inside createComplianceRunner(...)
@@ -57,12 +102,14 @@ export function createComplianceRunner(params: {
     check: (input: {
       prompt: string;
       artifacts: SnapshotArtifact[];
-      evidenceViews: {
-        snapshotId: string;
-        mode: SnapshotArtifact["mode"];
-        note?: string;
-        nav?: NavMetrics;
-      }[];
+evidenceViews: {
+  snapshotId: string;
+  mode: SnapshotArtifact["mode"];
+  note?: string;
+  nav?: NavMetrics;
+  context?: any;
+}[];
+
     }) => Promise<VlmDecision>;
   };
 
@@ -87,6 +134,14 @@ export function createComplianceRunner(params: {
   toast?: ToastFn;
 }) {
   const { viewerApi, snapshotCollector, vlmChecker, complianceDb, navigationAgent, toast } = params;
+
+  // Runner-local evidence state (updated whenever we execute a follow-up)
+  let lastScope: { storeyId?: string; spaceId?: string } = {};
+  let lastIsolatedCategories: string[] = [];
+  let lastHiddenIds: string[] = [];
+  let lastHighlightedIds: string[] = [];
+  let lastSelectedId: string | null = null;
+  let lastViewPreset: StartPosePreset | null = null;
 
   // one-rule-per-project: single active run id
   let activeRunId: string | null = null;
@@ -114,6 +169,7 @@ export function createComplianceRunner(params: {
 
     if (d.mode === "iso" || d.mode === "top") {
       await viewerApi.setPresetView(d.mode, true);
+      lastViewPreset = d.mode;
       return;
     }
 
@@ -127,20 +183,162 @@ function enrichNote(base: string, d: DeterministicStart) {
   return base + ` | start=${d.mode}`;
 }
 
-
+  //------------------------------------------------//
+  //----------------FOLLOW-UP EXECUTOR----------------//
+  //------------------------------------------------//
   // Minimal follow-up executor (no nav yet unless you added goToCurrentIsolateSelection)
   async function executeFollowUp(f: VlmFollowUp | undefined) {
     if (!f) return { didSomething: false, reason: "no-followup" as const };
 
-    if (f.request === "ISO_VIEW") {
-      await viewerApi.setPresetView("iso", true);
-      return { didSomething: true, reason: "iso" as const };
-    }
+if (f.request === "ISO_VIEW") {
+  await viewerApi.setPresetView("iso", true);
+  lastViewPreset = "iso";
+  return { didSomething: true, reason: "iso" as const };
+}
 
-    if (f.request === "TOP_VIEW") {
-      await viewerApi.setPresetView("top", true);
-      return { didSomething: true, reason: "top" as const };
-    }
+if (f.request === "TOP_VIEW") {
+  await viewerApi.setPresetView("top", true);
+  lastViewPreset = "top";
+  return { didSomething: true, reason: "top" as const };
+}
+// Set view preset follow-up
+if (f.request === "SET_VIEW_PRESET") {
+  const preset = f.params.preset;
+  if (preset === "TOP") {
+    await viewerApi.setPresetView("top", true);
+    lastViewPreset = "top";
+    return { didSomething: true, reason: "top" as const };
+  }
+  if (preset === "ISO") {
+    await viewerApi.setPresetView("iso", true);
+    lastViewPreset = "iso";
+    return { didSomething: true, reason: "iso" as const };
+  }
+  // ORBIT preset: if you have a preset view for it, call it; otherwise treat as NEW_VIEW
+  return { didSomething: false, reason: "set-view-preset-not-supported" as const };
+}
+
+// Hide category follow-up (e.g. slabs/ceilings)
+if (f.request === "HIDE_CATEGORY") {
+  if (!viewerApi.hideCategory) {
+    console.warn("[FollowUp] hideCategory not wired");
+    return { didSomething: false, reason: "hide-category-not-wired" as const };
+  }
+  const ok = await viewerApi.hideCategory(f.params.category);
+  if (viewerApi.getHiddenIds) lastHiddenIds = await viewerApi.getHiddenIds();
+  return { didSomething: ok, reason: ok ? "hide-category" as const : "hide-category-failed" as const };
+}
+
+if (f.request === "SHOW_CATEGORY") {
+  if (!viewerApi.showCategory) {
+    console.warn("[FollowUp] showCategory not wired");
+    return { didSomething: false, reason: "show-category-not-wired" as const };
+  }
+  const ok = await viewerApi.showCategory(f.params.category);
+  if (viewerApi.getHiddenIds) lastHiddenIds = await viewerApi.getHiddenIds();
+  return { didSomething: ok, reason: ok ? "show-category" as const : "show-category-failed" as const };
+}
+
+// Pick center follow-up (deterministic, avoids pixel math in the VLM)
+if (f.request === "PICK_CENTER") {
+  if (!viewerApi.pickObjectAt) {
+    console.warn("[FollowUp] pickObjectAt not wired");
+    return { didSomething: false, reason: "pick-not-wired" as const };
+  }
+  const canvas = viewerApi.getRendererDomElement?.();
+  if (!canvas) {
+    console.warn("[FollowUp] getRendererDomElement not wired");
+    return { didSomething: false, reason: "pick-center-no-canvas" as const };
+  }
+  const rect = canvas.getBoundingClientRect();
+  const id = await viewerApi.pickObjectAt(rect.width / 2, rect.height / 2);
+  lastSelectedId = id;
+
+  if (id && viewerApi.highlightIds) {
+    await viewerApi.highlightIds([id], "primary");
+    lastHighlightedIds = [id];
+  }
+
+  return { didSomething: !!id, reason: id ? "picked-center" as const : "pick-center-empty" as const };
+}
+
+// Pick object follow-up
+if (f.request === "PICK_OBJECT") {
+  if (!viewerApi.pickObjectAt) {
+    console.warn("[FollowUp] pickObjectAt not wired");
+    return { didSomething: false, reason: "pick-not-wired" as const };
+  }
+
+  const id = await viewerApi.pickObjectAt(f.params.x, f.params.y);
+  lastSelectedId = id;
+
+  // Auto-highlight picked item if possible
+  if (id && viewerApi.highlightIds) {
+    await viewerApi.highlightIds([id], "primary");
+    lastHighlightedIds = [id];
+  }
+
+  return { didSomething: !!id, reason: id ? "picked" as const : "pick-empty" as const };
+}
+
+// Set plan cut follow-up
+if (f.request === "SET_PLAN_CUT") {
+  if (!viewerApi.setPlanCut) {
+    console.warn("[FollowUp] setPlanCut not wired");
+    return { didSomething: false, reason: "plan-cut-not-wired" as const };
+  }
+  await viewerApi.setPlanCut(f.params);
+  return { didSomething: true, reason: "plan-cut" as const };
+}
+
+if (f.request === "CLEAR_PLAN_CUT") {
+  if (!viewerApi.clearPlanCut) {
+    console.warn("[FollowUp] clearPlanCut not wired");
+    return { didSomething: false, reason: "plan-cut-clear-not-wired" as const };
+  }
+  await viewerApi.clearPlanCut();
+  return { didSomething: true, reason: "plan-cut-clear" as const };
+}
+
+// Highlight ids follow-up
+if (f.request === "HIGHLIGHT_IDS") {
+  if (!viewerApi.highlightIds) {
+    console.warn("[FollowUp] highlightIds not wired");
+    return { didSomething: false, reason: "highlight-not-wired" as const };
+  }
+  const ids = f.params.ids ?? [];
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return { didSomething: false, reason: "highlight-empty" as const };
+  }
+  await viewerApi.highlightIds(ids, f.params.style);
+  lastHighlightedIds = ids;
+  return { didSomething: true, reason: "highlight" as const };
+}
+
+// Get properties follow-up
+if (f.request === "GET_PROPERTIES") {
+  if (!viewerApi.getProperties) {
+    console.warn("[FollowUp] getProperties not wired");
+    return { didSomething: false, reason: "props-not-wired" as const };
+  }
+  const props = await viewerApi.getProperties(f.params.objectId);
+  // Store something minimal in state for evidence metadata (optional)
+  lastSelectedId = f.params.objectId;
+  return { didSomething: !!props, reason: props ? "props" as const : "props-null" as const, props };
+}
+
+// Hide selected follow-up
+if (f.request === "HIDE_SELECTED") {
+  if (!viewerApi.hideSelected) {
+    console.warn("[FollowUp] hideSelected not wired");
+    return { didSomething: false, reason: "hide-selected-not-wired" as const };
+  }
+  await viewerApi.hideSelected();
+  // Update hidden ids tracking if available
+  if (viewerApi.getHiddenIds) lastHiddenIds = await viewerApi.getHiddenIds();
+  return { didSomething: true, reason: "hide-selected" as const };
+}
+
 
 if (f.request === "NEW_VIEW") {
   const pose = await viewerApi.getCameraPose();
@@ -195,6 +393,7 @@ if (f.request === "NEW_VIEW") {
   return { didSomething: true, reason: "zoom" as const };
 }
 
+// Isolate category follow-up
 if (f.request === "ISOLATE_CATEGORY") {
   if (!viewerApi.isolateCategory) {
     console.warn("[FollowUp] isolateCategory not wired");
@@ -225,12 +424,82 @@ if (f.request === "ISOLATE_CATEGORY") {
       occlusionRatio: m.occlusionRatio ?? undefined,
       convergenceScore: m.success ? 1 : 0,
     };
+    lastIsolatedCategories = [category];
     return { didSomething: true, reason: "isolate-category" as const, nav };
   }
-
+  lastIsolatedCategories = [category];
   return { didSomething: true, reason: "isolate-category" as const };
 }
 
+// Isolate storey follow-up
+if (f.request === "ISOLATE_STOREY") {
+  if (!viewerApi.isolateStorey) {
+    console.warn("[FollowUp] isolateStorey not wired");
+    return { didSomething: false, reason: "isolate-storey-not-wired" as const };
+  }
+  await viewerApi.isolateStorey(f.params.storeyId);
+  lastScope = { storeyId: f.params.storeyId };
+  return { didSomething: true, reason: "isolate-storey" as const };
+}
+
+// Isolate space follow-up
+if (f.request === "ISOLATE_SPACE") {
+  if (!viewerApi.isolateSpace) {
+    console.warn("[FollowUp] isolateSpace not wired");
+    return { didSomething: false, reason: "isolate-space-not-wired" as const };
+  }
+  await viewerApi.isolateSpace(f.params.spaceId);
+  lastScope = { spaceId: f.params.spaceId };
+  return { didSomething: true, reason: "isolate-space" as const };
+}
+
+// Reset visibility follow-up
+if (f.request === "RESET_VISIBILITY") {
+  await viewerApi.resetVisibility();
+  lastScope = {};
+  lastIsolatedCategories = [];
+  lastHiddenIds = [];
+  lastHighlightedIds = [];
+  lastSelectedId = null;
+  return { didSomething: true, reason: "reset-visibility" as const };
+}
+
+// Hide IDs follow-up
+if (f.request === "HIDE_IDS") {
+  if (!viewerApi.hideIds) {
+    console.warn("[FollowUp] hideIds not wired");
+    return { didSomething: false, reason: "hide-ids-not-wired" as const };
+  }
+  const ids = f.params.ids ?? [];
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return { didSomething: false, reason: "hide-ids-empty" as const };
+  }
+  await viewerApi.hideIds(ids);
+
+  // prefer authoritative getter if available
+  if (viewerApi.getHiddenIds) lastHiddenIds = await viewerApi.getHiddenIds();
+  else lastHiddenIds = Array.from(new Set([...lastHiddenIds, ...ids]));
+
+  return { didSomething: true, reason: "hide-ids" as const };
+}
+
+// Show IDs follow-up
+if (f.request === "SHOW_IDS") {
+  if (!viewerApi.showIds) {
+    console.warn("[FollowUp] showIds not wired");
+    return { didSomething: false, reason: "show-ids-not-wired" as const };
+  }
+  const ids = f.params.ids ?? [];
+  if (!Array.isArray(ids) || ids.length === 0) {
+    return { didSomething: false, reason: "show-ids-empty" as const };
+  }
+  await viewerApi.showIds(ids);
+
+  if (viewerApi.getHiddenIds) lastHiddenIds = await viewerApi.getHiddenIds();
+  else lastHiddenIds = lastHiddenIds.filter(x => !ids.includes(x));
+
+  return { didSomething: true, reason: "show-ids" as const };
+}
 
     // Optional: if nav exists and you want to support it
     if (f.request === "ORBIT" && navigationAgent?.goToCurrentIsolateSelection) {
@@ -286,13 +555,16 @@ if (f.request === "ISOLATE_CATEGORY") {
           mode: s.artifact.mode,
           note: s.artifact.meta.note,
           nav: s.nav,
+          context: s.context,
         })),
+
       };
     }
 
 let lastActionReason: string | null = null;
 let pendingNav: NavMetrics | undefined = undefined;
-
+let lastFollowUpKey: string | null = null;
+let repeatedFollowUpCount = 0;
 
     // Step loop
     for (let step = 1; step <= maxSteps; step++) {
@@ -300,12 +572,66 @@ const note = enrichNote(`compliance_step_${step}_view`, params.deterministic) +
   (lastActionReason ? ` | prevAction=${lastActionReason}` : "");
 
       const artifact = await snapshotCollector.capture(note, "RENDER_PLUS_JSON_METADATA");
+
+      const b64 = artifact.images?.[0]?.imageBase64Png ?? "";
+const isProbablyBlank = b64.length > 0 && b64.length < 25000; // tune later if needed
+
+if (isProbablyBlank) {
+  console.warn("[Compliance] snapshot looks blank; recovering", {
+    step,
+    lastActionReason,
+    len: b64.length,
+  });
+
+  // Undo the most common causes of blankness
+  await viewerApi.clearPlanCut?.();
+  await viewerApi.resetVisibility();
+  await viewerApi.setPresetView("iso", true);
+  lastViewPreset = "iso";
+
+  lastScope = {};
+  lastIsolatedCategories = [];
+  lastHiddenIds = [];
+  lastHighlightedIds = [];
+  lastSelectedId = null;
+
+  await (viewerApi as any).stabilizeForSnapshot?.();
+
+  // Continue to next step (which will recapture clean evidence)
+  continue;
+}
+
+
       if (artifact.mode !== "RENDER_PLUS_JSON_METADATA") {
   console.warn("[Compliance] unexpected snapshot mode", artifact.mode);
 }
 
+const cameraPose = await viewerApi.getCameraPose();
+const phase: EvidenceContext["phase"] =
+  step === 1 ? "context" : step === maxSteps ? "final" : "refined";
+const availableStoreys = viewerApi.listStoreys ? await viewerApi.listStoreys() : undefined;
+const availableSpaces = viewerApi.listSpaces ? await viewerApi.listSpaces() : undefined;
+const planCutState = (viewerApi as any).getPlanCutState ? await (viewerApi as any).getPlanCutState() : undefined;
+
+// capture current evidence context
+const context: EvidenceContext = {
+  step,
+  phase,
+  viewPreset: lastViewPreset ?? undefined,
+  cameraPose,
+  scope: (lastScope.storeyId || lastScope.spaceId) ? lastScope : undefined,
+  isolatedCategories: lastIsolatedCategories.length ? lastIsolatedCategories : undefined,
+  hiddenIds: lastHiddenIds.length ? lastHiddenIds : undefined,
+  highlightedIds: lastHighlightedIds.length ? lastHighlightedIds : undefined,
+  selectedId: lastSelectedId ?? undefined,
+  lastActionReason: lastActionReason ?? undefined,
+  availableStoreys,
+  availableSpaces,
+  planCut: planCutState,
+};
+
 // then after you capture the next snapshot:
-pushEvidence({ artifact, nav: pendingNav });
+pushEvidence({ artifact, nav: pendingNav, context });
 pendingNav = undefined;
 
 
@@ -337,16 +663,41 @@ pendingNav = undefined;
       }
 
       if ((decision.verdict === "PASS" || decision.verdict === "FAIL") && !confident) {
+const followUpKey = decision.followUp ? JSON.stringify(decision.followUp) : null;
+if (followUpKey && followUpKey === lastFollowUpKey) repeatedFollowUpCount++;
+else repeatedFollowUpCount = 0;
+lastFollowUpKey = followUpKey;
+
+if (repeatedFollowUpCount >= 1) {
+  console.warn("[Compliance] repeating same followUp, forcing recovery", decision.followUp);
+
+  await viewerApi.clearPlanCut?.();
+  await viewerApi.resetVisibility();
+  await viewerApi.setPresetView("iso", true);
+  lastViewPreset = "iso";
+
+  lastScope = {};
+  lastIsolatedCategories = [];
+  lastHiddenIds = [];
+  lastHighlightedIds = [];
+  lastSelectedId = null;
+
+  await (viewerApi as any).stabilizeForSnapshot?.();
+  continue;
+}
+
         const acted = await executeFollowUp(decision.followUp);
-        lastActionReason = acted.reason;
-        pendingNav = (acted as any).nav ?? undefined;
+lastActionReason = acted.reason;
+pendingNav = (acted as any).nav ?? undefined;
 
+if (acted.didSomething) {
+  await (viewerApi as any).stabilizeForSnapshot?.();
+  continue;
+}
 
-        if (!acted.didSomething) {
-          toast?.(`Low-confidence ${decision.verdict} with no actionable follow-up. Stopping.`);
-          return { ok: true as const, runId: activeRunId, final: decision };
-        }
-        continue;
+toast?.(`Low-confidence ${decision.verdict} with no actionable follow-up. Stopping.`);
+return { ok: true as const, runId: activeRunId, final: decision };
+
       }
 
       if (decision.verdict === "UNCERTAIN" && confident) {
@@ -356,15 +707,41 @@ pendingNav = undefined;
         return { ok: true as const, runId: activeRunId, final: decision };
       }
 
+const followUpKey = decision.followUp ? JSON.stringify(decision.followUp) : null;
+if (followUpKey && followUpKey === lastFollowUpKey) repeatedFollowUpCount++;
+else repeatedFollowUpCount = 0;
+lastFollowUpKey = followUpKey;
+
+if (repeatedFollowUpCount >= 1) {
+  console.warn("[Compliance] repeating same followUp, forcing recovery", decision.followUp);
+
+  await viewerApi.clearPlanCut?.();
+  await viewerApi.resetVisibility();
+  await viewerApi.setPresetView("iso", true);
+  lastViewPreset = "iso";
+
+  lastScope = {};
+  lastIsolatedCategories = [];
+  lastHiddenIds = [];
+  lastHighlightedIds = [];
+  lastSelectedId = null;
+
+  await (viewerApi as any).stabilizeForSnapshot?.();
+  continue;
+}
+
       const acted = await executeFollowUp(decision.followUp);
-      lastActionReason = acted.reason;
-      pendingNav = (acted as any).nav ?? undefined;
+lastActionReason = acted.reason;
+pendingNav = (acted as any).nav ?? undefined;
 
+if (acted.didSomething) {
+  await (viewerApi as any).stabilizeForSnapshot?.();
+  continue;
+}
 
-      if (!acted.didSomething) {
-        toast?.("UNCERTAIN with no actionable follow-up. Stopping.");
-        return { ok: true as const, runId: activeRunId, final: decision };
-      }
+toast?.("UNCERTAIN with no actionable follow-up. Stopping.");
+return { ok: true as const, runId: activeRunId, final: decision };
+
     }
 
     toast?.("Max steps reached without conclusive compliance result.");

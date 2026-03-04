@@ -9,6 +9,7 @@
 
 import type { SnapshotArtifact } from "../snapshotCollector";
 import type { EvidenceView, VlmAdapter, VlmCheckInput, VlmFollowUp, VlmVerdict } from "../vlmChecker";
+import { wrapPromptBase } from "./prompts/basePrompt";
 
 export type OpenRouterAdapterConfig = {
   apiKey: string;
@@ -63,17 +64,73 @@ function isVerdict(v: unknown): v is VlmVerdict {
   return v === "PASS" || v === "FAIL" || v === "UNCERTAIN";
 }
 
+
+//-----------------------------------------------//
+//-----------------Follow-up check---------------//
+//-----------------------------------------------//
 function isFollowUp(x: any): x is VlmFollowUp {
   if (!x || typeof x !== "object") return false;
 
-  if (x.request === "NEW_VIEW") return !x.params || typeof x.params === "object";
-  if (x.request === "ISO_VIEW") return true;
-  if (x.request === "TOP_VIEW") return true;
-  if (x.request === "ZOOM_IN") return !x.params || typeof x.params === "object";
-  if (x.request === "ORBIT") return x.params && typeof x.params.degrees === "number";
-  if (x.request === "ISOLATE_CATEGORY") return x.params && typeof x.params.category === "string";
+  const req = x.request;
 
-  return false;
+  switch (req) {
+    case "NEW_VIEW":
+      return !x.params || typeof x.params === "object";
+
+    case "ISO_VIEW":
+    case "TOP_VIEW":
+    case "RESET_VISIBILITY":
+    case "HIDE_SELECTED":
+    case "PICK_CENTER":
+      return true;
+
+    case "SET_VIEW_PRESET":
+      return (
+        x.params &&
+        (x.params.preset === "TOP" || x.params.preset === "ISO" || x.params.preset === "ORBIT")
+      );
+
+    case "ORBIT":
+      return x.params && typeof x.params.degrees === "number" && isFinite(x.params.degrees);
+
+    case "ZOOM_IN":
+      return !x.params || (typeof x.params === "object");
+
+    case "ISOLATE_CATEGORY":
+      return x.params && typeof x.params.category === "string" && x.params.category.length > 0;
+
+    case "HIDE_CATEGORY":
+      return x.params && typeof x.params.category === "string" && x.params.category.length > 0;
+
+    case "SHOW_CATEGORY":
+      return x.params && typeof x.params.category === "string" && x.params.category.length > 0;
+
+    case "HIDE_IDS":
+    case "SHOW_IDS":
+    case "HIGHLIGHT_IDS":
+      return x.params && Array.isArray(x.params.ids) && x.params.ids.every((id: any) => typeof id === "string");
+
+    case "ISOLATE_STOREY":
+      return x.params && typeof x.params.storeyId === "string" && x.params.storeyId.length > 0;
+
+    case "ISOLATE_SPACE":
+      return x.params && typeof x.params.spaceId === "string" && x.params.spaceId.length > 0;
+
+    case "PICK_OBJECT":
+      return (
+        x.params &&
+        typeof x.params.x === "number" &&
+        typeof x.params.y === "number" &&
+        isFinite(x.params.x) &&
+        isFinite(x.params.y)
+      );
+
+    case "GET_PROPERTIES":
+      return x.params && typeof x.params.objectId === "string" && x.params.objectId.length > 0;
+
+    default:
+      return false;
+  }
 }
 
 function toPngDataUrl(base64Png: string): string {
@@ -86,29 +143,41 @@ function stableEvidenceJson(evidenceViews: EvidenceView[]): string {
   return JSON.stringify(evidenceViews, null, 2);
 }
 
-function wrapPrompt(prompt: string, evidenceViewsJson: string): string {
-  return (
-    "You are a BIM compliance vision checker.\n" +
-    "You must NOT guess geometry. Treat evidenceViews.nav metrics as authoritative.\n" +
-    "Return ONLY valid JSON (no markdown, no commentary, no extra keys).\n" +
-    "JSON shape:\n" +
-    "{\n" +
-    '  "verdict": "PASS" | "FAIL" | "UNCERTAIN",\n' +
-    '  "confidence": number,\n' +
-    '  "rationale": string,\n' +
-    '  "visibility": { "isRuleTargetVisible": boolean, "occlusionAssessment": "LOW"|"MEDIUM"|"HIGH", "missingEvidence"?: string[] },\n' +
-    '  "evidence": { "snapshotIds": string[], "mode": string, "note"?: string },\n' +
-    '  "followUp"?: { "request": "NEW_VIEW"|"ISO_VIEW"|"TOP_VIEW"|"ZOOM_IN"|"ORBIT"|"ISOLATE_CATEGORY", "params"?: object }\n' +
-    "}\n" +
-    "Rules:\n" +
-    "- confidence must be within [0,1].\n" +
-    "- If uncertain, set verdict=UNCERTAIN and propose followUp.\n\n" +
-    "evidenceViews (authoritative nav metrics; ordering matches the images provided):\n" +
-    evidenceViewsJson +
-    "\n\nTASK PROMPT:\n" +
-    prompt
-  );
+function getLastContext(evidenceViews: any[]): any | undefined {
+  const last = evidenceViews?.[evidenceViews.length - 1];
+  return last?.context;
 }
+
+function normalize(s: string) {
+  return String(s ?? "").trim().toLowerCase();
+}
+
+function pickStoreyFromPrompt(prompt: string, available: string[] | undefined): string | null {
+  if (!available?.length) return null;
+
+  const p = normalize(prompt);
+
+  // Very small deterministic matching for PoC
+  const wantsFirst =
+    p.includes("first floor") || p.includes("1st floor") || p.includes("floor 1") || p.includes("level 1");
+
+  if (wantsFirst) {
+    const exact = available.find((x) => normalize(x) === "first floor");
+    if (exact) return exact;
+
+    // fallback: contains "first"
+    const contains = available.find((x) => normalize(x).includes("first"));
+    if (contains) return contains;
+  }
+
+  // If prompt directly contains one of the storey names, pick it
+  for (const s of available) {
+    if (p.includes(normalize(s))) return s;
+  }
+
+  return null;
+}
+
 
 function extractFirstJsonObject(text: string): string | null {
   const a = text.indexOf("{");
@@ -173,9 +242,11 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
 
 
       const evidenceViewsJson = stableEvidenceJson(input.evidenceViews);
-      const userText = wrapPrompt(input.prompt, evidenceViewsJson) +
-        "\n\nimageIndex (maps each provided image to snapshotId):\n" +
-        imageIndexJson;
+      const userText = wrapPromptBase({
+        taskPrompt: input.prompt,
+        evidenceViewsJson,
+        imageIndexJson,
+      });
 
 
       const body = {
@@ -302,7 +373,57 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
           : undefined,
       } as const;
 
-      const followUp = isFollowUp(parsed?.followUp) ? parsed.followUp : undefined;
+let followUp = isFollowUp(parsed?.followUp) ? parsed.followUp : undefined;
+
+// --- Deterministic guardrail: prevent infinite NEW_VIEW loops for PoC ---
+if (verdict === "UNCERTAIN") {
+  const ctxAny = getLastContext(input.evidenceViews as any[]);
+  const availableStoreys: string[] | undefined = ctxAny?.availableStoreys;
+  const currentScopeStorey: string | undefined = ctxAny?.scope?.storeyId;
+  const currentViewPreset: string | undefined = ctxAny?.viewPreset; // "iso" | "top"
+  const isolatedCats: string[] | undefined = ctxAny?.isolatedCategories;
+
+  const wantedStorey = pickStoreyFromPrompt(input.prompt, availableStoreys);
+
+  const followUpIsNewView = followUp?.request === "NEW_VIEW";
+
+  // If model says NEW_VIEW but we have an obvious next action, override it.
+  if (!followUp || followUpIsNewView) {
+    // 1) If prompt references a storey, isolate it first.
+    if (wantedStorey && currentScopeStorey !== wantedStorey) {
+      followUp = { request: "ISOLATE_STOREY", params: { storeyId: wantedStorey } } as any;
+    }
+    // 2) Then go to TOP view for accessibility checks.
+    else if (currentViewPreset !== "top") {
+      followUp = { request: "TOP_VIEW" } as any;
+    }
+    // 3) Then apply plan cut to remove walls above doors.
+    else {
+      followUp = {
+        request: "SET_PLAN_CUT",
+        params: { height: 1.2, mode: "WORLD_UP" },
+      } as any;
+    }
+
+    // 4) Once we already are in top+plan cut, isolate doors.
+    // (We can’t detect planCut state yet, so use isolatedCats heuristic.)
+    if (
+      followUp?.request === "SET_PLAN_CUT" &&
+      isolatedCats &&
+      isolatedCats.some((c) => normalize(c).includes("ifcdoor"))
+    ) {
+      // Already doors isolated, don't replace.
+    } else if (
+      currentViewPreset === "top" &&
+      isolatedCats &&
+      isolatedCats.length > 0 &&
+      !isolatedCats.some((c) => normalize(c).includes("ifcdoor"))
+    ) {
+      followUp = { request: "ISOLATE_CATEGORY", params: { category: "IfcDoor" } } as any;
+    }
+  }
+}
+
 
       const decision: DecisionCore = {
         verdict,
