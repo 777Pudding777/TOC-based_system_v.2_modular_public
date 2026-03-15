@@ -10,6 +10,12 @@
 
 import type { SnapshotArtifact } from "./snapshotCollector";
 
+const DEFAULT_ALLOWED_DOMAINS = ["codes.iccsafe.org"];
+const WEB_FETCH_PROXY_BASE_URL =
+  import.meta.env.VITE_WEB_FETCH_PROXY_URL ?? ""; // put your worker URL here via env
+
+import { webFetchViaProxy } from "./vlmAdapters/tools/webFetch";
+
 export type VlmVerdict = "PASS" | "FAIL" | "UNCERTAIN";
 
 export type ViewPreset = "TOP" | "ISO" | "ORBIT";
@@ -47,8 +53,10 @@ export type VlmFollowUp =
   | { request: "HIDE_SELECTED" }
 
   | { request: "SET_PLAN_CUT"; params: { height: number; thickness?: number; mode?: "WORLD_UP" | "CAMERA" } }
-| { request: "CLEAR_PLAN_CUT" };
+  | { request: "CLEAR_PLAN_CUT" }
 
+// Internal tool-like step (no viewer action): fetch authoritative code text via allowlisted proxy
+  | { request: "WEB_FETCH"; params: { url: string; maxChars?: number; selector?: string; focus?: { contains?: string[]; windowChars?: number } } };
 
 export type VlmDecision = {
   decisionId: string;
@@ -193,6 +201,14 @@ function isFollowUp(x: any): x is VlmFollowUp {
         x.params.ids.every((id: any) => typeof id === "string") &&
         (x.params.style === undefined || x.params.style === "primary" || x.params.style === "warn")
       );
+    case "WEB_FETCH":
+      return (
+        x.params &&
+        typeof x.params.url === "string" &&
+        x.params.url.length > 0 &&
+        (x.params.maxChars === undefined || (typeof x.params.maxChars === "number" && isFinite(x.params.maxChars))) &&
+        (x.params.selector === undefined || typeof x.params.selector === "string")
+      );
 
     case "HIDE_SELECTED":
     case "HIDE_CATEGORY":
@@ -207,6 +223,74 @@ function isFollowUp(x: any): x is VlmFollowUp {
   }
 }
 
+function extractAllowedDomainsFromPrompt(p: string): string[] | null {
+  const m = p.match(/AllowedSources:\s*([\s\S]*?)(\n\n|$)/i);
+  if (!m) return null;
+
+  const block = m[1];
+  const lines = block
+    .split("\n")
+    .map((l) => l.replace(/^\s*-\s*/, "").trim())
+    .filter(Boolean);
+
+  const domains: string[] = [];
+  for (const raw of lines) {
+    // Accept both full URLs and plain hostnames
+    const candidate = raw.includes("://") ? raw : `https://${raw}`;
+    try {
+      const host = new URL(candidate).hostname.toLowerCase();
+      if (host) domains.push(host);
+    } catch {
+      // ignore invalid entries
+    }
+  }
+
+  const uniq = Array.from(new Set(domains));
+  return uniq.length ? uniq : null;
+}
+
+function composePromptWithRegulatoryContext(args: {
+  userIntent: string;
+  regulatoryContext: string;
+  allowedDomains: string[];
+  }): string {
+  const allowedLines = args.allowedDomains.map((d) => `- https://${d}`).join("\n");
+  const ctx = args.regulatoryContext.trim();
+
+  return (
+    "USER_INTENT:\n" +
+    args.userIntent +
+    "\n\n" +
+    "AllowedSources:\n" +
+    allowedLines +
+    "\n\n" +
+    "REGULATORY_CONTEXT:\n" +
+    (ctx.length ? ctx : "(none yet; fetch if needed)") +
+    "\n"
+  );
+}
+
+function isVagueCompliancePrompt(p: string): boolean {
+  const s = (p ?? "").toLowerCase();
+  const hasNumber = /\b\d+(\.\d+)?\b/.test(s);            // any numeric threshold or clause
+  const hasClauseWord = /\b(section|sec\.|clause|chapter)\b/.test(s);
+  const hasEdition = /\b(20\d{2})\b/.test(s);
+  return !(hasNumber || hasClauseWord) || !hasEdition;
+}
+
+function guessIccEntrypointUrl(userIntent: string, allowedDomains: string[]): string | null {
+  // Deterministic fallback: if ICC is allowlisted and prompt mentions IBC 2018 -> use IBC2018P6 root.
+  // Otherwise: just use ICC home (still on allowlist).
+  const s = (userIntent ?? "").toLowerCase();
+  const iccAllowed = allowedDomains.some(d => d === "codes.iccsafe.org" || d.endsWith(".iccsafe.org"));
+  if (!iccAllowed) return null;
+
+  if (s.includes("ibc") && s.includes("2018")) return "https://codes.iccsafe.org/content/IBC2018P6";
+  if (s.includes("ibc") && s.includes("2021")) return "https://codes.iccsafe.org/content/IBC2021P2";
+  // keep minimal; extend later with more editions if you want
+
+  return "https://codes.iccsafe.org";
+}
 
 function normalizeInput(input: VlmCheckInput): VlmCheckInput {
   const artifacts = Array.isArray(input.artifacts) ? input.artifacts : [];
@@ -219,13 +303,13 @@ function normalizeInput(input: VlmCheckInput): VlmCheckInput {
 
   // EvidenceViews should be parallel. If missing/short, synthesize deterministically from artifacts.
   if (views.length !== artifacts.length) {
-const synthesized: EvidenceView[] = artifacts.map(a => ({
+  const synthesized: EvidenceView[] = artifacts.map(a => ({
   snapshotId: a.id,
   mode: a.mode,
   note: a.meta?.note,
   nav: undefined,
   context: (a.meta as any)?.context, // best-effort carry if snapshot meta includes it
-}));
+  }));
 
     // If some views exist, keep them in order for the overlapping prefix; fill the rest.
     const min = Math.min(views.length, synthesized.length);
@@ -251,7 +335,7 @@ function finalizeDecision(
   core: Omit<VlmDecision, "decisionId" | "timestampIso">,
   input: VlmCheckInput,
   provider: string
-): VlmDecision {
+  ): VlmDecision {
   const allowedIds = input.artifacts.map(a => a.id);
   const allowed = new Set(allowedIds);
 
@@ -395,11 +479,120 @@ export function createVlmChecker(adapter: VlmAdapter) {
   return {
     adapterName: adapter.name,
 
-async check(input: VlmCheckInput): Promise<VlmDecision> {
-  const norm = normalizeInput(input);
-  const core = await adapter.check(norm);
-  return finalizeDecision(core, norm, adapter.name);
-},
+    async check(input: VlmCheckInput): Promise<VlmDecision> {
+      const norm0 = normalizeInput(input);
+
+      // Keep original user prompt stable; accumulate regulatory context deterministically.
+      const userIntent = norm0.prompt;
+      let regulatoryContext = "";
+      const fetchedUrls = new Set<string>();
+
+      const allowedDomains = extractAllowedDomainsFromPrompt(userIntent) ?? DEFAULT_ALLOWED_DOMAINS;
+
+      // Run at most 2 iterations: initial decision + (optional) one WEB_FETCH grounding pass.
+      for (let step = 0; step < 3; step++) {
+        let composedPrompt = composePromptWithRegulatoryContext({
+          userIntent,
+          regulatoryContext,
+          allowedDomains,
+        });
+
+        // If prompt is vague and we have no regulatory text yet, push WEB_FETCH first.
+        if (step === 0 && !regulatoryContext.trim() && isVagueCompliancePrompt(userIntent)) {
+          composedPrompt +=
+            "\n\nSYSTEM_NOTE:\n" +
+            "The requirement is vague / missing thresholds. Prioritize WEB_FETCH first to retrieve the authoritative clause text from AllowedSources.\n" +
+            "If you don’t know the section URL yet, fetch a relevant code TOC/chapter page first.\n";
+        }
+        const norm: VlmCheckInput = { ...norm0, prompt: composedPrompt };
+        const core = await adapter.check(norm);
+
+        //--------------------------------------------------
+        //--------------WEB_FETCH FOLLOW-UP LOGIC----------------
+        //---------------------------------------------------
+        // If model requests WEB_FETCH, execute it internally and re-run once.
+        const fu = isFollowUp(core.followUp) ? core.followUp : undefined;
+        if (core.verdict === "UNCERTAIN" && fu?.request === "WEB_FETCH") {
+          console.log("[VLM] WEB_FETCH requested. raw params:", fu.params);
+
+          if (!WEB_FETCH_PROXY_BASE_URL) {
+            console.warn("[VLM] WEB_FETCH proxy not configured.");
+            const patched = {
+              ...core,
+              followUp: undefined,
+              rationale:
+                (core.rationale ? core.rationale + " " : "") +
+                "WEB_FETCH requested but proxy is not configured (VITE_WEB_FETCH_PROXY_URL).",
+            };
+            return finalizeDecision(patched as any, norm, adapter.name);
+          }
+
+          let url = (fu.params as any)?.url as string | undefined;
+
+          // Fallback if model forgot url
+          if (!url) {
+            url = guessIccEntrypointUrl(userIntent, allowedDomains) ?? undefined;
+            console.log("[VLM] WEB_FETCH missing url; fallback entrypoint:", url);
+          }
+
+          if (!url) {
+            const patched = {
+              ...core,
+              followUp: { request: "NEW_VIEW", params: { reason: "WEB_FETCH requested but no url provided and no fallback entrypoint available." } } as VlmFollowUp,
+            };
+            return finalizeDecision(patched as any, norm, adapter.name);
+          }
+
+          if (fetchedUrls.has(url)) {
+            regulatoryContext =
+              (regulatoryContext ? regulatoryContext + "\n\n" : "") +
+              `WEB_EVIDENCE_NOTE:\n[source: ${url}]\nAlready fetched in this run.\n`;
+            continue;
+          }
+          fetchedUrls.add(url);
+
+          console.log("[VLM] WEB_FETCH start:", { url, proxy: WEB_FETCH_PROXY_BASE_URL });
+          const t0 = performance.now();
+
+          const result = await webFetchViaProxy({
+            targetUrl: url,
+            allowedDomains,
+            proxyBaseUrl: WEB_FETCH_PROXY_BASE_URL,
+            maxChars: (fu.params as any)?.maxChars ?? 20000,
+            cache: { enabled: true, ttlMs: 7 * 24 * 60 * 60 * 1000, persist: true },
+          });
+
+          console.log("[VLM] WEB_FETCH done:", {
+            ok: result.ok,
+            ms: Math.round(performance.now() - t0),
+            chars: result.text?.length ?? 0,
+            error: result.error,
+            fromCache: (result as any).fromCache,
+          });
+
+          const injected = result.ok
+            ? `WEB_EVIDENCE:\n[source: ${result.url}]\n${(result as any).fromCache ? `[cache: ${(result as any).fromCache}]\n` : ""}${result.text}\n`
+            : `WEB_EVIDENCE_ERROR:\n[source: ${result.url}]\n${result.error}\n`;
+
+          regulatoryContext = (regulatoryContext ? regulatoryContext + "\n\n" : "") + injected;
+          continue;
+        }
+
+        // Normal path: finalize now.
+        return finalizeDecision(core, norm, adapter.name);
+      }
+
+
+// Should not reach here; fallback conservative.
+    const composedPrompt = composePromptWithRegulatoryContext({
+      userIntent,
+      regulatoryContext,
+      allowedDomains,
+    });
+    const norm: VlmCheckInput = { ...norm0, prompt: composedPrompt };
+    const fallbackCore = await adapter.check(norm);
+    return finalizeDecision(fallbackCore, norm, adapter.name);
+    },
 
   };
 }

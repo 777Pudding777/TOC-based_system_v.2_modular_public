@@ -348,6 +348,7 @@ function applyClippingPlanes(planes: THREE.Plane[]) {
     (m as any).side = THREE.DoubleSide;
     (m as any).clippingPlanes = planes;
     (m as any).clipIntersection = planes.length > 1;
+    (m as any).clipping = true;
     m.needsUpdate = true;
   });
 }
@@ -426,14 +427,16 @@ async function stabilizeSceneForSnapshot() {
   fragments.core.update(true);
 
   // 3) give worker/main thread time to apply changes
-  await waitFrames(3);
+  await waitFrames(4);
 
   // 4) update again (often fixes "half updated" frames)
   fragments.core.update(true);
-  await waitFrames(2);
+  await waitFrames(3);
 
   // 5) force a render right before readback
-  world.renderer.three.render(world.scene.three, world.camera.three);
+world.renderer.three.render(world.scene.three, world.camera.three);
+await waitFrames(1);
+world.renderer.three.render(world.scene.three, world.camera.three);
 }
 
   let visibilityState = {
@@ -508,6 +511,41 @@ async function stabilizeSceneForSnapshot() {
       target: { x: center.x, y: center.y, z: center.z },
     };
   }
+
+function sampleCanvasLuma(canvas: HTMLCanvasElement): number {
+  // sample a few pixels deterministically from the center-ish area
+  const ctx2d = document.createElement("canvas").getContext("2d");
+  if (!ctx2d) return 0;
+
+  const w = 32, h = 32;
+  ctx2d.canvas.width = w;
+  ctx2d.canvas.height = h;
+
+  // draw current WebGL canvas into 2d (browser allows this for same-origin canvas)
+  try {
+    ctx2d.drawImage(canvas, 0, 0, w, h);
+  } catch {
+    // if blocked for any reason, return 0; calibration will fall back
+    return 0;
+  }
+
+  const img = ctx2d.getImageData(0, 0, w, h).data;
+  // compute average luma
+  let sum = 0;
+  for (let i = 0; i < img.length; i += 4) {
+    const r = img[i], g = img[i + 1], b = img[i + 2];
+    sum += 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  }
+  return sum / (w * h);
+}
+
+async function renderBarrier() {
+  fragments.core.update(true);
+  world.renderer.three.render(world.scene.three, world.camera.three);
+  await waitFrames(2);
+  fragments.core.update(true);
+  world.renderer.three.render(world.scene.three, world.camera.three);
+}
 
   // Helpers for IFC type ID extraction from various shapes of output
 function extractNumericIdsFromUnknown(out: any, preferredKey?: string): number[] | null {
@@ -691,17 +729,22 @@ function debugDescribeOut(out: any) {
       }, smooth);
     },
 
-    async isolate(map: OBC.ModelIdMap) {
-      const count = countItems(map);
-      if (count === 0) return;
+async isolate(map: OBC.ModelIdMap) {
+  const count = countItems(map);
+  if (count === 0) return;
 
-      await hider.set(true);
-      await hider.isolate(map);
+  await hider.set(true);
+  await hider.isolate(map);
 
-      // update visibility state for metadata/logging
-      lastIsolateMap = cloneModelIdMap(map);
-      visibilityState = { mode: "isolate", lastIsolateCount: count };
-    },
+  // update visibility state for metadata/logging
+  lastIsolateMap = cloneModelIdMap(map);
+  visibilityState = { mode: "isolate", lastIsolateCount: count };
+
+  // ✅ settle barrier so next snapshot isn't too early
+  await stabilizeSceneForSnapshot();
+  fragments.core.update(true);
+  world.renderer.three.render(world.scene.three, world.camera.three);
+},
 
 async resetVisibility() {
   await hider.set(true);
@@ -909,6 +952,9 @@ async setPlanCut(params: { height: number; thickness?: number; mode?: "WORLD_UP"
   const height = params.height;
   if (!Number.isFinite(height)) return;
 
+  const mode = params.mode ?? "WORLD_UP";
+
+  // --- compute absolute cut position (abs) in a stable way ---
   const upAxis = getUpAxis();
 
   // Base: if storey isolated -> use its min; else use camera target (stable)
@@ -941,37 +987,54 @@ async setPlanCut(params: { height: number; thickness?: number; mode?: "WORLD_UP"
     }
   }
 
-  // Build plane intended to CLIP ABOVE abs and KEEP below abs.
-  // We'll verify with distanceToPoint and flip if needed.
-  const n = upAxis === "y" ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(0, 0, 1);
-  const p0 = upAxis === "y" ? new THREE.Vector3(0, abs, 0) : new THREE.Vector3(0, 0, abs);
+  // --- Build a SINGLE clipping plane ---
+  // For WORLD_UP: plane normal is world-up; we keep BELOW and clip ABOVE.
+  // For CAMERA: plane normal is opposite the camera forward vector, so we clip "in front"
+  //             and keep the side nearer to the camera (CAD-like sectioning).
+  let n: THREE.Vector3;
+  let p0: THREE.Vector3;
+
+  if (mode === "CAMERA") {
+    // camera forward direction in world coords: from eye -> target
+    const pose = await this.getCameraPose();
+    const eye = new THREE.Vector3(pose.eye.x, pose.eye.y, pose.eye.z);
+    const target = new THREE.Vector3(pose.target.x, pose.target.y, pose.target.z);
+    const forward = target.clone().sub(eye).normalize();
+
+    // We want the kept half-space to be the side nearer the camera.
+    // Using normal = -forward typically keeps the camera side.
+    n = forward.clone().negate();
+
+    // Position plane at "abs" along world up axis (still driven by height input).
+    // (This keeps your current semantics: height is a vertical plan height.)
+    p0 = upAxis === "y" ? new THREE.Vector3(0, abs, 0) : new THREE.Vector3(0, 0, abs);
+  } else {
+    // WORLD_UP (classic plan cut): keep below abs, clip above
+    n = upAxis === "y" ? new THREE.Vector3(0, -1, 0) : new THREE.Vector3(0, 0, -1);
+    p0 = upAxis === "y" ? new THREE.Vector3(0, abs, 0) : new THREE.Vector3(0, 0, abs);
+  }
 
   let plane = new THREE.Plane().setFromNormalAndCoplanarPoint(n, p0);
-  // Debug + auto-fix direction
-  logPlaneTest(plane, abs, upAxis);
 
-  // We want "above" to be clipped. If your renderer keeps the wrong side,
-  // flip the plane. This condition is the robust part:
-  //
-  // If after applying plane you observe it keeps ABOVE and clips BELOW,
-  // then you need plane.negate().
-  //
-  // We can't "apply then check" easily here, but we CAN use a deterministic
-  // rule based on plane distances:
-  //
-  // If plane.distance(above) is NOT greater than plane.distance(below),
-  // the orientation is likely wrong for our intended semantic.
-  const abovePt = upAxis === "y" ? new THREE.Vector3(0, abs + 0.5, 0) : new THREE.Vector3(0, 0, abs + 0.5);
-  const belowPt = upAxis === "y" ? new THREE.Vector3(0, abs - 0.5, 0) : new THREE.Vector3(0, 0, abs - 0.5);
+  // --- Deterministic orientation sanity: ensure "below" is kept for WORLD_UP ---
+  // We do a simple check for WORLD_UP only (CAMERA mode depends on view direction).
+  if (mode !== "CAMERA") {
+    const abovePt = upAxis === "y"
+      ? new THREE.Vector3(0, abs + 0.5, 0)
+      : new THREE.Vector3(0, 0, abs + 0.5);
 
-  const da = plane.distanceToPoint(abovePt);
-  const db = plane.distanceToPoint(belowPt);
+    const belowPt = upAxis === "y"
+      ? new THREE.Vector3(0, abs - 0.5, 0)
+      : new THREE.Vector3(0, 0, abs - 0.5);
 
-  // If "above" isn't more on the normal side than "below", flip.
-  if (!(da > db)) {
-    plane = plane.clone().negate();
-    console.log("[PlanCut] plane flipped");
-    logPlaneTest(plane, abs, upAxis);
+    const dAbove = plane.distanceToPoint(abovePt);
+    const dBelow = plane.distanceToPoint(belowPt);
+
+    // If below isn't the "kept" side (positive-ish), flip.
+    // This matches many Three pipelines where negative is clipped.
+    if (dBelow < dAbove) {
+      plane = plane.clone().negate();
+    }
   }
 
   const planes = [plane];
@@ -982,7 +1045,7 @@ async setPlanCut(params: { height: number; thickness?: number; mode?: "WORLD_UP"
   fragments.core.update(true);
   world.renderer.three.render(world.scene.three, world.camera.three);
 
-  console.log("[PlanCut]", { upAxis, base, height, absoluteHeight: abs });
+  console.log("[PlanCut:Single]", { mode, upAxis, base, height, abs });
 },
 
 
@@ -1338,18 +1401,6 @@ dumpItemsOfCategories: async (cat: string) =>{
       return lastIsolateMap ? cloneModelIdMap(lastIsolateMap) : null;
     },
 
-    // These three are used by the navigation agent for projection + forced renders
-    getThreeCamera(): THREE.Camera {
-      return world.camera.three;
-    },
-
-    getRendererDomElement(): HTMLCanvasElement {
-      return world.renderer.three.domElement;
-    },
-
-    renderNow(): void {
-      world.renderer.three.render(world.scene.three, world.camera.three);
-    },
 
     /**
      * Compute a world-space bounding box for a selection.
@@ -1385,7 +1436,7 @@ dumpItemsOfCategories: async (cat: string) =>{
       return box;
     },
 
-    async getSelectionMeshes(map: OBC.ModelIdMap): Promise<THREE.Object3D[]> {
+async getSelectionMeshes(map: OBC.ModelIdMap): Promise<THREE.Object3D[]> {
   const modelKey = Object.keys(map ?? {})[0];
   if (!modelKey) return [];
 
@@ -1430,58 +1481,53 @@ dumpItemsOfCategories: async (cat: string) =>{
   return [];
 },
 
+async getSnapshot(opts?: { note?: string }): Promise<ViewerSnapshot> {
+  // 1) Ensure fragments update (geometry + visibility state)
+  await stabilizeSceneForSnapshot();
+  fragments.core.update(true);
+
+  // 2) Wait for browser to paint at least once
+  await new Promise<void>((r) => requestAnimationFrame(() => r()));
+  await new Promise<void>((r) => requestAnimationFrame(() => r()));
+
+  // 3) Force render before readback
+  world.renderer.three.render(world.scene.three, world.camera.three);
+
+  const canvas = world.renderer.three.domElement;
+  const dataUrl = canvas.toDataURL("image/png");
+  const imageBase64Png = dataUrl.startsWith("data:image/")
+    ? (dataUrl.split(",")[1] ?? "")
+    : dataUrl;
+
+  const pose = await this.getCameraPose();
+
+  return {
+    imageBase64Png,
+    pose,
+    meta: {
+      timestampIso: new Date().toISOString(),
+      modelId: getActiveModelId(),
+      note: opts?.note,
+    },
+  };
+},
+
 async stabilizeForSnapshot(): Promise<void> {
   await stabilizeSceneForSnapshot();
 },
 
-    async getSnapshot(opts?: { note?: string }): Promise<ViewerSnapshot> {
-      // 1) Ensure fragments update (geometry + visibility state)
-      await stabilizeSceneForSnapshot();
-      fragments.core.update(true);
+async getElementProperties(localId: number): Promise<Record<string, any> | null> {
+  const model = getActiveModel();
+  if (!model) return null;
 
-      // 2) Wait for the browser to actually paint at least once
-      //    (two frames is safer for WebGL + async fragment updates)
-      await new Promise<void>((r) => requestAnimationFrame(() => r()));
-      await new Promise<void>((r) => requestAnimationFrame(() => r()));
-
-      // 3) Force an explicit render right before reading pixels
-      world.renderer.three.render(world.scene.three, world.camera.three);
-
-      const canvas = world.renderer.three.domElement;
-const dataUrl = canvas.toDataURL("image/png");
-const imageBase64Png = dataUrl.startsWith("data:image/")
-  ? dataUrl.split(",")[1] ?? ""
-  : dataUrl;
-
-
-      const pose = await this.getCameraPose();
-
-      return {
-        imageBase64Png,
-        pose,
-        meta: {
-          timestampIso: new Date().toISOString(),
-          modelId: getActiveModelId(),
-          note: opts?.note,
-        },
-      };
-    },
-
-async stabilizeForSnapshot(): Promise<void> {
-  await stabilizeSceneForSnapshot();
-},    
-    async getElementProperties(localId: number): Promise<Record<string, any> | null> {
-      const model = getActiveModel();
-      if (!model) return null;
-
-      try {
-        if (typeof model.getProperties === "function") {
-          return await model.getProperties(localId);
-        }
-        return null;
-      } catch {
-        return null;
-      }
-    },
+  try {
+    if (typeof model.getProperties === "function") {
+      return await model.getProperties(localId);
+    }
+    return null;
+  } catch {
+    return null;
+  }
+},
   };
 }

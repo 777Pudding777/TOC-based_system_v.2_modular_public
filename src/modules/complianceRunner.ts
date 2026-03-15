@@ -183,6 +183,38 @@ function enrichNote(base: string, d: DeterministicStart) {
   return base + ` | start=${d.mode}`;
 }
 
+function stableJson(x: any): string {
+  if (x == null) return "";
+  if (Array.isArray(x)) return `[${x.map(stableJson).join(",")}]`;
+  if (typeof x === "object") {
+    const keys = Object.keys(x).sort();
+    return `{${keys.map(k => `${k}:${stableJson((x as any)[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(x);
+}
+
+function followUpKey(fu: VlmFollowUp | undefined): string | null {
+  if (!fu) return null;
+  return `${fu.request}|${stableJson((fu as any).params ?? null)}`;
+}
+
+function escalateFollowUp(fu: VlmFollowUp | undefined): VlmFollowUp | undefined {
+  if (!fu) return fu;
+
+  switch (fu.request) {
+    case "ISOLATE_STOREY":
+      return { request: "TOP_VIEW" };
+    case "TOP_VIEW":
+      return { request: "SET_PLAN_CUT", params: { height: 1.2, mode: "WORLD_UP" } };
+    case "SET_PLAN_CUT":
+      return { request: "ISOLATE_CATEGORY", params: { category: "IfcDoor" } };
+    //case "ISOLATE_CATEGORY":
+    //  return { request: "PICK_CENTER", params: { reason: "Pick a representative door to inspect." } };
+    default:
+      return { request: "NEW_VIEW", params: { reason: "Repeated followUp; changing view to gather new evidence." } };
+  }
+}
+
   //------------------------------------------------//
   //----------------FOLLOW-UP EXECUTOR----------------//
   //------------------------------------------------//
@@ -437,7 +469,14 @@ if (f.request === "ISOLATE_STOREY") {
     console.warn("[FollowUp] isolateStorey not wired");
     return { didSomething: false, reason: "isolate-storey-not-wired" as const };
   }
-  await viewerApi.isolateStorey(f.params.storeyId);
+
+  const map = await viewerApi.isolateStorey(f.params.storeyId);
+
+  // If isolate failed, report it as no-op so runner escalates
+  if (!map) {
+    return { didSomething: false, reason: "isolate-storey-empty" as const };
+  }
+
   lastScope = { storeyId: f.params.storeyId };
   return { didSomething: true, reason: "isolate-storey" as const };
 }
@@ -663,30 +702,21 @@ pendingNav = undefined;
       }
 
       if ((decision.verdict === "PASS" || decision.verdict === "FAIL") && !confident) {
-const followUpKey = decision.followUp ? JSON.stringify(decision.followUp) : null;
-if (followUpKey && followUpKey === lastFollowUpKey) repeatedFollowUpCount++;
+const fuKey = followUpKey(decision.followUp);
+if (fuKey && fuKey === lastFollowUpKey) repeatedFollowUpCount++;
 else repeatedFollowUpCount = 0;
-lastFollowUpKey = followUpKey;
+lastFollowUpKey = fuKey;
 
+let followUpToRun = decision.followUp;
+
+// If same followUp repeats, escalate instead of resetting
 if (repeatedFollowUpCount >= 1) {
-  console.warn("[Compliance] repeating same followUp, forcing recovery", decision.followUp);
-
-  await viewerApi.clearPlanCut?.();
-  await viewerApi.resetVisibility();
-  await viewerApi.setPresetView("iso", true);
-  lastViewPreset = "iso";
-
-  lastScope = {};
-  lastIsolatedCategories = [];
-  lastHiddenIds = [];
-  lastHighlightedIds = [];
-  lastSelectedId = null;
-
-  await (viewerApi as any).stabilizeForSnapshot?.();
-  continue;
+  console.warn("[Compliance] repeating same followUp, escalating", decision.followUp);
+  followUpToRun = escalateFollowUp(decision.followUp);
+  repeatedFollowUpCount = 0; // reset after escalation so we don't immediately loop
 }
 
-        const acted = await executeFollowUp(decision.followUp);
+const acted = await executeFollowUp(followUpToRun);
 lastActionReason = acted.reason;
 pendingNav = (acted as any).nav ?? undefined;
 
@@ -707,30 +737,21 @@ return { ok: true as const, runId: activeRunId, final: decision };
         return { ok: true as const, runId: activeRunId, final: decision };
       }
 
-const followUpKey = decision.followUp ? JSON.stringify(decision.followUp) : null;
-if (followUpKey && followUpKey === lastFollowUpKey) repeatedFollowUpCount++;
+const fuKey = followUpKey(decision.followUp);
+if (fuKey && fuKey === lastFollowUpKey) repeatedFollowUpCount++;
 else repeatedFollowUpCount = 0;
-lastFollowUpKey = followUpKey;
+lastFollowUpKey = fuKey;
 
+let followUpToRun = decision.followUp;
+
+// If same followUp repeats, escalate instead of resetting
 if (repeatedFollowUpCount >= 1) {
-  console.warn("[Compliance] repeating same followUp, forcing recovery", decision.followUp);
-
-  await viewerApi.clearPlanCut?.();
-  await viewerApi.resetVisibility();
-  await viewerApi.setPresetView("iso", true);
-  lastViewPreset = "iso";
-
-  lastScope = {};
-  lastIsolatedCategories = [];
-  lastHiddenIds = [];
-  lastHighlightedIds = [];
-  lastSelectedId = null;
-
-  await (viewerApi as any).stabilizeForSnapshot?.();
-  continue;
+  console.warn("[Compliance] repeating same followUp, escalating", decision.followUp);
+  followUpToRun = escalateFollowUp(decision.followUp);
+  repeatedFollowUpCount = 0; // reset after escalation so we don't immediately loop
 }
 
-      const acted = await executeFollowUp(decision.followUp);
+const acted = await executeFollowUp(followUpToRun);
 lastActionReason = acted.reason;
 pendingNav = (acted as any).nav ?? undefined;
 

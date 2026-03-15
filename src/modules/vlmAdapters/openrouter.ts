@@ -25,6 +25,14 @@ export type OpenRouterAdapterConfig = {
   top_p?: number; // default 1
   max_tokens?: number; // default 900
   maxImages?: number; // default 4 (cost control)
+
+    // Optional: enable OpenRouter web-search plugin for text-only clause discovery calls.
+    webSearch?: {
+      enabled?: boolean; // default false
+      maxResults?: number; // default 5
+      // Restrict discovery to ICC; keep generalizable by allowing multiple domains.
+      allowedDomains?: string[]; // default ["codes.iccsafe.org"]
+    };
 };
 
 
@@ -128,6 +136,16 @@ function isFollowUp(x: any): x is VlmFollowUp {
     case "GET_PROPERTIES":
       return x.params && typeof x.params.objectId === "string" && x.params.objectId.length > 0;
 
+    case "WEB_FETCH":
+      return (
+        x.params &&
+        typeof x.params.url === "string" &&
+        x.params.url.length > 0 &&
+        (x.params.maxChars === undefined || (typeof x.params.maxChars === "number" && isFinite(x.params.maxChars))) &&
+        (x.params.selector === undefined || typeof x.params.selector === "string") &&
+        (x.params.focus === undefined || typeof x.params.focus === "object")
+      );
+      
     default:
       return false;
   }
@@ -448,4 +466,187 @@ if (verdict === "UNCERTAIN") {
       return decision;
     },
   };
+}
+
+
+// --------------------------------------------------------------//
+//-----------------Optional clause discovery check---------------//
+//---------------------------------------------------------------//
+export type ClauseCandidate = {
+  standard?: string;        // e.g. "IBC", "ICC A117.1"
+  edition?: string;         // e.g. "2021"
+  section?: string;         // e.g. "404.2.3"
+  title?: string;
+  whyRelevant: string[];
+  url: string;              // MUST be codes.iccsafe.org
+  confidence: number;       // 0..1
+};
+
+export type ClauseDiscoveryResult = {
+  assumptions: {
+    jurisdiction?: string;
+    codeFamily?: string;    // "IBC", "IRC", "IFC", "ICC A117.1", etc.
+    edition?: string;
+  };
+  candidates: ClauseCandidate[];
+  missingInfo?: string[];   // questions for user
+};
+
+function buildSiteRestrictedQuery(userIntent: string, domains: string[]) {
+  const siteFilters = domains.map((d) => `site:${d}`).join(" OR ");
+  // Keep it deterministic and short
+  return `(${siteFilters}) ${userIntent}`.trim();
+}
+
+function clamp01Local(x: any) {
+  const n = typeof x === "number" && isFinite(x) ? x : 0;
+  return Math.max(0, Math.min(1, n));
+}
+
+/**
+ * Text-only: use OpenRouter web-search plugin to find ICC clause URLs.
+ * Returns strict JSON (no markdown).
+ *
+ * IMPORTANT: This is discovery only. You should still run your proxy WEB_FETCH
+ * to extract the authoritative clause text before compliance decisions.
+ */
+export async function discoverIccClausesOnline(cfg: OpenRouterAdapterConfig, args: {
+  userIntent: string;                 // e.g. "accessibility of doors second floor"
+  hint?: { codeFamily?: string; edition?: string; jurisdiction?: string };
+  maxCandidates?: number;             // default 5
+}): Promise<ClauseDiscoveryResult> {
+  if (!cfg.apiKey) throw new Error("OpenRouter missing apiKey.");
+  const endpoint = cfg.endpoint ?? "https://openrouter.ai/api/v1/chat/completions";
+  const timeoutMs = Math.max(5_000, Math.min(120_000, cfg.requestTimeoutMs ?? 45_000));
+
+  const allowedDomains = cfg.webSearch?.allowedDomains?.length
+    ? cfg.webSearch.allowedDomains
+    : ["codes.iccsafe.org"];
+
+  const maxResults = Math.max(1, Math.min(10, cfg.webSearch?.maxResults ?? 5));
+  const maxCandidates = Math.max(1, Math.min(10, args.maxCandidates ?? 5));
+
+  // IMPORTANT: Use a text model (or your same model) – this call is text-only.
+  // If you want, you can add a separate cfg.webSearchModel later.
+  const model = cfg.model;
+
+  const query = buildSiteRestrictedQuery(
+    [
+      args.hint?.codeFamily ? `${args.hint.codeFamily}` : "",
+      args.hint?.edition ? `${args.hint.edition}` : "",
+      args.userIntent,
+      // helpful fixed terms for accessibility door checks
+      "accessibility door clear width maneuvering clearance threshold hardware",
+      "section",
+    ].filter(Boolean).join(" "),
+    allowedDomains
+  );
+
+  // Force JSON output; also tell the web plugin not to require markdown citations.
+  const discoveryPrompt =
+    "You are a code clause discovery assistant.\n" +
+    "Task: find the most relevant code clauses for the user's intent using ONLY web results from allowed domains.\n" +
+    "Return ONLY valid JSON with the shape:\n" +
+    "{\n" +
+    '  "assumptions": { "jurisdiction"?: string, "codeFamily"?: string, "edition"?: string },\n' +
+    '  "candidates": [{ "standard"?: string, "edition"?: string, "section"?: string, "title"?: string, "whyRelevant": string[], "url": string, "confidence": number }],\n' +
+    '  "missingInfo"?: string[]\n' +
+    "}\n" +
+    "Rules:\n" +
+    "- Use ONLY URLs from the allowed domains.\n" +
+    "- Provide at most " + maxCandidates + " candidates.\n" +
+    "- confidence must be within [0,1].\n" +
+    "- Do NOT include markdown links. Put raw URLs in the 'url' field.\n" +
+    "- If code edition/jurisdiction is unclear, include that in missingInfo.\n" +
+    "\n" +
+    "User intent:\n" +
+    args.userIntent + "\n" +
+    (args.hint?.jurisdiction ? `Jurisdiction hint: ${args.hint.jurisdiction}\n` : "") +
+    (args.hint?.codeFamily ? `Code hint: ${args.hint.codeFamily}\n` : "") +
+    (args.hint?.edition ? `Edition hint: ${args.hint.edition}\n` : "") +
+    "\n" +
+    "Search query to use:\n" +
+    query;
+
+  const body: any = {
+    model,
+    temperature: 0,
+    top_p: 1,
+    max_tokens: 700,
+    messages: [{ role: "user", content: [{ type: "text", text: discoveryPrompt }] }],
+    response_format: { type: "json_object" },
+
+    // ✅ OpenRouter web-search plugin
+    plugins: [
+      {
+        id: "web",
+        max_results: maxResults,
+        // This controls how the plugin frames results; keep it JSON-safe.
+        search_prompt:
+          "Search the web and provide results. Do not write markdown. Do not cite with brackets. Provide plain URLs only.",
+      },
+    ],
+  };
+
+  const { ok, status, json } = await fetchJsonWithTimeout(
+    endpoint,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${cfg.apiKey}`,
+        ...(cfg.appReferer ? { "HTTP-Referer": cfg.appReferer } : {}),
+        ...(cfg.appTitle ? { "X-Title": cfg.appTitle } : {}),
+      },
+      body: JSON.stringify(body),
+    },
+    timeoutMs
+  );
+
+  if (!ok) {
+    const msg = json?.error?.message || `OpenRouter discovery failed (${status}).`;
+    return { assumptions: {}, candidates: [], missingInfo: [msg] };
+  }
+
+  const content: string =
+    json?.choices?.[0]?.message?.content ??
+    json?.choices?.[0]?.text ??
+    "";
+
+  const candidate = extractFirstJsonObject(String(content)) ?? String(content);
+
+  let parsed: any = null;
+  try {
+    parsed = JSON.parse(candidate);
+  } catch {
+    return { assumptions: {}, candidates: [], missingInfo: ["Discovery model returned non-JSON output."] };
+  }
+
+  const assumptions = (parsed?.assumptions && typeof parsed.assumptions === "object") ? parsed.assumptions : {};
+  const candidatesRaw = Array.isArray(parsed?.candidates) ? parsed.candidates : [];
+
+  // sanitize + enforce domain restriction
+  const candidates: ClauseCandidate[] = candidatesRaw
+    .map((c: any) => ({
+      standard: typeof c?.standard === "string" ? c.standard : undefined,
+      edition: typeof c?.edition === "string" ? c.edition : undefined,
+      section: typeof c?.section === "string" ? c.section : undefined,
+      title: typeof c?.title === "string" ? c.title : undefined,
+      whyRelevant: Array.isArray(c?.whyRelevant) ? c.whyRelevant.map((x: any) => String(x)).slice(0, 6) : [],
+      url: typeof c?.url === "string" ? c.url : "",
+      confidence: clamp01Local(c?.confidence),
+    }))
+    .filter((c: ClauseCandidate) => {
+      try {
+        const u = new URL(c.url);
+        return allowedDomains.some((d) => u.hostname === d || u.hostname.endsWith("." + d));
+      } catch {
+        return false;
+      }
+    })
+    .slice(0, maxCandidates);
+
+  const missingInfo = Array.isArray(parsed?.missingInfo) ? parsed.missingInfo.map((x: any) => String(x)) : undefined;
+
+  return { assumptions, candidates, missingInfo };
 }
