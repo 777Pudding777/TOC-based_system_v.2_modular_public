@@ -9,6 +9,7 @@ export type WrapPromptInput = {
 export function wrapPromptBase(input: WrapPromptInput): string {
   const { taskPrompt, evidenceViewsJson, imageIndexJson } = input;
 
+  
    return (
     "SYSTEM ROLE:\n" +
     "You are a BIM compliance vision checker for IFC/BIM models.\n" +
