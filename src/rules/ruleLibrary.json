@@ -1,0 +1,751 @@
+{
+  "version": "1.0.0",
+  "lastUpdated": "2026-03-15",
+  "metadata": {
+    "totalRules": 6,
+    "enabledRules": 6,
+    "categories": ["accessibility", "circulation", "safety", "egress"],
+    "description": "Solibri-based rule library for VLM visual compliance checking. Focused on rules that can be evaluated through visual inspection of IFC/BIM model snapshots."
+  },
+  "rules": [
+    {
+      "id": "VLM-ACC-DOOR-001",
+      "title": "Accessible Door Clearance",
+      "description": "Verifies that doors have adequate maneuvering clearance on both pull and push sides, including free space in front of the door and on the latch/hinge sides. Checks door width, opening direction, and surrounding obstacles.",
+      "category": "accessibility",
+      "severity": "critical",
+      "source": {
+        "solibriId": "SOL-208",
+        "solibriTitle": "208 Accessible Door Rule",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500004738282-208-Accessible-Door-Rule",
+        "version": "v9.6+"
+      },
+      "visualSuitability": {
+        "isSuitable": true,
+        "confidence": 0.85,
+        "reasoning": "Door clearances are highly visible in plan and 3D views. VLM can assess free space around doors, identify obstructing elements (walls, furniture), measure relative distances, and evaluate door swing geometry.",
+        "visualAspects": [
+          "Door opening geometry is visible",
+          "Surrounding free space can be assessed",
+          "Obstructing elements (walls, furniture, equipment) are visible",
+          "Door width relative to opening is measurable",
+          "Approach angles and maneuvering space are observable"
+        ],
+        "limitations": [
+          "Exact measurements may require reference dimensions",
+          "Door operation type (push/pull/sliding) may need metadata",
+          "Movable furniture vs fixed obstacles may be ambiguous"
+        ]
+      },
+      "visualEvidence": {
+        "lookFor": [
+          "Door opening and its surrounding floor area",
+          "Clear floor space on pull side (typically 60\" x door width + 18\")",
+          "Clear floor space on push side (typically 48\" x door width)",
+          "Objects or walls that may obstruct maneuvering",
+          "Door swing arc and potential conflicts",
+          "Latch side clearance (typically 18\" minimum)"
+        ],
+        "passIndicators": [
+          "Ample clear floor space visible on both sides of door",
+          "No obstructions within required clearance zones",
+          "Door can swing fully open without collision",
+          "Adequate space for wheelchair maneuvering visible"
+        ],
+        "failIndicators": [
+          "Walls, columns, or furniture blocking door clearance",
+          "Insufficient space for door to swing open",
+          "Corridor or room too narrow at door location",
+          "Objects placed immediately in front of door"
+        ],
+        "uncertainIndicators": [
+          "Unclear whether objects are movable or fixed",
+          "Door opening direction not evident from view",
+          "Cannot determine exact clearance dimensions from current view",
+          "Partial occlusion of door area"
+        ]
+      },
+      "evaluationCriteria": {
+        "pass": [
+          "Visible clear floor space on both sides meets minimum dimensions",
+          "No fixed obstructions within required clearance zones",
+          "Door swing path is clear of conflicts"
+        ],
+        "fail": [
+          "Fixed obstructions (walls, columns) within required clearance",
+          "Insufficient floor area for wheelchair maneuvering",
+          "Door swing blocked by walls or fixed elements"
+        ],
+        "uncertain": [
+          "Door operation type unclear",
+          "Ambiguous whether objects are movable",
+          "Current view does not show full clearance area",
+          "Need different angle or plan view to assess properly"
+        ]
+      },
+      "navigationHints": {
+        "recommendedViews": ["TOP", "ISO"],
+        "zoomLevel": "medium",
+        "isolateCategories": ["IFCDOOR", "IFCWALL", "IFCFURNISHINGELEMENT", "IFCSLAB"],
+        "usePlanCut": true,
+        "planCutHeight": "1.2m (eye level)",
+        "tips": [
+          "Use plan view to assess clearance dimensions",
+          "Isolate doors and surrounding elements",
+          "Check both sides of door with camera rotation",
+          "Use plan cut at wheelchair seat height for better context"
+        ]
+      },
+      "findingTemplates": {
+        "pass": "Door has adequate maneuvering clearance. Clear floor space visible on both pull and push sides with no obstructions.",
+        "fail": "Door clearance insufficient. {obstruction_type} obstructs the required {clearance_side} clearance zone, preventing wheelchair maneuvering.",
+        "uncertain": "Cannot fully assess door clearance from current view. {reason}. Recommend {suggested_action}.",
+        "placeholders": ["obstruction_type", "clearance_side", "reason", "suggested_action"]
+      },
+      "dimensionalRequirements": [
+        {
+          "parameter": "Door Clear Width",
+          "typicalValue": "32 inches (815mm) minimum",
+          "referenceStandard": "ADA, ICC A117.1",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Pull Side Clearance (Front Approach)",
+          "typicalValue": "60\" depth x (door width + 18\" latch side)",
+          "referenceStandard": "ADA 404.2.4.1",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Push Side Clearance",
+          "typicalValue": "48\" depth x door width",
+          "referenceStandard": "ADA 404.2.4.1",
+          "visuallyMeasurable": true
+        }
+      ],
+      "tags": ["accessibility", "door", "clearance", "ADA", "wheelchair", "maneuvering"],
+      "enabled": true,
+      "notes": "This rule is based on ADA and ICC A117.1 standards. Clearance requirements vary based on approach direction (front, latch, hinge) and whether door has a closer and latch."
+    },
+    {
+      "id": "VLM-ACC-STAIR-001",
+      "title": "Accessible Stair Geometry and Safety",
+      "description": "Checks staircase accessibility including riser height consistency, tread depth uniformity, stair width, handrail presence and height, landing dimensions, and headroom clearance. Ensures stairs are safe and accessible.",
+      "category": "accessibility",
+      "severity": "critical",
+      "source": {
+        "solibriId": "SOL-210",
+        "solibriTitle": "210 Accessible Stair Rule",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500004610681-210-Accessible-Stair-Rule",
+        "version": "v25.12.0+"
+      },
+      "visualSuitability": {
+        "isSuitable": true,
+        "confidence": 0.88,
+        "reasoning": "Stair geometry is highly visual - riser heights, tread depths, handrails, and landings are all observable. VLM can assess consistency, count steps, verify handrail presence, and check relative proportions.",
+        "visualAspects": [
+          "Riser heights are visually comparable",
+          "Tread depths can be assessed",
+          "Handrail presence and continuity observable",
+          "Landing size and position visible",
+          "Stair width measurable relative to reference",
+          "Headroom clearance visible in side views"
+        ],
+        "limitations": [
+          "Precise measurements (e.g., 7.5\" max riser) difficult without scale",
+          "Handrail height exact measurement challenging",
+          "Tactile indicators may be too small to see clearly"
+        ]
+      },
+      "visualEvidence": {
+        "lookFor": [
+          "Individual stair risers and treads",
+          "Consistency of riser heights across flight",
+          "Uniformity of tread depths",
+          "Handrails on one or both sides",
+          "Handrail height above nosing",
+          "Handrail extensions beyond top and bottom",
+          "Landing presence and size",
+          "Clear headroom above stair",
+          "Nosing profile and projection"
+        ],
+        "passIndicators": [
+          "Risers appear uniform in height",
+          "Treads appear consistent in depth",
+          "Handrails present on both sides",
+          "Handrails appear at appropriate height",
+          "Handrails extend beyond stairs",
+          "Landings present between flights",
+          "No visible obstructions in headroom"
+        ],
+        "failIndicators": [
+          "Visible variation in riser heights",
+          "Irregular tread depths",
+          "Missing handrails",
+          "Handrails too high or too low",
+          "Handrail discontinuity or gaps",
+          "Missing landings between flights",
+          "Beams or soffits intruding into headroom"
+        ],
+        "uncertainIndicators": [
+          "Cannot see all steps in current view",
+          "Handrail height unclear from angle",
+          "Headroom obstruction not visible from this view",
+          "Unclear if landings meet size requirements"
+        ]
+      },
+      "evaluationCriteria": {
+        "pass": [
+          "All visible risers appear uniform (within typical 3/8\" tolerance)",
+          "Treads appear consistent throughout flight",
+          "Handrails present and continuous",
+          "Landings present where required",
+          "Clear headroom visible above stair path"
+        ],
+        "fail": [
+          "Obvious variation in riser heights",
+          "Missing or discontinuous handrails",
+          "No landing between long flights",
+          "Visible headroom obstruction (beams, ductwork, etc.)"
+        ],
+        "uncertain": [
+          "Cannot see entire stair flight in current view",
+          "Viewing angle prevents assessment of handrail height",
+          "Need plan cut or different view to verify headroom",
+          "Tread/riser dimensions unclear without reference scale"
+        ]
+      },
+      "navigationHints": {
+        "recommendedViews": ["FRONT", "SIDE", "ISO"],
+        "zoomLevel": "medium",
+        "isolateCategories": ["IFCSTAIR", "IFCSTAIRFLIGHT", "IFCRAILING", "IFCSLAB"],
+        "usePlanCut": false,
+        "tips": [
+          "Use side view to assess riser/tread consistency",
+          "Front view helps verify handrail presence",
+          "Orbit camera to check handrails on both sides",
+          "Zoom to individual steps to check geometry",
+          "Check headroom with camera positioned below stairs looking up"
+        ]
+      },
+      "findingTemplates": {
+        "pass": "Staircase meets accessibility requirements. Risers uniform, treads consistent, handrails present and continuous, adequate headroom observed.",
+        "fail": "Staircase fails accessibility check. Issue: {issue_type}. {specific_finding}.",
+        "uncertain": "Cannot fully verify stair compliance from current view. {limitation}. Suggest {action}.",
+        "placeholders": ["issue_type", "specific_finding", "limitation", "action"]
+      },
+      "dimensionalRequirements": [
+        {
+          "parameter": "Maximum Riser Height",
+          "typicalValue": "7 inches (178mm)",
+          "referenceStandard": "IBC 1011.5.2",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Minimum Tread Depth",
+          "typicalValue": "11 inches (279mm)",
+          "referenceStandard": "IBC 1011.5.2",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Handrail Height",
+          "typicalValue": "34-38 inches (865-965mm) above nosing",
+          "referenceStandard": "IBC 1014.2",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Minimum Stair Width",
+          "typicalValue": "44 inches (1118mm) for egress",
+          "referenceStandard": "IBC 1011.2",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Minimum Headroom",
+          "typicalValue": "80 inches (2032mm)",
+          "referenceStandard": "IBC 1011.3",
+          "visuallyMeasurable": true
+        }
+      ],
+      "tags": ["accessibility", "stairs", "handrails", "safety", "egress", "IBC"],
+      "enabled": true,
+      "notes": "Riser height consistency is critical for safety. Maximum 3/8 inch variation between risers in a flight per IBC. Handrails must be continuous without interruption."
+    },
+    {
+      "id": "VLM-ACC-RAMP-001",
+      "title": "Accessible Ramp Slope and Features",
+      "description": "Verifies ramp accessibility by checking slope/gradient, width, handrail presence and configuration, landing dimensions, and clear floor space. Ensures ramps comply with accessibility standards.",
+      "category": "accessibility",
+      "severity": "critical",
+      "source": {
+        "solibriId": "SOL-207",
+        "solibriTitle": "207 Accessible Ramp Rule",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500004738262-207-Accessible-Ramp-Rule",
+        "version": "v25.9.0+"
+      },
+      "visualSuitability": {
+        "isSuitable": true,
+        "confidence": 0.82,
+        "reasoning": "Ramp slope is visually assessable, handrails are clearly visible, and landing presence can be confirmed. VLM can evaluate relative steepness and identify safety features.",
+        "visualAspects": [
+          "Ramp slope visually apparent",
+          "Handrail presence observable",
+          "Landing size and position visible",
+          "Ramp width measurable",
+          "Edge protection (curbs) visible"
+        ],
+        "limitations": [
+          "Exact slope percentage difficult without measurements",
+          "Handrail height precise measurement challenging",
+          "Very gentle slopes (<5%) hard to distinguish from level surfaces"
+        ]
+      },
+      "visualEvidence": {
+        "lookFor": [
+          "Ramp incline and slope",
+          "Ramp width",
+          "Handrails on one or both sides",
+          "Landing at top and bottom",
+          "Intermediate landings for long ramps",
+          "Edge protection/curbs",
+          "Clear floor space at ramp ends"
+        ],
+        "passIndicators": [
+          "Gentle visible slope (appears <8%)",
+          "Handrails present on both sides",
+          "Level landings at transitions",
+          "Adequate ramp width",
+          "Edge protection visible"
+        ],
+        "failIndicators": [
+          "Steep slope (visibly >8%)",
+          "Missing handrails",
+          "No landing at top or bottom",
+          "Ramp too narrow",
+          "Missing edge protection on drop-offs"
+        ],
+        "uncertainIndicators": [
+          "Slope appears borderline, cannot determine exact percentage",
+          "Unclear if handrails meet height requirements",
+          "Landing size unclear from current view",
+          "Cannot see full ramp length"
+        ]
+      },
+      "evaluationCriteria": {
+        "pass": [
+          "Ramp slope appears gentle (consistent with 1:12 or less)",
+          "Handrails present and appear continuous",
+          "Level landings visible at top, bottom, and intermediate points",
+          "Adequate width for wheelchair passage"
+        ],
+        "fail": [
+          "Ramp slope appears steep (inconsistent with 1:12 max)",
+          "Handrails absent or discontinuous",
+          "Missing required landings",
+          "Ramp width appears insufficient"
+        ],
+        "uncertain": [
+          "Slope percentage not determinable from current view",
+          "Need side elevation to assess slope properly",
+          "Handrail configuration unclear",
+          "Landing dimensions not fully visible"
+        ]
+      },
+      "navigationHints": {
+        "recommendedViews": ["SIDE", "ISO", "FRONT"],
+        "zoomLevel": "medium",
+        "isolateCategories": ["IFCRAMP", "IFCRAMPFLIGHT", "IFCRAILING", "IFCSLAB"],
+        "usePlanCut": false,
+        "tips": [
+          "Use side elevation to assess slope angle",
+          "Front view shows handrail presence",
+          "Zoom to check landing levelness",
+          "Orbit to verify handrails on both sides"
+        ]
+      },
+      "findingTemplates": {
+        "pass": "Ramp meets accessibility standards. Slope appears compliant, handrails present, landings adequate.",
+        "fail": "Ramp fails accessibility check. {issue}: {details}.",
+        "uncertain": "Cannot fully assess ramp compliance. {reason}. Recommend {action}.",
+        "placeholders": ["issue", "details", "reason", "action"]
+      },
+      "dimensionalRequirements": [
+        {
+          "parameter": "Maximum Slope",
+          "typicalValue": "1:12 (8.33%)",
+          "referenceStandard": "ADA 405.2",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Minimum Width",
+          "typicalValue": "36 inches (915mm) clear",
+          "referenceStandard": "ADA 405.5",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Handrail Height",
+          "typicalValue": "34-38 inches (865-965mm)",
+          "referenceStandard": "ADA 505.4",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Landing Size",
+          "typicalValue": "60\" x 60\" minimum",
+          "referenceStandard": "ADA 405.7",
+          "visuallyMeasurable": true
+        }
+      ],
+      "tags": ["accessibility", "ramp", "slope", "handrails", "ADA", "wheelchair"],
+      "enabled": true,
+      "notes": "Maximum slope 1:12 for new construction. Steeper slopes (up to 1:8) may be allowed for existing facilities with space constraints. Handrail extensions required at top and bottom."
+    },
+    {
+      "id": "VLM-CIRC-WIDTH-001",
+      "title": "Corridor and Circulation Width",
+      "description": "Checks that corridors and circulation spaces have adequate width for accessible passage, identifies obstructions that narrow the path, and verifies clear floor space. Ensures wheelchair-accessible circulation.",
+      "category": "circulation",
+      "severity": "critical",
+      "source": {
+        "solibriId": "SOL-247",
+        "solibriTitle": "247 Local Accessible Circulation",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500000754682-Rule-Templates",
+        "version": "v25.12.0+"
+      },
+      "visualSuitability": {
+        "isSuitable": true,
+        "confidence": 0.90,
+        "reasoning": "Corridor width is highly visual and easily assessed from plan views. VLM can identify narrow points, measure relative widths, and detect obstructions like columns, furniture, or protruding elements.",
+        "visualAspects": [
+          "Corridor width clearly visible in plan view",
+          "Obstructions (columns, furniture, equipment) easily identified",
+          "Narrow points visually obvious",
+          "Wall-to-wall or wall-to-obstruction distances measurable",
+          "Passing spaces observable"
+        ],
+        "limitations": [
+          "Exact measurements require reference dimensions",
+          "Overhanging elements may not be visible in plan view"
+        ]
+      },
+      "visualEvidence": {
+        "lookFor": [
+          "Corridor width between walls",
+          "Obstructions narrowing the path (columns, furniture, equipment)",
+          "Clear width after accounting for obstacles",
+          "Protruding elements (wall-mounted items, handrails)",
+          "Pinch points or bottlenecks",
+          "Door swings reducing corridor width"
+        ],
+        "passIndicators": [
+          "Corridor appears wide (visually >36 inches clear)",
+          "No obstructions in circulation path",
+          "Uniform width throughout length",
+          "Adequate passing spaces visible"
+        ],
+        "failIndicators": [
+          "Narrow corridor (visually <36 inches)",
+          "Columns or walls creating pinch points",
+          "Furniture blocking passage",
+          "Door swings reducing clear width below minimum"
+        ],
+        "uncertainIndicators": [
+          "Cannot determine exact width from current view",
+          "Unclear if objects are movable or fixed",
+          "Need plan view to assess properly",
+          "Protrusions not fully visible"
+        ]
+      },
+      "evaluationCriteria": {
+        "pass": [
+          "Clear width appears adequate (>36 inches) throughout corridor",
+          "No fixed obstructions narrowing the path",
+          "Pinch points absent or meet minimum width"
+        ],
+        "fail": [
+          "Corridor width clearly insufficient (<36 inches)",
+          "Fixed obstructions (columns, walls) creating narrow passage",
+          "Pinch point below accessible minimum"
+        ],
+        "uncertain": [
+          "Width borderline, need measurements",
+          "Unclear if obstructions are fixed or movable",
+          "Need plan view or different angle to assess"
+        ]
+      },
+      "navigationHints": {
+        "recommendedViews": ["TOP"],
+        "zoomLevel": "medium",
+        "isolateCategories": ["IFCWALL", "IFCCOLUMN", "IFCFURNISHINGELEMENT", "IFCSLAB"],
+        "usePlanCut": true,
+        "planCutHeight": "1.0m (waist height)",
+        "tips": [
+          "Use plan view for best width assessment",
+          "Plan cut at waist height to see protruding elements",
+          "Isolate walls and obstructions",
+          "Measure at narrowest points",
+          "Check entire corridor length for pinch points"
+        ]
+      },
+      "findingTemplates": {
+        "pass": "Corridor width is adequate. Clear width exceeds minimum requirements with no significant obstructions.",
+        "fail": "Corridor is too narrow. {location} has clear width of approximately {width}, below the {standard} minimum of {required_width}. Obstruction: {obstruction}.",
+        "uncertain": "Cannot determine exact corridor width from current view. {issue}. Recommend {action}.",
+        "placeholders": ["location", "width", "standard", "required_width", "obstruction", "issue", "action"]
+      },
+      "dimensionalRequirements": [
+        {
+          "parameter": "Minimum Corridor Width",
+          "typicalValue": "36 inches (915mm) clear",
+          "referenceStandard": "ADA 403.5.1",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Passing Space Width",
+          "typicalValue": "60 inches (1525mm) at intervals",
+          "referenceStandard": "ADA 403.5.3",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Maximum Protruding Objects",
+          "typicalValue": "4 inches (100mm) into path",
+          "referenceStandard": "ADA 307",
+          "visuallyMeasurable": true
+        }
+      ],
+      "tags": ["circulation", "corridor", "width", "accessibility", "clearance", "ADA"],
+      "enabled": true,
+      "notes": "36-inch minimum for accessible routes. 60-inch width required for two wheelchairs to pass. Protruding objects limited to 4 inches between 27-80 inches above floor."
+    },
+    {
+      "id": "VLM-SAFE-HEADROOM-001",
+      "title": "Headroom Clearance",
+      "description": "Verifies adequate vertical clearance along circulation paths, stairs, ramps, and doorways. Checks for overhead obstructions like beams, ductwork, or sloped ceilings that create hazards.",
+      "category": "safety",
+      "severity": "moderate",
+      "source": {
+        "solibriId": "SOL-252-SUBSET",
+        "solibriTitle": "252 Accessible Route Compliance (Headroom Component)",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500000754682-Rule-Templates",
+        "version": "v25.12.0+"
+      },
+      "visualSuitability": {
+        "isSuitable": true,
+        "confidence": 0.78,
+        "reasoning": "Headroom issues are visually identifiable when beams, ductwork, or sloped ceilings intrude into circulation space. VLM can spot low-hanging elements and assess relative heights.",
+        "visualAspects": [
+          "Overhead obstructions visible in elevation/3D views",
+          "Low beams or soffits apparent",
+          "Ductwork or mechanical elements observable",
+          "Sloped ceilings visible",
+          "Relative height assessment possible"
+        ],
+        "limitations": [
+          "Exact clearance height difficult to measure without reference",
+          "Small protrusions may not be visible",
+          "Requires elevation or 3D view, not visible in plan"
+        ]
+      },
+      "visualEvidence": {
+        "lookFor": [
+          "Overhead beams, joists, or structural elements",
+          "Ductwork, pipes, or mechanical systems",
+          "Sloped ceilings or soffits",
+          "Low-hanging light fixtures",
+          "Clearance above stairs and ramps",
+          "Clearance at doorways"
+        ],
+        "passIndicators": [
+          "Clear vertical space with no obstructions",
+          "Ceiling height appears adequate (>7 feet)",
+          "No low-hanging elements visible",
+          "Uniform clearance throughout path"
+        ],
+        "failIndicators": [
+          "Beams or ductwork protruding low into space",
+          "Sloped ceiling creating head strike hazard",
+          "Light fixtures or signage hanging too low",
+          "Reduced clearance under stairs"
+        ],
+        "uncertainIndicators": [
+          "Cannot assess clearance from current view angle",
+          "Need elevation view to verify",
+          "Unclear if element creates hazard without measurements",
+          "Partial occlusion prevents assessment"
+        ]
+      },
+      "evaluationCriteria": {
+        "pass": [
+          "No visible overhead obstructions",
+          "Clearance appears adequate (visually >80 inches)",
+          "Ceiling height uniform and sufficient"
+        ],
+        "fail": [
+          "Beam or ductwork clearly intrudes into required clearance",
+          "Sloped ceiling creates obvious head strike hazard",
+          "Clearance visibly insufficient (<80 inches)"
+        ],
+        "uncertain": [
+          "Cannot determine clearance height from plan view",
+          "Need elevation or section view",
+          "Element may or may not intrude, measurements needed"
+        ]
+      },
+      "navigationHints": {
+        "recommendedViews": ["FRONT", "SIDE", "ISO"],
+        "zoomLevel": "medium",
+        "isolateCategories": ["IFCBEAM", "IFCSLAB", "IFCFLOWSEGMENT", "IFCDOOR", "IFCSTAIR"],
+        "usePlanCut": false,
+        "tips": [
+          "Use elevation views to assess vertical clearance",
+          "Position camera at pedestrian eye height",
+          "Check under stairs and beams specifically",
+          "Rotate camera to look up at ceiling",
+          "Isolate structural and MEP elements"
+        ]
+      },
+      "findingTemplates": {
+        "pass": "Headroom clearance is adequate. No overhead obstructions observed along circulation path.",
+        "fail": "Insufficient headroom clearance. {obstruction_type} at {location} reduces clearance to approximately {height}, below the minimum {required_height}.",
+        "uncertain": "Cannot verify headroom clearance from current view. {reason}. Recommend {action}.",
+        "placeholders": ["obstruction_type", "location", "height", "required_height", "reason", "action"]
+      },
+      "dimensionalRequirements": [
+        {
+          "parameter": "Minimum Headroom (General)",
+          "typicalValue": "80 inches (2032mm)",
+          "referenceStandard": "ADA 307.2, IBC 1003.2",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Minimum Headroom (Stairs)",
+          "typicalValue": "80 inches (2032mm)",
+          "referenceStandard": "IBC 1011.3",
+          "visuallyMeasurable": true
+        }
+      ],
+      "tags": ["safety", "headroom", "clearance", "circulation", "hazard"],
+      "enabled": true,
+      "notes": "80-inch minimum clearance required for accessible routes. Lower clearance allowed for specific conditions (e.g., door frames). Protruding objects above 80 inches not restricted."
+    },
+    {
+      "id": "VLM-EGRESS-WIDTH-001",
+      "title": "Escape Route and Exit Passageway Width",
+      "description": "Verifies that escape routes and exit passageways have adequate width for safe egress during emergencies. Checks corridor width, door width, and capacity along egress paths.",
+      "category": "egress",
+      "severity": "critical",
+      "source": {
+        "solibriId": "SOL-179-SUBSET",
+        "solibriTitle": "179 Escape Route Analysis (Width Component)",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500004738162-179-Escape-Route-Analysis",
+        "version": "v4.3+"
+      },
+      "visualSuitability": {
+        "isSuitable": true,
+        "confidence": 0.85,
+        "reasoning": "Exit passageway width is visually assessable from plan views. VLM can measure corridor widths, identify bottlenecks, and evaluate egress capacity along routes to exits.",
+        "visualAspects": [
+          "Corridor and passageway width visible",
+          "Exit doors and their widths observable",
+          "Bottlenecks and narrow points identifiable",
+          "Route continuity assessable",
+          "Obstruction detection possible"
+        ],
+        "limitations": [
+          "Occupant load calculation requires metadata",
+          "Travel distance measurement complex",
+          "Door operation type may need confirmation"
+        ]
+      },
+      "visualEvidence": {
+        "lookFor": [
+          "Exit passageway width",
+          "Exit door width",
+          "Corridor width along egress route",
+          "Bottlenecks or narrow sections",
+          "Obstructions in egress path",
+          "Multiple egress routes availability"
+        ],
+        "passIndicators": [
+          "Wide, clear egress paths visible",
+          "Exit doors appear adequately wide",
+          "No bottlenecks in passageways",
+          "Clear, unobstructed routes to exits",
+          "Multiple exit routes available"
+        ],
+        "failIndicators": [
+          "Narrow passageways along egress route",
+          "Insufficient exit door width",
+          "Bottleneck reducing capacity",
+          "Obstructions blocking egress path",
+          "Single point of egress only"
+        ],
+        "uncertainIndicators": [
+          "Cannot determine if width adequate for occupant load",
+          "Unclear which routes are designated egress",
+          "Need floor plan to trace full egress path",
+          "Door width unclear from current view"
+        ]
+      },
+      "evaluationCriteria": {
+        "pass": [
+          "Exit passageways appear wide enough for safe egress",
+          "Exit doors adequately sized",
+          "No significant bottlenecks observed",
+          "Clear, unobstructed egress paths"
+        ],
+        "fail": [
+          "Passageway width clearly insufficient",
+          "Exit door too narrow",
+          "Obvious bottleneck in egress path",
+          "Obstructions blocking route to exit"
+        ],
+        "uncertain": [
+          "Cannot assess width adequacy without occupant load data",
+          "Need to verify which route is designated egress",
+          "Measurements needed to confirm compliance"
+        ]
+      },
+      "navigationHints": {
+        "recommendedViews": ["TOP"],
+        "zoomLevel": "far",
+        "isolateCategories": ["IFCWALL", "IFCDOOR", "IFCSPACE", "IFCSLAB"],
+        "usePlanCut": true,
+        "planCutHeight": "1.2m",
+        "tips": [
+          "Use plan view to trace egress routes",
+          "Isolate walls and doors to see paths clearly",
+          "Check width at narrowest points",
+          "Verify exit door locations and widths",
+          "Look for obstructions in egress corridors"
+        ]
+      },
+      "findingTemplates": {
+        "pass": "Egress route width is adequate. Exit passageways and doors provide sufficient capacity for safe evacuation.",
+        "fail": "Insufficient egress width. {component} at {location} has width of {width}, below minimum required {required_width} for safe evacuation.",
+        "uncertain": "Cannot fully assess egress capacity. {limitation}. Occupant load data needed to verify compliance.",
+        "placeholders": ["component", "location", "width", "required_width", "limitation"]
+      },
+      "dimensionalRequirements": [
+        {
+          "parameter": "Minimum Exit Passageway Width",
+          "typicalValue": "44 inches (1118mm)",
+          "referenceStandard": "IBC 1020.2",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Minimum Exit Door Width",
+          "typicalValue": "32 inches (815mm) clear",
+          "referenceStandard": "IBC 1010.1.1",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Corridor Width (Egress)",
+          "typicalValue": "44 inches (1118mm) for <50 occupants",
+          "referenceStandard": "IBC 1020.2",
+          "visuallyMeasurable": true
+        }
+      ],
+      "tags": ["egress", "safety", "escape route", "fire safety", "exit", "IBC"],
+      "enabled": true,
+      "notes": "Egress width calculated based on occupant load. 0.2 inches per occupant for stairs, 0.15 inches for corridors/doors. Multiple exit routes typically required for occupant loads >50."
+    }
+  ]
+}
