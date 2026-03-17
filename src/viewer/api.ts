@@ -1049,6 +1049,53 @@ async setPlanCut(params: { height: number; thickness?: number; mode?: "WORLD_UP"
 },
 
 
+/**
+ * Storey-aware plan cut: isolates a storey and sets a plan cut at a
+ * fraction of its bounding-box height (default 1.2 m above floor, or
+ * 40% up the storey if storey is shorter than 3 m).
+ * This is the preferred way to get a CAD-style floor-plan view.
+ */
+async setStoreyPlanCut(params: {
+  storeyId: string;
+  offsetFromFloor?: number;  // metres above floor, default 1.2
+  mode?: "WORLD_UP" | "CAMERA";
+}) {
+  const storeyId = params.storeyId;
+  const mode = params.mode ?? "WORLD_UP";
+
+  // 1) isolate storey to get its map
+  const map = await this.isolateStorey(storeyId);
+  if (!map) {
+    console.warn("[setStoreyPlanCut] could not isolate storey", storeyId);
+    return;
+  }
+
+  // 2) get storey bounding box
+  const box = await this.getSelectionWorldBox(map);
+  const upAxis = getUpAxis();
+
+  if (box && !box.isEmpty()) {
+    const minH = upAxis === "y" ? box.min.y : box.min.z;
+    const maxH = upAxis === "y" ? box.max.y : box.max.z;
+    const storeyHeight = maxH - minH;
+
+    // Determine absolute cut height
+    let offset = params.offsetFromFloor ?? 1.2;
+    // If storey is short, use proportional cut (40% up)
+    if (storeyHeight < 3.0 || offset > storeyHeight * 0.8) {
+      offset = storeyHeight * 0.4;
+    }
+    // Use internal setPlanCut with the calculated offset
+    // setPlanCut adds offset to base (which will be the storey's bounding box min)
+    await this.setPlanCut({ height: offset, mode });
+  } else {
+    // Fallback: just use 1.2 m from camera target
+    await this.setPlanCut({ height: params.offsetFromFloor ?? 1.2, mode });
+  }
+
+  console.log("[setStoreyPlanCut]", { storeyId, mode });
+},
+
 async clearPlanCut() {
   planCutState = { enabled: false, planes: [] };
   clearClippingPlanes();

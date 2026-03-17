@@ -1,4 +1,5 @@
 /**
+ * src/types/rule.types.ts
  * TypeScript interfaces for the Solibri-based Rule Library
  * These types support VLM-based visual compliance checking in IFC/BIM models
  */

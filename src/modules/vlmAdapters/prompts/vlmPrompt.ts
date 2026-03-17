@@ -1,5 +1,5 @@
-// src/modules/vlmPrompt.ts
-import type { EvidenceView, VlmFollowUp, VlmVerdict } from "./vlmChecker";
+// src/modules/vlmAdapters/prompts/vlmPrompt.ts
+import type { EvidenceView, VlmFollowUp, VlmVerdict } from "../../vlmChecker";
 
 export type VlmDecisionJson = {
   verdict: VlmVerdict;

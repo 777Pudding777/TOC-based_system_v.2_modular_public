@@ -15,6 +15,38 @@ const WEB_FETCH_PROXY_BASE_URL =
   import.meta.env.VITE_WEB_FETCH_PROXY_URL ?? ""; // put your worker URL here via env
 
 import { webFetchViaProxy } from "./vlmAdapters/tools/webFetch";
+import {
+  isTavilyAvailable,
+  searchRuleContext,
+  formatResultsForPrompt,
+  webFetchViaTavily,
+} from "./vlmAdapters/tools/tavilySearch";
+import type { WebEvidenceRecord } from "../types/trace.types";
+import { reduceRegulatoryTextWithOpenRouter } from "./regulatoryReducer";
+
+// -------------------- Web fetching tools --------------------
+type ReducerProviderConfig =
+  | { provider: "mock" }
+  | {
+      provider: "openrouter";
+      openrouter: {
+        apiKey?: string;
+        model?: string;
+        endpoint?: string;
+        requestTimeoutMs?: number;
+        appTitle?: string;
+        appReferer?: string;
+      };
+    }
+  | {
+      provider: "openai";
+      openai: {
+        apiKey?: string;
+        model?: string;
+        endpoint?: string;
+        requestTimeoutMs?: number;
+      };
+    };
 
 export type VlmVerdict = "PASS" | "FAIL" | "UNCERTAIN";
 
@@ -53,6 +85,7 @@ export type VlmFollowUp =
   | { request: "HIDE_SELECTED" }
 
   | { request: "SET_PLAN_CUT"; params: { height: number; thickness?: number; mode?: "WORLD_UP" | "CAMERA" } }
+  | { request: "SET_STOREY_PLAN_CUT"; params: { storeyId: string; offsetFromFloor?: number; mode?: "WORLD_UP" | "CAMERA" } }
   | { request: "CLEAR_PLAN_CUT" }
 
 // Internal tool-like step (no viewer action): fetch authoritative code text via allowlisted proxy
@@ -475,7 +508,205 @@ export function createMockVlmAdapter(): VlmAdapter {
   };
 }
 
-export function createVlmChecker(adapter: VlmAdapter) {
+export function createVlmChecker(
+  adapter: VlmAdapter,
+  options?: {
+    onWebEvidence?: (entry: WebEvidenceRecord) => void;
+    hasWebEvidenceForUrl?: (url: string) => boolean;
+    getProviderConfig?: () => ReducerProviderConfig;
+  }
+) {
+        async function fetchRegulatoryContextDirect(args: {
+        step: number;
+        url: string;
+        userIntent: string;
+        allowedDomains: string[];
+        maxChars?: number;
+      }): Promise<string | null> {
+        const { step, url, userIntent, allowedDomains } = args;
+        const maxChars = args.maxChars ?? 20000;
+
+        // Prefer Tavily
+        if (isTavilyAvailable()) {
+          console.log("[VLM] Direct prefetch via Tavily start:", { url });
+
+          const result = await webFetchViaTavily({
+            targetUrl: url,
+            userIntent,
+            allowedDomains,
+            maxChars,
+            cache: { enabled: true, ttlMs: 7 * 24 * 60 * 60 * 1000, persist: true },
+          });
+
+          let reducedText = "";
+          let reductionHeadings: string[] | undefined;
+          let reductionRationale: string | undefined;
+          let reductionError: string | undefined;
+
+          if (result.ok) {
+            const reduced = await reduceFetchedRegulatoryText({
+              ruleText: userIntent,
+              sourceUrl: result.url,
+              rawText: result.text ?? "",
+            });
+            reducedText = reduced.reducedText;
+            reductionHeadings = reduced.headings;
+            reductionRationale = reduced.rationale;
+            reductionError = reduced.error;
+          }
+
+          options?.onWebEvidence?.({
+            step,
+            sourceType: "WEB_FETCH",
+            url: result.url,
+            fetchedAt: new Date().toISOString(),
+            ok: result.ok,
+            chars: result.text?.length ?? 0,
+            fromCache: result.fromCache,
+            via: `tavily/${result.source}` as "tavily/extract" | "tavily/search",
+            text: result.text ?? "",
+            reducedText: reducedText || undefined,
+            reductionHeadings,
+            reductionRationale,
+            reductionError,
+            error: result.error,
+          });
+
+          console.log("[VLM] Direct prefetch via Tavily done:", {
+            ok: result.ok,
+            chars: result.text?.length ?? 0,
+            reducedChars: reducedText.length,
+            error: result.error,
+            reductionError,
+            fromCache: result.fromCache,
+            source: result.source,
+          });
+
+          if (result.ok) {
+            return (
+              `WEB_EVIDENCE:\n[source: ${result.url}]\n` +
+              `[via: tavily/${result.source}]\n` +
+              `${result.fromCache ? `[cache: ${result.fromCache}]\n` : ""}` +
+              `${reducedText}\n`
+            );
+          }
+        }
+
+        // Proxy fallback
+        if (WEB_FETCH_PROXY_BASE_URL) {
+          console.log("[VLM] Direct prefetch via proxy start:", { url, proxy: WEB_FETCH_PROXY_BASE_URL });
+
+          const result = await webFetchViaProxy({
+            targetUrl: url,
+            allowedDomains,
+            proxyBaseUrl: WEB_FETCH_PROXY_BASE_URL,
+            maxChars,
+            cache: { enabled: true, ttlMs: 7 * 24 * 60 * 60 * 1000, persist: true },
+          });
+
+          let reducedText = "";
+          let reductionHeadings: string[] | undefined;
+          let reductionRationale: string | undefined;
+          let reductionError: string | undefined;
+
+          if (result.ok) {
+            const reduced = await reduceFetchedRegulatoryText({
+              ruleText: userIntent,
+              sourceUrl: result.url,
+              rawText: result.text ?? "",
+            });
+            reducedText = reduced.reducedText;
+            reductionHeadings = reduced.headings;
+            reductionRationale = reduced.rationale;
+            reductionError = reduced.error;
+          }
+
+          options?.onWebEvidence?.({
+            step,
+            sourceType: "WEB_FETCH",
+            url: result.url,
+            fetchedAt: new Date().toISOString(),
+            ok: result.ok,
+            chars: result.text?.length ?? 0,
+            fromCache: result.fromCache,
+            via: "proxy",
+            text: result.text ?? "",
+            reducedText: reducedText || undefined,
+            reductionHeadings,
+            reductionRationale,
+            reductionError,
+            error: result.error,
+          });
+
+          console.log("[VLM] Direct prefetch via proxy done:", {
+            ok: result.ok,
+            chars: result.text?.length ?? 0,
+            reducedChars: reducedText.length,
+            error: result.error,
+            reductionError,
+            fromCache: result.fromCache,
+          });
+
+          if (result.ok) {
+            return (
+              `WEB_EVIDENCE:\n[source: ${result.url}]\n` +
+              `${result.fromCache ? `[cache: ${result.fromCache}]\n` : ""}` +
+              `${reducedText}\n`
+            );
+          }
+        }
+
+        return null;
+      }
+
+        async function reduceFetchedRegulatoryText(args: {
+          ruleText: string;
+          sourceUrl: string;
+          rawText: string;
+        }): Promise<{
+          reducedText: string;
+          headings?: string[];
+          rationale?: string;
+          error?: string;
+        }> {
+          const cfg = options?.getProviderConfig?.();
+
+          if (cfg?.provider === "openrouter" && cfg.openrouter?.apiKey && cfg.openrouter?.model) {
+            const reduced = await reduceRegulatoryTextWithOpenRouter({
+              apiKey: String(cfg.openrouter.apiKey),
+              model: String(cfg.openrouter.model),
+              endpoint: cfg.openrouter.endpoint,
+              requestTimeoutMs: cfg.openrouter.requestTimeoutMs,
+              appTitle: cfg.openrouter.appTitle,
+              appReferer: cfg.openrouter.appReferer,
+              input: {
+                ruleText: args.ruleText,
+                sourceUrl: args.sourceUrl,
+                rawText: args.rawText,
+                maxChars: 3500,
+              },
+            });
+
+            if (reduced.ok) {
+              return {
+                reducedText: reduced.reducedText,
+                headings: reduced.headings,
+                rationale: reduced.rationale,
+              };
+            }
+
+            return {
+              reducedText: args.rawText.slice(0, 3500),
+              error: reduced.error,
+            };
+          }
+
+          return {
+            reducedText: args.rawText.slice(0, 3500),
+            error: "No reducer provider configured; used truncated raw text.",
+          };
+        }
+
   return {
     adapterName: adapter.name,
 
@@ -497,12 +728,45 @@ export function createVlmChecker(adapter: VlmAdapter) {
           allowedDomains,
         });
 
-        // If prompt is vague and we have no regulatory text yet, push WEB_FETCH first.
+        // Deterministic prefetch: do not rely on the model to request WEB_FETCH first.
         if (step === 0 && !regulatoryContext.trim() && isVagueCompliancePrompt(userIntent)) {
-          composedPrompt +=
-            "\n\nSYSTEM_NOTE:\n" +
-            "The requirement is vague / missing thresholds. Prioritize WEB_FETCH first to retrieve the authoritative clause text from AllowedSources.\n" +
-            "If you don’t know the section URL yet, fetch a relevant code TOC/chapter page first.\n";
+          const prefetchUrl = guessIccEntrypointUrl(userIntent, allowedDomains);
+
+          if (
+            prefetchUrl &&
+            !fetchedUrls.has(prefetchUrl) &&
+            !options?.hasWebEvidenceForUrl?.(prefetchUrl)
+          ) {
+            fetchedUrls.add(prefetchUrl);
+
+            const injected = await fetchRegulatoryContextDirect({
+              step,
+              url: prefetchUrl,
+              userIntent,
+              allowedDomains,
+              maxChars: 20000,
+            });
+
+            if (injected) {
+              regulatoryContext = (regulatoryContext ? regulatoryContext + "\n\n" : "") + injected;
+            } else {
+              composedPrompt +=
+                "\n\nSYSTEM_NOTE:\n" +
+                "The requirement is vague / missing thresholds. Prioritize WEB_FETCH first to retrieve the authoritative clause text from AllowedSources.\n" +
+                "If you don’t know the section URL yet, fetch a relevant code TOC/chapter page first.\n";
+            }
+          } else {
+            composedPrompt +=
+              "\n\nSYSTEM_NOTE:\n" +
+              "The requirement is vague / missing thresholds. Prioritize WEB_FETCH first to retrieve the authoritative clause text from AllowedSources.\n" +
+              "If you don’t know the section URL yet, fetch a relevant code TOC/chapter page first.\n";
+          }
+
+          composedPrompt = composePromptWithRegulatoryContext({
+            userIntent,
+            regulatoryContext,
+            allowedDomains,
+          });
         }
         const norm: VlmCheckInput = { ...norm0, prompt: composedPrompt };
         const core = await adapter.check(norm);
@@ -511,21 +775,9 @@ export function createVlmChecker(adapter: VlmAdapter) {
         //--------------WEB_FETCH FOLLOW-UP LOGIC----------------
         //---------------------------------------------------
         // If model requests WEB_FETCH, execute it internally and re-run once.
-        const fu = isFollowUp(core.followUp) ? core.followUp : undefined;
+                const fu = isFollowUp(core.followUp) ? core.followUp : undefined;
         if (core.verdict === "UNCERTAIN" && fu?.request === "WEB_FETCH") {
           console.log("[VLM] WEB_FETCH requested. raw params:", fu.params);
-
-          if (!WEB_FETCH_PROXY_BASE_URL) {
-            console.warn("[VLM] WEB_FETCH proxy not configured.");
-            const patched = {
-              ...core,
-              followUp: undefined,
-              rationale:
-                (core.rationale ? core.rationale + " " : "") +
-                "WEB_FETCH requested but proxy is not configured (VITE_WEB_FETCH_PROXY_URL).",
-            };
-            return finalizeDecision(patched as any, norm, adapter.name);
-          }
 
           let url = (fu.params as any)?.url as string | undefined;
 
@@ -538,31 +790,162 @@ export function createVlmChecker(adapter: VlmAdapter) {
           if (!url) {
             const patched = {
               ...core,
-              followUp: { request: "NEW_VIEW", params: { reason: "WEB_FETCH requested but no url provided and no fallback entrypoint available." } } as VlmFollowUp,
+              followUp: {
+                request: "NEW_VIEW",
+                params: { reason: "WEB_FETCH requested but no url provided and no fallback entrypoint available." },
+              } as VlmFollowUp,
             };
             return finalizeDecision(patched as any, norm, adapter.name);
           }
 
           if (fetchedUrls.has(url)) {
-            regulatoryContext =
-              (regulatoryContext ? regulatoryContext + "\n\n" : "") +
-              `WEB_EVIDENCE_NOTE:\n[source: ${url}]\nAlready fetched in this run.\n`;
-            continue;
+            const patched = {
+              ...core,
+              followUp: { request: "NEW_VIEW", params: { reason: "Regulatory source already fetched; need better model evidence now." } } as VlmFollowUp,
+              rationale:
+                (core.rationale ? core.rationale + " " : "") +
+                "Regulatory source already fetched in this run; further progress requires better visual evidence, not another web fetch.",
+            };
+            return finalizeDecision(patched as any, norm, adapter.name);
           }
           fetchedUrls.add(url);
 
-          console.log("[VLM] WEB_FETCH start:", { url, proxy: WEB_FETCH_PROXY_BASE_URL });
+          const maxChars = (fu.params as any)?.maxChars ?? 20000;
+
+          // 1) Prefer Tavily for URL-grounded fetch/extract
+          if (isTavilyAvailable()) {
+            console.log("[VLM] WEB_FETCH via Tavily start:", { url });
+
+            const t0 = performance.now();
+            const result = await webFetchViaTavily({
+              targetUrl: url,
+              userIntent,
+              allowedDomains,
+              maxChars,
+              cache: { enabled: true, ttlMs: 7 * 24 * 60 * 60 * 1000, persist: true },
+            });
+
+            let reducedText = "";
+            let reductionHeadings: string[] | undefined;
+            let reductionRationale: string | undefined;
+            let reductionError: string | undefined;
+
+            if (result.ok) {
+              const reduced = await reduceFetchedRegulatoryText({
+                ruleText: userIntent,
+                sourceUrl: result.url,
+                rawText: result.text ?? "",
+              });
+              reducedText = reduced.reducedText;
+              reductionHeadings = reduced.headings;
+              reductionRationale = reduced.rationale;
+              reductionError = reduced.error;
+            }
+
+            options?.onWebEvidence?.({
+              step,
+              sourceType: "WEB_FETCH",
+              url: result.url,
+              fetchedAt: new Date().toISOString(),
+              ok: result.ok,
+              chars: result.text?.length ?? 0,
+              fromCache: result.fromCache,
+              via: `tavily/${result.source}` as "tavily/extract" | "tavily/search",
+              text: result.text ?? "",
+              reducedText: reducedText || undefined,
+              reductionHeadings,
+              reductionRationale,
+              reductionError,
+              error: result.error,
+            });
+
+            console.log("[VLM] WEB_FETCH via Tavily done:", {
+              ok: result.ok,
+              ms: Math.round(performance.now() - t0),
+              chars: result.text?.length ?? 0,
+              reducedChars: reducedText.length,
+              error: result.error,
+              reductionError,
+              fromCache: result.fromCache,
+              source: result.source,
+            });
+
+            if (result.ok) {
+              const injected =
+                `WEB_EVIDENCE:\n[source: ${result.url}]\n` +
+                `[via: tavily/${result.source}]\n` +
+                `${result.fromCache ? `[cache: ${result.fromCache}]\n` : ""}` +
+                `${reducedText}\n`;
+
+              regulatoryContext = (regulatoryContext ? regulatoryContext + "\n\n" : "") + injected;
+              continue;
+            }
+
+            console.warn("[VLM] Tavily fetch failed; falling back to proxy.", result.error);
+          }
+
+          // 2) Optional proxy fallback
+          if (!WEB_FETCH_PROXY_BASE_URL) {
+            // Final soft fallback: broad Tavily search context if available
+            if (isTavilyAvailable()) {
+              console.log("[VLM] No proxy configured; using Tavily search fallback.");
+              const searchQuery = `site:${new URL(url).hostname} ${userIntent}`;
+              const tavilyResult = await searchRuleContext(searchQuery).catch(() => null);
+              if (tavilyResult && tavilyResult.results.length > 0) {
+                for (const r of tavilyResult.results) {
+                  options?.onWebEvidence?.({
+                    step,
+                    sourceType: "TAVILY_SEARCH",
+                    url: r.url,
+                    fetchedAt: new Date().toISOString(),
+                    ok: true,
+                    chars: (r.rawContent ?? r.content ?? "").length,
+                    via: "tavily/search",
+                    query: tavilyResult.query,
+                    title: r.title,
+                    text: r.rawContent ?? r.content ?? "",
+                  });
+                }
+              }
+            }
+
+            
+            const patched = {
+              ...core,
+              followUp: undefined,
+              rationale:
+                (core.rationale ? core.rationale + " " : "") +
+                "WEB_FETCH failed and no proxy is configured (VITE_WEB_FETCH_PROXY_URL).",
+            };
+            
+            return finalizeDecision(patched as any, norm, adapter.name);
+          }
+
+          console.log("[VLM] WEB_FETCH via proxy start:", { url, proxy: WEB_FETCH_PROXY_BASE_URL });
           const t0 = performance.now();
 
           const result = await webFetchViaProxy({
             targetUrl: url,
             allowedDomains,
             proxyBaseUrl: WEB_FETCH_PROXY_BASE_URL,
-            maxChars: (fu.params as any)?.maxChars ?? 20000,
+            maxChars,
             cache: { enabled: true, ttlMs: 7 * 24 * 60 * 60 * 1000, persist: true },
           });
 
-          console.log("[VLM] WEB_FETCH done:", {
+                    options?.onWebEvidence?.({
+            step,
+            sourceType: "WEB_FETCH",
+            url: result.url,
+            fetchedAt: new Date().toISOString(),
+            ok: result.ok,
+            chars: result.text?.length ?? 0,
+            fromCache: result.fromCache,
+            via: "proxy",
+            text: result.text ?? "",
+            error: result.error,
+          });
+
+          console.log("[VLM] WEB_FETCH via proxy done:", {
             ok: result.ok,
             ms: Math.round(performance.now() - t0),
             chars: result.text?.length ?? 0,

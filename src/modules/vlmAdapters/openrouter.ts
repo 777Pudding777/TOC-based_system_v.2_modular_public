@@ -274,6 +274,10 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
         max_tokens: cfg.max_tokens ?? 900,
         messages: [
           {
+            role: "system",
+            content: "Return ONLY valid JSON. No markdown. No prose outside JSON. No code fences. No extra keys.",
+          },
+          {
             role: "user",
             content: [
               { type: "text", text: userText },
@@ -332,14 +336,14 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
         const fallback: DecisionCore = {
           verdict: "UNCERTAIN",
           confidence: 0.15,
-          rationale: "Model returned non-JSON output; requesting another view.",
+          rationale: "Model returned non-JSON output; could not produce structured decision.",
           visibility: {
             isRuleTargetVisible: false,
             occlusionAssessment: "HIGH",
             missingEvidence: ["Non-JSON output from model."],
           },
           evidence: { snapshotIds: [last.id], mode: last.mode, note: last.meta.note },
-          followUp: { request: "NEW_VIEW", params: { reason: "Non-JSON output; need clearer evidence." } },
+          followUp: undefined,
           meta: { modelId: cfg.model ?? null, provider: "openrouter" },
         };
         return fallback;
@@ -366,7 +370,7 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
             missingEvidence: ["Incomplete JSON core from model."],
           },
           evidence: { snapshotIds: [last.id], mode: last.mode, note: last.meta.note },
-          followUp: { request: "NEW_VIEW", params: { reason: "Incomplete JSON; need clearer evidence." } },
+          followUp: undefined,
           meta: { modelId: cfg.model ?? null, provider: "openrouter" },
         };
         return fallback;

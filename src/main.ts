@@ -1,3 +1,4 @@
+// main.ts - Application entry point. Initializes viewer, modules, and UI components, and wires them together.
 import "./styles.css";
 
 import * as BUI from "@thatopen/ui";
@@ -17,9 +18,15 @@ import { createComplianceRunner } from "./modules/complianceRunner";
 import { createOpenRouterVlmAdapter, type OpenRouterAdapterConfig } from "./modules/vlmAdapters/openrouter";
 import { _setActiveModel } from "./viewer/state";
 
+// Phase 1: New imports for rule management and inspection
+import { createRuleDb } from "./storage/ruleDb";
+import { createTraceDb } from "./storage/traceDb";
+import { initializeRuleLibrary } from "./modules/ruleLoader";
+import { validateEnvironment, getEnvironmentConfig } from "./config/environment";
 
-// ✅ add this import
+// OpenAI adapter
 import { createOpenAiVlmAdapter, type OpenAiAdapterConfig } from "./modules/vlmAdapters/openai";
+import type { WebEvidenceRecord } from "./types/trace.types";
 
 // ---------- VLM adapter UI config (persisted) ----------
 type VlmUiConfig =
@@ -116,8 +123,6 @@ function saveVlmKeys(keys: VlmKeys) {
   sessionStorage.setItem(VLM_KEYS_KEY, JSON.stringify(keys));
 }
 
-// On unload, persist any API keys from session to local (for UI convenience)
-
 function buildAdapterFromConfig(cfg: VlmUiConfig): VlmAdapter {
   if (cfg.provider === "openai") {
     return createOpenAiVlmAdapter({
@@ -130,7 +135,6 @@ function buildAdapterFromConfig(cfg: VlmUiConfig): VlmAdapter {
     return createOpenRouterVlmAdapter({
       ...cfg.openrouter,
       apiKey: String((cfg.openrouter as any).apiKey ?? ""),
-      // Sensible defaults for determinism
       temperature: (cfg.openrouter as any).temperature ?? 0,
       top_p: (cfg.openrouter as any).top_p ?? 1,
       max_tokens: (cfg.openrouter as any).max_tokens ?? 900,
@@ -144,7 +148,14 @@ function buildAdapterFromConfig(cfg: VlmUiConfig): VlmAdapter {
 
 
 // Application Initialization
-BUI.Manager.init(); // do this immediately once
+BUI.Manager.init();
+
+// Phase 1: Validate environment configuration
+const envValidation = validateEnvironment();
+if (envValidation.warnings.length > 0) {
+  console.warn("[ENV] Configuration warnings:", envValidation.warnings);
+}
+void getEnvironmentConfig();
 
 const viewerDiv = document.getElementById("viewer") as HTMLDivElement;
 const treeRoot = document.getElementById("overlay-top-left") as HTMLDivElement;
@@ -158,14 +169,11 @@ const ctx = await initViewer(viewerDiv);
 (window as any).ifcManager = (ctx.ifcLoader as any)?.ifcManager;
 const viewerApi = createViewerApi(ctx);
 
-// Navigation Agent module initialization
-const navigationAgent = createNavigationAgent({
-  viewerApi,
-  toast,
-});
+// Navigation Agent
+const navigationAgent = createNavigationAgent({ viewerApi, toast });
 (window as any).navigationAgent = navigationAgent;
 
-// Snapshot Collector and Storage DB module initialization
+// Snapshot Collector and Storage DB
 const snapshotDb = createSnapshotDb();
 
 const snapshotCollector = createSnapshotCollector({
@@ -178,7 +186,7 @@ const snapshotCollector = createSnapshotCollector({
 snapshotCollector.start();
 (window as any).snapshotCollector = snapshotCollector;
 
-let panelHandle: { rerender: () => void } | null = null;
+let panelHandle: { rerender: () => void; refreshRules?: () => Promise<void> } | null = null;
 
 const upload = createIfcUpload({
   ifcLoader: ctx.ifcLoader,
@@ -191,31 +199,59 @@ const upload = createIfcUpload({
   },
 });
 
+(window as any).snapshotDb = snapshotDb;
 
-(window as any).snapshotDb = snapshotDb; // handy for debugging
+// Temporary in-memory store for web evidence collected during a run, to be included in trace and report outputs. Cleared on each new run.
+let currentRunWebEvidence: WebEvidenceRecord[] = [];
 
-// -------------------- ✅ VLM checker (mutable) --------------------
+function hasRunWebEvidenceForUrl(url: string): boolean {
+  return currentRunWebEvidence.some((e) => e.ok && e.url === url);
+}
+
+// -------------------- VLM checker (mutable) --------------------
+function createAppChecker(cfg: VlmUiConfig) {
+  return createVlmChecker(buildAdapterFromConfig(cfg), {
+    onWebEvidence: (entry) => {
+      currentRunWebEvidence.push(entry);
+      console.log("[WEB_EVIDENCE] pushed", {
+        len: currentRunWebEvidence.length,
+        url: entry.url,
+        ok: entry.ok,
+        via: entry.via,
+      });
+    },
+    hasWebEvidenceForUrl: (url: string) => {
+      const seen = currentRunWebEvidence.some((e) => e.ok && e.url === url);
+      console.log("[WEB_EVIDENCE] hasUrl", { url, seen });
+      return seen;
+    },
+    getProviderConfig: () => cfg,
+  });
+}
+
 let vlmUiConfig: VlmUiConfig = loadVlmUiConfig();
-let currentChecker = createVlmChecker(buildAdapterFromConfig(vlmUiConfig));
 
-// Facade object stays stable for determinism + runner references.
-// Swapping providers updates currentChecker, not references.
+let currentChecker = createAppChecker(vlmUiConfig);
+
 const vlmChecker = {
-  get adapterName() {
-    return currentChecker.adapterName;
-  },
+  get adapterName() { return currentChecker.adapterName; },
   async check(input: Parameters<typeof currentChecker.check>[0]) {
     return currentChecker.check(input);
   },
-  // allow UI to swap provider/config deterministically
   setConfig(next: VlmUiConfig) {
     vlmUiConfig = next;
     saveVlmUiConfig(next);
-    currentChecker = createVlmChecker(buildAdapterFromConfig(next));
+    currentChecker = createAppChecker(next);
   },
-  getConfig() {
-    return vlmUiConfig;
+  resetRunWebEvidence() {
+    currentRunWebEvidence = [];
+    console.log("[WEB_EVIDENCE] reset");
   },
+  getRunWebEvidence() {
+    console.log("[WEB_EVIDENCE] get", currentRunWebEvidence.length);
+    return [...currentRunWebEvidence];
+  },
+  getConfig() { return vlmUiConfig; },
 };
 
 (window as any).vlmChecker = vlmChecker;
@@ -224,20 +260,31 @@ const vlmChecker = {
 const complianceDb = createComplianceDb();
 (window as any).complianceDb = complianceDb;
 
-// Compliance Runner module initialization
+// Phase 1: Rule Database and Trace Database
+const ruleDb = createRuleDb();
+const traceDb = createTraceDb();
+(window as any).ruleDb = ruleDb;
+(window as any).traceDb = traceDb;
+
+// Initialize rule library on first run
+initializeRuleLibrary(ruleDb).catch((e) => {
+  console.error("[BOOT] Failed to initialize rule library:", e);
+});
+
+// Compliance Runner
 const complianceRunner = createComplianceRunner({
   viewerApi,
   snapshotCollector,
-  // ✅ pass facade; runner keeps working if provider switches
   vlmChecker,
   complianceDb,
-  navigationAgent, // optional
+  navigationAgent,
   toast,
 });
 
 (window as any).complianceRunner = complianceRunner;
 
-// UI Mounting
+// ==================== UI Mounting ====================
+// Mount a single unified panel with inspection features integrated
 panelHandle = mountPanel({
   panelRoot,
   viewerApi,
@@ -246,7 +293,9 @@ panelHandle = mountPanel({
   vlmChecker,
   complianceDb,
   complianceRunner,
-  navigationAgent, // optional
+  navigationAgent,
+  ruleDb,
+  traceDb,
   toast,
 });
 
@@ -255,8 +304,14 @@ panelHandle = mountPanel({
 viewerApi.onModelLoaded(() => panelHandle?.rerender());
 mountTree({ treeRoot, ctx, viewerApi, toast });
 
+// Refresh rules in panel after library initialization completes
+setTimeout(async () => {
+  try {
+    await panelHandle?.refreshRules?.();
+  } catch { /* ignore */ }
+}, 1500);
+
 toast("Viewer booted");
 
 console.log("[BOOT] app initialized", new Date().toISOString());
-
-
+console.log("[BOOT] Phase 1 modules loaded: ruleDb, traceDb, integrated inspection panel");

@@ -2,6 +2,7 @@
 // Orchestrates "one rule per project": reset state, (optional) deterministic start,
 // capture snapshot(s), call VLM checker, store decisions, and optionally do follow-ups.
 
+import type { WebEvidenceRecord } from "../types/trace.types";
 import type { CameraPose, StartPosePreset } from "../viewer/api";
 import type { SnapshotArtifact } from "./snapshotCollector";
 import type { VlmDecision, VlmFollowUp } from "./vlmChecker";
@@ -32,7 +33,7 @@ type EvidenceContext = {
   lastActionReason?: string | null;
   availableStoreys?: string[];
   availableSpaces?: string[];
-
+  planCut?: { enabled: boolean; planes?: number };
 };
 
 type ToastFn = (msg: string, ms?: number) => void;
@@ -48,6 +49,7 @@ export type ComplianceStartParams = {
   maxSteps?: number;          // safeguard
   minConfidence?: number;     // stop condition
   evidenceWindow?: number;    // multi-view aggregation (forward-compatible)
+  onStep?: (step: number, decision: VlmDecision) => void;  // live progress callback
 };
 
 export function createComplianceRunner(params: {
@@ -82,6 +84,7 @@ export function createComplianceRunner(params: {
 
     setPlanCut?: (p: { height: number; thickness?: number; mode?: "WORLD_UP" | "CAMERA" }) => Promise<void>;
     clearPlanCut?: () => Promise<void>;
+    setStoreyPlanCut?: (p: { storeyId: string; offsetFromFloor?: number; mode?: "WORLD_UP" | "CAMERA" }) => Promise<void>;
 
    listStoreys?: () => Promise<string[]>;
    listSpaces?: () => Promise<string[]>;
@@ -321,6 +324,16 @@ if (f.request === "SET_PLAN_CUT") {
   }
   await viewerApi.setPlanCut(f.params);
   return { didSomething: true, reason: "plan-cut" as const };
+}
+
+// Storey-aware plan cut (CAD-style floor plan)
+if (f.request === "SET_STOREY_PLAN_CUT") {
+  if (!viewerApi.setStoreyPlanCut) {
+    console.warn("[FollowUp] setStoreyPlanCut not wired");
+    return { didSomething: false, reason: "storey-plan-cut-not-wired" as const };
+  }
+  await viewerApi.setStoreyPlanCut(f.params);
+  return { didSomething: true, reason: "storey-plan-cut" as const };
 }
 
 if (f.request === "CLEAR_PLAN_CUT") {
@@ -578,6 +591,9 @@ if (f.request === "SHOW_IDS") {
     const minConfidence = Math.max(0, Math.min(1, params.minConfidence ?? 0.75));
     const evidenceWindow = Math.max(1, Math.min(8, params.evidenceWindow ?? 3));
 
+    // Accumulate ALL decisions across steps so the caller can build a trace
+    const allDecisions: VlmDecision[] = [];
+
     // Per-run evidence buffer (deterministic, in-order)
     const evidence: EvidenceItem[] = [];
 
@@ -689,8 +705,10 @@ pendingNav = undefined;
         return { ok: false as const, reason: "no-runid" as const };
       }
 
+      allDecisions.push(decision);
       await complianceDb.saveDecision(activeRunId, decision);
       console.log("[Compliance] decision:", decision);
+      params.onStep?.(step, decision);
 
       const confident = decision.confidence >= minConfidence;
 
@@ -698,7 +716,13 @@ pendingNav = undefined;
         toast?.(
           `Compliance result: ${decision.verdict} (${(decision.confidence * 100).toFixed(0)}%)`
         );
-        return { ok: true as const, runId: activeRunId, final: decision };
+        return {
+          ok: true as const,
+          runId: activeRunId,
+          final: decision,
+          decisions: allDecisions,
+          snapshots: evidence.length,
+        };
       }
 
       if ((decision.verdict === "PASS" || decision.verdict === "FAIL") && !confident) {
@@ -726,15 +750,26 @@ if (acted.didSomething) {
 }
 
 toast?.(`Low-confidence ${decision.verdict} with no actionable follow-up. Stopping.`);
-return { ok: true as const, runId: activeRunId, final: decision };
-
+        return {
+          ok: true as const,
+          runId: activeRunId,
+          final: decision,
+          decisions: allDecisions,
+          snapshots: evidence.length,
+        };
       }
 
       if (decision.verdict === "UNCERTAIN" && confident) {
         toast?.(
           `UNCERTAIN with high confidence (${(decision.confidence * 100).toFixed(0)}%). Stopping.`
         );
-        return { ok: true as const, runId: activeRunId, final: decision };
+        return {
+          ok: true as const,
+          runId: activeRunId,
+          final: decision,
+          decisions: allDecisions,
+          snapshots: evidence.length,
+        };
       }
 
 const fuKey = followUpKey(decision.followUp);
@@ -761,12 +796,18 @@ if (acted.didSomething) {
 }
 
 toast?.("UNCERTAIN with no actionable follow-up. Stopping.");
-return { ok: true as const, runId: activeRunId, final: decision };
-
+      return {
+        ok: true as const,
+        runId: activeRunId,
+        final: decision,
+        decisions: allDecisions,
+        snapshots: evidence.length,
+      };
     }
 
     toast?.("Max steps reached without conclusive compliance result.");
-    return { ok: false as const, reason: "max-steps-reached" as const };
+    const lastDec = allDecisions.length > 0 ? allDecisions[allDecisions.length - 1] : undefined;
+    return { ok: false as const, reason: "max-steps-reached" as const, final: lastDec, decisions: allDecisions, snapshots: evidence.length };
   }
 return { start, getActiveRunId: () => activeRunId, parseCustomPose, }; }
 

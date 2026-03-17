@@ -94,19 +94,35 @@ html, body {
   overflow: hidden;
 }
 
-/* Floating UI window */
+/* Floating UI window — right sidebar */
 #overlay-top-right {
   position: absolute;
   top: 12px;
   right: 12px;
+  bottom: 12px;
   z-index: 10;
-  width: 280px;
+  width: 420px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.2) transparent;
+}
+
+#overlay-top-right::-webkit-scrollbar {
+  width: 6px;
+}
+#overlay-top-right::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.2);
+  border-radius: 3px;
+}
+#overlay-top-right::-webkit-scrollbar-track {
+  background: transparent;
 }
 
 /* Make the panel look like a small card */
 #overlay-top-right bim-panel {
   border-radius: 12px;
-  overflow: hidden;
+  overflow: visible;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
 }
 
