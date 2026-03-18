@@ -29,6 +29,110 @@ function extractFirstJsonObject(text: string): string | null {
   return text.slice(a, b + 1);
 }
 
+function coerceAssistantText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object") {
+          const p = part as any;
+          if (typeof p.text === "string") return p.text;
+          if (typeof p.content === "string") return p.content;
+          if (typeof p.output_text === "string") return p.output_text;
+          if (p.json && typeof p.json === "object") return JSON.stringify(p.json);
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+  if (content && typeof content === "object") {
+    const c = content as any;
+    if (typeof c.text === "string") return c.text;
+    if (typeof c.content === "string") return c.content;
+    if (typeof c.output_text === "string") return c.output_text;
+    if (c.json && typeof c.json === "object") return JSON.stringify(c.json);
+  }
+  return "";
+}
+
+
+function pickAssistantContent(responseJson: any): unknown {
+  const choice = responseJson?.choices?.[0];
+  const message = choice?.message;
+  const toolCallArgs = Array.isArray(message?.tool_calls)
+    ? message.tool_calls
+        .map((t: any) => t?.function?.arguments)
+        .find((x: unknown) => x !== undefined && x !== null)
+    : undefined;
+
+  return (
+    message?.parsed ??
+    message?.json ??
+    message?.content ??
+    choice?.text ??
+    toolCallArgs ??
+    ""
+  );
+}
+
+
+function describeModelOutput(content: unknown): string {
+  if (content == null) return "empty";
+  if (typeof content === "string") {
+    const snippet = content.replace(/\s+/g, " ").trim().slice(0, 180);
+    return `string:${snippet || "<blank>"}`;
+  }
+  if (Array.isArray(content)) {
+    const preview = content.slice(0, 2).map((x) => {
+      if (typeof x === "string") return x.replace(/\s+/g, " ").trim().slice(0, 80);
+      if (x && typeof x === "object") return `obj(${Object.keys(x as any).slice(0, 6).join(",")})`;
+      return typeof x;
+    });
+    return `array[len=${content.length}] ${preview.join(" | ")}`;
+  }
+  if (typeof content === "object") {
+    return `object keys=${Object.keys(content as any).slice(0, 10).join(",")}`;
+  }
+  return typeof content;
+}
+
+function parseModelJson<T>(content: unknown): T | null {
+  if (content && typeof content === "object" && !Array.isArray(content)) {
+    const direct = content as any;
+    if (direct.json && typeof direct.json === "object") return direct.json as T;
+    if (
+      typeof direct.verdict === "string" ||
+      Array.isArray(direct.relevantClauses) ||
+      Array.isArray(direct.candidates) ||
+      typeof direct.ruleFocusedSummary === "string"
+    ) {
+      return direct as T;
+    }
+  }
+
+  const raw = coerceAssistantText(content).trim();
+  if (!raw) return null;
+
+  const candidates = [raw];
+  const unwrappedFence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
+  if (unwrappedFence) candidates.push(unwrappedFence);
+  const jsonSlice = extractFirstJsonObject(raw);
+  if (jsonSlice && jsonSlice !== raw) candidates.push(jsonSlice);
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate) as T;
+    } catch {
+      // try next candidate
+    }
+  }
+
+  return null;
+}
+
 function buildReducerPrompt(input: RegulatoryReductionInput) {
   const system = [
     "You extract only rule-relevant regulatory text from authoritative fetched code content.",
@@ -92,7 +196,7 @@ function compactReducedOutput(parsed: JsonShape, maxChars: number): string {
 
 export async function reduceRegulatoryTextWithOpenRouter(args: {
   apiKey: string;
-  model: "openai/gpt-4",
+  model: "openai/gpt-4.o",
   endpoint?: string;
   requestTimeoutMs?: number;
   appTitle?: string;
@@ -138,21 +242,50 @@ export async function reduceRegulatoryTextWithOpenRouter(args: {
     };
   }
 
-  const content: string =
-    json?.choices?.[0]?.message?.content ??
-    json?.choices?.[0]?.text ??
-    "";
+  const content = json?.choices?.[0]?.message?.content ?? json?.choices?.[0]?.text ?? "";
+  let parsed = parseModelJson<JsonShape>(content);
 
-  const candidate = extractFirstJsonObject(String(content)) ?? String(content);
+  if (!parsed) {
+    const retryBody = {
+      ...body,
+      temperature: 0,
+      top_p: 1,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Return ONLY valid minified JSON object with keys relevantClauses, ruleFocusedSummary, droppedContentKinds. No markdown, no prose, no code fences.",
+        },
+        { role: "user", content: user },
+      ],
+    };
 
-  let parsed: JsonShape | null = null;
-  try {
-    parsed = JSON.parse(candidate);
-  } catch {
+    const retry = await fetchJsonWithTimeout(
+      endpoint,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${args.apiKey}`,
+          ...(args.appReferer ? { "HTTP-Referer": args.appReferer } : {}),
+          ...(args.appTitle ? { "X-Title": args.appTitle } : {}),
+        },
+        body: JSON.stringify(retryBody),
+      },
+      timeoutMs
+    );
+
+    if (retry.ok) {
+      const retryContent = retry.json?.choices?.[0]?.message?.content ?? retry.json?.choices?.[0]?.text ?? "";
+      parsed = parseModelJson<JsonShape>(retryContent);
+    }
+  }
+
+  if (!parsed) {
     return {
       ok: false,
       reducedText: "",
-      error: "Reducer returned non-JSON output.",
+      error: `Reducer returned non-JSON output (${describeModelOutput(content)}).`,
     };
   }
 

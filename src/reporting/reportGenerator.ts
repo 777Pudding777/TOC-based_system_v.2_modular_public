@@ -348,6 +348,63 @@ function generateCss(): string {
       color: #6b7280;
     }
 
+    .step-snapshots {
+      margin-bottom: 12px;
+    }
+
+    .step-snapshots-title {
+      font-size: 13px;
+      font-weight: 600;
+      color: #374151;
+      margin-bottom: 8px;
+    }
+
+    .step-snapshots-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 10px;
+    }
+
+    .step-snapshot-card {
+      margin: 0;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      overflow: hidden;
+      background: #fff;
+    }
+
+    .step-snapshot-card img {
+      display: block;
+      width: 100%;
+      height: 600px;
+      object-fit: cover;
+      background: #111827;
+    }
+
+    .step-snapshot-placeholder {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 600px;
+      background: #1f2937;
+      color: #9ca3af;
+      font-size: 12px;
+    }
+
+    .step-snapshot-card figcaption {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      padding: 8px 10px;
+      font-size: 12px;
+      color: #6b7280;
+    }
+
+    .step-snapshot-card .snapshot-id {
+      font-weight: 600;
+      color: #1f2937;
+    }
+
     .footer {
       background: #f9fafb;
       padding: 24px 32px;
@@ -601,9 +658,43 @@ function generateTraceSection(trace: ConversationTrace): string {
     `;
   }
 
+  const snapshotsById = new Map(trace.snapshots.map((snapshot) => [snapshot.snapshotId, snapshot]));
+  const promptByStep = new Map(trace.prompts.map((prompt) => [prompt.step, prompt]));
+
   const stepsHtml = trace.responses
     .map(
-      (r) => `
+      (r) => {
+        const prompt = promptByStep.get(r.step);
+        const evidenceSnapshots = (prompt?.snapshotIds ?? [])
+          .map((snapshotId) => snapshotsById.get(snapshotId))
+          .filter((snapshot): snapshot is NonNullable<typeof snapshot> => !!snapshot);
+
+        const snapshotsHtml = evidenceSnapshots.length
+          ? `
+          <div class="step-snapshots">
+            <div class="step-snapshots-title">Visual evidence</div>
+            <div class="step-snapshots-grid">
+              ${evidenceSnapshots
+                .map(
+                  (snapshot) => `
+                <figure class="step-snapshot-card">
+                  ${snapshot.imageBase64
+                    ? `<img src="data:image/png;base64,${snapshot.imageBase64}" alt="Snapshot ${snapshot.snapshotId}" />`
+                    : `<div class="step-snapshot-placeholder">Image not embedded</div>`}
+                  <figcaption>
+                    <span class="snapshot-id">${escapeHtml(snapshot.snapshotId)}</span>
+                    <span>${escapeHtml(snapshot.reason)}</span>
+                  </figcaption>
+                </figure>
+              `
+                )
+                .join("")}
+            </div>
+          </div>
+        `
+          : "";
+
+        return `
       <div class="step-item ${r.decision.verdict.toLowerCase()}">
         <div class="step-header">
           <span class="step-number">Step ${r.step}</span>
@@ -616,6 +707,7 @@ function generateTraceSection(trace: ConversationTrace): string {
         </div>
         <div class="step-content">
           <div class="rationale">${escapeHtml(r.decision.rationale)}</div>
+          ${snapshotsHtml}
           <div class="meta">
             Response time: ${formatDuration(r.responseTimeMs)} | 
             ${new Date(r.timestamp).toLocaleString()}
@@ -623,7 +715,8 @@ function generateTraceSection(trace: ConversationTrace): string {
           </div>
         </div>
       </div>
-    `
+    `;
+      }
     )
     .join("");
 
@@ -710,7 +803,11 @@ function generateWebEvidenceAppendix(trace: ConversationTrace): string {
 
   const itemsHtml = entries
     .map(
-      (e, index) => `
+      (e, index) => {
+        const appendixText = e.reducedText?.trim() ? e.reducedText : e.text;
+        const appendixChars = appendixText.length;
+
+        return `
       <div class="appendix-item">
         <h3>Source ${index + 1}</h3>
         <div class="appendix-meta">
@@ -718,7 +815,8 @@ function generateWebEvidenceAppendix(trace: ConversationTrace): string {
           <div><strong>Type:</strong> ${escapeHtml(e.sourceType)}</div>
           <div><strong>Status:</strong> ${e.ok ? "OK" : "ERROR"}</div>
           <div><strong>Via:</strong> ${escapeHtml(e.via ?? "unknown")}</div>
-          <div><strong>Chars:</strong> ${e.chars}</div>
+          <div><strong>Chars:</strong> ${appendixChars}</div>
+          ${e.reducedText?.trim() ? `<div><strong>Original chars:</strong> ${e.chars}</div>` : ""}
           <div><strong>Fetched:</strong> ${escapeHtml(new Date(e.fetchedAt).toLocaleString())}</div>
           ${e.fromCache ? `<div><strong>Cache:</strong> ${escapeHtml(e.fromCache)}</div>` : ""}
         </div>
@@ -726,9 +824,10 @@ function generateWebEvidenceAppendix(trace: ConversationTrace): string {
         <div style="margin-bottom: 8px;"><strong>URL:</strong> ${escapeHtml(e.url)}</div>
         ${e.query ? `<div style="margin-bottom: 8px;"><strong>Query:</strong> ${escapeHtml(e.query)}</div>` : ""}
         ${e.error ? `<div style="margin-bottom: 8px; color: #b91c1c;"><strong>Error:</strong> ${escapeHtml(e.error)}</div>` : ""}
-        <div class="appendix-text">${escapeHtml(e.text)}</div>
+        <div class="appendix-text">${escapeHtml(appendixText)}</div>
       </div>
     `
+          }
     )
     .join("");
 

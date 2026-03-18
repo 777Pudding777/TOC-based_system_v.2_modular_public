@@ -204,6 +204,110 @@ function extractFirstJsonObject(text: string): string | null {
   return text.slice(a, b + 1);
 }
 
+function coerceAssistantText(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") return part;
+        if (part && typeof part === "object") {
+          const p = part as any;
+          if (typeof p.text === "string") return p.text;
+          if (typeof p.content === "string") return p.content;
+          if (typeof p.output_text === "string") return p.output_text;
+          if (p.json && typeof p.json === "object") return JSON.stringify(p.json);
+        }
+        return "";
+      })
+      .filter(Boolean)
+      .join("\n")
+      .trim();
+  }
+  if (content && typeof content === "object") {
+    const c = content as any;
+    if (typeof c.text === "string") return c.text;
+    if (typeof c.content === "string") return c.content;
+    if (typeof c.output_text === "string") return c.output_text;
+    if (c.json && typeof c.json === "object") return JSON.stringify(c.json);
+  }
+  return "";
+}
+
+
+function pickAssistantContent(responseJson: any): unknown {
+  const choice = responseJson?.choices?.[0];
+  const message = choice?.message;
+  const toolCallArgs = Array.isArray(message?.tool_calls)
+    ? message.tool_calls
+        .map((t: any) => t?.function?.arguments)
+        .find((x: unknown) => x !== undefined && x !== null)
+    : undefined;
+
+  return (
+    message?.parsed ??
+    message?.json ??
+    message?.content ??
+    choice?.text ??
+    toolCallArgs ??
+    ""
+  );
+}
+
+
+function describeModelOutput(content: unknown): string {
+  if (content == null) return "empty";
+  if (typeof content === "string") {
+    const snippet = content.replace(/\s+/g, " ").trim().slice(0, 180);
+    return `string:${snippet || "<blank>"}`;
+  }
+  if (Array.isArray(content)) {
+    const preview = content.slice(0, 2).map((x) => {
+      if (typeof x === "string") return x.replace(/\s+/g, " ").trim().slice(0, 80);
+      if (x && typeof x === "object") return `obj(${Object.keys(x as any).slice(0, 6).join(",")})`;
+      return typeof x;
+    });
+    return `array[len=${content.length}] ${preview.join(" | ")}`;
+  }
+  if (typeof content === "object") {
+    return `object keys=${Object.keys(content as any).slice(0, 10).join(",")}`;
+  }
+  return typeof content;
+}
+
+function parseModelJson<T>(content: unknown): T | null {
+  if (content && typeof content === "object" && !Array.isArray(content)) {
+    const direct = content as any;
+    if (direct.json && typeof direct.json === "object") return direct.json as T;
+    if (
+      typeof direct.verdict === "string" ||
+      Array.isArray(direct.relevantClauses) ||
+      Array.isArray(direct.candidates) ||
+      typeof direct.ruleFocusedSummary === "string"
+    ) {
+      return direct as T;
+    }
+  }
+
+  const raw = coerceAssistantText(content).trim();
+  if (!raw) return null;
+
+  const candidates = [raw];
+  const unwrappedFence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim();
+  if (unwrappedFence) candidates.push(unwrappedFence);
+  const jsonSlice = extractFirstJsonObject(raw);
+  if (jsonSlice && jsonSlice !== raw) candidates.push(jsonSlice);
+
+  for (const candidate of candidates) {
+    try {
+      return JSON.parse(candidate) as T;
+    } catch {
+      // try next candidate
+    }
+  }
+
+  return null;
+}
+
 async function fetchJsonWithTimeout(
   url: string,
   init: RequestInit,
@@ -322,21 +426,56 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
         return fallback;
       }
 
-      const content: string =
-        json?.choices?.[0]?.message?.content ??
-        json?.choices?.[0]?.text ??
-        "";
+      const content = json?.choices?.[0]?.message?.content ?? json?.choices?.[0]?.text ?? "";
+      let parsed = parseModelJson<any>(content);
 
-      const candidate = extractFirstJsonObject(String(content)) ?? String(content);
+      if (!parsed) {
+        const retryBody = {
+          ...body,
+          temperature: 0,
+          top_p: 1,
+          messages: [
+            {
+              role: "system",
+              content:
+                "Return ONLY valid minified JSON object. No markdown. No prose. Required keys: verdict, confidence, rationale, visibility. visibility must include isRuleTargetVisible and occlusionAssessment.",
+            },
+            {
+              role: "user",
+              content: [
+                { type: "text", text: userText },
+                ...imageInputsCapped.map(x => ({ type: "image_url", image_url: { url: x.dataUrl } })),
+              ],
+            },
+          ],
+        };
 
-      let parsed: any = null;
-      try {
-        parsed = JSON.parse(candidate);
-      } catch {
+        const retry = await fetchJsonWithTimeout(
+          endpoint,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${cfg.apiKey}`,
+              ...(cfg.appReferer ? { "HTTP-Referer": cfg.appReferer } : {}),
+              ...(cfg.appTitle ? { "X-Title": cfg.appTitle } : {}),
+            },
+            body: JSON.stringify(retryBody),
+          },
+          timeoutMs
+        );
+
+        if (retry.ok) {
+          const retryContent = retry.json?.choices?.[0]?.message?.content ?? retry.json?.choices?.[0]?.text ?? "";
+          parsed = parseModelJson<any>(retryContent);
+        }
+      }
+
+      if (!parsed) {
         const fallback: DecisionCore = {
           verdict: "UNCERTAIN",
           confidence: 0.15,
-          rationale: "Model returned non-JSON output; could not produce structured decision.",
+          rationale: `Model returned non-JSON output (${describeModelOutput(content)}); could not produce structured decision.`,
           visibility: {
             isRuleTargetVisible: false,
             occlusionAssessment: "HIGH",
@@ -363,7 +502,7 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
         const fallback: DecisionCore = {
           verdict: "UNCERTAIN",
           confidence: 0.2,
-          rationale: "Model returned incomplete JSON core; requesting another view.",
+          rationale: `Model returned incomplete JSON core (${describeModelOutput(parsed)}); cannot trust structured decision yet.`,
           visibility: {
             isRuleTargetVisible: false,
             occlusionAssessment: "HIGH",
@@ -612,17 +751,46 @@ export async function discoverIccClausesOnline(cfg: OpenRouterAdapterConfig, arg
     return { assumptions: {}, candidates: [], missingInfo: [msg] };
   }
 
-  const content: string =
-    json?.choices?.[0]?.message?.content ??
-    json?.choices?.[0]?.text ??
-    "";
+  const content = json?.choices?.[0]?.message?.content ?? json?.choices?.[0]?.text ?? "";
+  let parsed = parseModelJson<any>(content);
 
-  const candidate = extractFirstJsonObject(String(content)) ?? String(content);
+  if (!parsed) {
+    const retryBody = {
+      ...body,
+      temperature: 0,
+      top_p: 1,
+      messages: [
+        {
+          role: "system",
+          content:
+            "Return ONLY valid minified JSON object with keys assumptions, candidates, missingInfo. No markdown or prose.",
+        },
+        { role: "user", content: [{ type: "text", text: discoveryPrompt }] },
+      ],
+    };
 
-  let parsed: any = null;
-  try {
-    parsed = JSON.parse(candidate);
-  } catch {
+    const retry = await fetchJsonWithTimeout(
+      endpoint,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${cfg.apiKey}`,
+          ...(cfg.appReferer ? { "HTTP-Referer": cfg.appReferer } : {}),
+          ...(cfg.appTitle ? { "X-Title": cfg.appTitle } : {}),
+        },
+        body: JSON.stringify(retryBody),
+      },
+      timeoutMs
+    );
+
+    if (retry.ok) {
+      const retryContent = retry.json?.choices?.[0]?.message?.content ?? retry.json?.choices?.[0]?.text ?? "";
+      parsed = parseModelJson<any>(retryContent);
+    }
+  }
+
+  if (!parsed) {
     return { assumptions: {}, candidates: [], missingInfo: ["Discovery model returned non-JSON output."] };
   }
 

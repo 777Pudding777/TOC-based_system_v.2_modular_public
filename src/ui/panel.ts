@@ -387,26 +387,53 @@ vlmChecker: {
           : { id: "custom", title: "Custom Rule", description: prompt.slice(0, 200), category: "custom", severity: "moderate" };
 
         console.log("[TRACE] getRunWebEvidence()", vlmChecker.getRunWebEvidence());  
+        const run = snapshotCollector.getRun();
+        const artifacts = Array.isArray(run?.artifacts) ? run.artifacts : [];
+        const modelId = vlmProvider === "openrouter" ? openRouterModel : vlmProvider === "openai" ? openAiModel : "mock";
+        const snapshots = artifacts.map((artifact: any, index: number) => ({
+          snapshotId: artifact.id,
+          reason: artifact.meta?.note ?? `Snapshot ${index + 1}`,
+          cameraPose: artifact.meta?.camera ?? {
+            eye: { x: 0, y: 0, z: 0 },
+            target: { x: 0, y: 0, z: 0 },
+          },
+          timestamp: artifact.meta?.timestampIso ?? new Date(startTime).toISOString(),
+          mode: artifact.mode,
+          imageBase64: artifact.images?.[0]?.imageBase64Png,
+        }));
         const trace: ConversationTrace = {
           traceId: crypto.randomUUID(),
           runId: res?.runId ?? crypto.randomUUID(),
           rule: ruleInfo,
           model: {
-            id: vlmProvider === "openrouter" ? openRouterModel : vlmProvider === "openai" ? openAiModel : "mock",
+          id: modelId,
             provider: vlmProvider,
             name: vlmChecker.adapterName,
           },
           startedAt: new Date(startTime).toISOString(),
           completedAt: new Date(endTime).toISOString(),
           status: "completed",
-          prompts: [],
+          prompts: decisions.map((d: VlmDecision, i: number) => ({
+            step: i + 1,
+            promptText: prompt,
+            ruleContext: {
+              ruleId: selectedRule?.id ?? "custom",
+              ruleTitle: selectedRule?.title ?? "Custom Rule",
+              ruleDescription: selectedRule?.description ?? prompt.slice(0, 200),
+              evaluationCriteria: selectedRule?.evaluationCriteria ?? { pass: [], fail: [], uncertain: [] },
+              visualEvidence: selectedRule?.visualEvidence ?? { lookFor: [], passIndicators: [], failIndicators: [] },
+            },
+            snapshotIds: d.evidence?.snapshotIds ?? [],
+            timestamp: d.timestampIso,
+            modelId,
+          })),
           responses: decisions.map((d: VlmDecision, i: number) => ({
             step: i + 1,
             decision: d,
             responseTimeMs: 0,
             timestamp: d.timestampIso,
           })),
-          snapshots: [],
+          snapshots,
           navigationActions: [],
           sceneStates: [],
           stepMetrics: [],
@@ -415,7 +442,7 @@ vlmChecker: {
           finalConfidence: decisions.length > 0 ? decisions[decisions.length - 1].confidence : undefined,
           finalRationale: decisions.length > 0 ? decisions[decisions.length - 1].rationale : undefined,
           metrics: {
-            totalSnapshots: res?.snapshots ?? decisions.length,
+            totalSnapshots: snapshots.length,
             totalVlmCalls: decisions.length,
             totalNavigationSteps: 0,
             totalDurationMs: endTime - startTime,
