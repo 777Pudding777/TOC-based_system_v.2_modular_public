@@ -665,30 +665,31 @@ function generateTraceSection(trace: ConversationTrace): string {
     .map(
       (r) => {
         const prompt = promptByStep.get(r.step);
-        const evidenceSnapshots = (prompt?.snapshotIds ?? [])
-          .map((snapshotId) => snapshotsById.get(snapshotId))
-          .filter((snapshot): snapshot is NonNullable<typeof snapshot> => !!snapshot);
+        const promptSnapshotIds = prompt?.snapshotIds ?? [];
+        const fallbackSnapshotId = trace.snapshots[r.step - 1]?.snapshotId;
+        const primarySnapshotId = promptSnapshotIds.length > 0
+          ? promptSnapshotIds[promptSnapshotIds.length - 1]
+          : fallbackSnapshotId;
+        const primarySnapshot = primarySnapshotId ? snapshotsById.get(primarySnapshotId) : undefined;
+        const additionalSnapshotCount = promptSnapshotIds.length > 1 ? promptSnapshotIds.length - 1 : 0;
 
-        const snapshotsHtml = evidenceSnapshots.length
+        const snapshotsHtml = primarySnapshot
           ? `
           <div class="step-snapshots">
             <div class="step-snapshots-title">Visual evidence</div>
+            ${additionalSnapshotCount > 0
+              ? `<div class="step-snapshots-note">This VLM decision also included ${additionalSnapshotCount} snapshot${additionalSnapshotCount === 1 ? "" : "s"} from previous steps as additional evidence.</div>`
+              : ""}
             <div class="step-snapshots-grid">
-              ${evidenceSnapshots
-                .map(
-                  (snapshot) => `
-                <figure class="step-snapshot-card">
-                  ${snapshot.imageBase64
-                    ? `<img src="data:image/png;base64,${snapshot.imageBase64}" alt="Snapshot ${snapshot.snapshotId}" />`
-                    : `<div class="step-snapshot-placeholder">Image not embedded</div>`}
-                  <figcaption>
-                    <span class="snapshot-id">${escapeHtml(snapshot.snapshotId)}</span>
-                    <span>${escapeHtml(snapshot.reason)}</span>
-                  </figcaption>
-                </figure>
-              `
-                )
-                .join("")}
+              <figure class="step-snapshot-card">
+                ${primarySnapshot.imageBase64
+                  ? `<img src="data:image/png;base64,${primarySnapshot.imageBase64}" alt="Snapshot ${primarySnapshot.snapshotId}" />`
+                  : `<div class="step-snapshot-placeholder">Image not embedded</div>`}
+                <figcaption>
+                  <span class="snapshot-id">${escapeHtml(primarySnapshot.snapshotId)}</span>
+                  <span>${escapeHtml(primarySnapshot.reason)}</span>
+                </figcaption>
+              </figure>
             </div>
           </div>
         `

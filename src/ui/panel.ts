@@ -671,10 +671,10 @@ vlmChecker: {
             <div style="display:flex;gap:4px;">
               <button style="flex:1;padding:6px;border-radius:6px 0 0 6px;border:1px solid rgba(255,255,255,0.15);cursor:pointer;
                 color:#fff;font-size:12px;background:${ruleInputMode === "library" ? "rgba(59,130,246,0.4)" : "rgba(0,0,0,0.25)"};"
-                @click=${() => { ruleInputMode = "library"; render(); }}>📋 Rule Library</button>
+                @click=${() => { ruleInputMode = "library"; render(); }}>Rule Library</button>
               <button style="flex:1;padding:6px;border-radius:0 6px 6px 0;border:1px solid rgba(255,255,255,0.15);cursor:pointer;
                 color:#fff;font-size:12px;background:${ruleInputMode === "custom" ? "rgba(59,130,246,0.4)" : "rgba(0,0,0,0.25)"};"
-                @click=${() => { ruleInputMode = "custom"; render(); }}>✏️ Custom Prompt</button>
+                @click=${() => { ruleInputMode = "custom"; render(); }}>Custom Prompt</button>
             </div>
 
             <!-- ── Rule Library dropdown ── -->

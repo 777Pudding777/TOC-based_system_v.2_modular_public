@@ -759,7 +759,7 @@ toast?.(`Low-confidence ${decision.verdict} with no actionable follow-up. Stoppi
         };
       }
 
-      if (decision.verdict === "UNCERTAIN" && confident) {
+/*      if (decision.verdict === "UNCERTAIN" && confident) {
         toast?.(
           `UNCERTAIN with high confidence (${(decision.confidence * 100).toFixed(0)}%). Stopping.`
         );
@@ -771,6 +771,9 @@ toast?.(`Low-confidence ${decision.verdict} with no actionable follow-up. Stoppi
           snapshots: evidence.length,
         };
       }
+*/
+    // Do not early-stop on UNCERTAIN, even if confidence is high.
+    // Continue gathering evidence and applying follow-ups so reports include full step history.
 
 const fuKey = followUpKey(decision.followUp);
 if (fuKey && fuKey === lastFollowUpKey) repeatedFollowUpCount++;

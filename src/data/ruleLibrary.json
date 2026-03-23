@@ -399,14 +399,14 @@
     },
     {
       "id": "VLM-CIRC-WIDTH-001",
-      "title": "Corridor and Circulation Width",
+      "title": "Free Floor Space",
       "description": "Checks that corridors and circulation spaces have adequate width for accessible passage, identifies obstructions that narrow the path, and verifies clear floor space. Ensures wheelchair-accessible circulation.",
       "category": "circulation",
       "severity": "critical",
       "source": {
         "solibriId": "SOL-247",
         "solibriTitle": "247 Local Accessible Circulation",
-        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500000754682-Rule-Templates",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500004610661-209-Free-Floor-Space",
         "version": "v25.12.0+"
       },
       "visualSuitability": {
