@@ -70,6 +70,18 @@ export interface VlmPromptTrace {
   step: number;
   /** Full prompt text sent to VLM */
   promptText: string;
+  /** Origin of the prompt content */
+  promptSource?: "rule_library" | "custom_user_prompt";
+  /** Human-readable source label (rule title or custom prompt) */
+  promptSourceLabel?: string;
+  /** Original source text before coupling/wrapping */
+  sourceText?: string;
+  /** Web sources used while grounding this step (if any) */
+  webSourcesUsed?: Array<{
+    sourceType: WebEvidenceRecord["sourceType"];
+    url: string;
+    via?: WebEvidenceRecord["via"];
+  }>;
   /** Rule context included in prompt */
   ruleContext: {
     ruleId: string;
@@ -144,6 +156,8 @@ export interface InspectionMetrics {
   uncertainSteps: number;
   /** Failure notes collected during inspection */
   failureNotes: string[];
+  /** Total tokens used by compliance-check VLM calls */
+  complianceTokensUsed?: number;
 }
 
 /**

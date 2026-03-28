@@ -9,6 +9,7 @@
 
 import type { SnapshotArtifact } from "../snapshotCollector";
 import type { EvidenceView, VlmAdapter, VlmCheckInput, VlmFollowUp, VlmVerdict } from "../vlmChecker";
+import { DEFAULT_MAX_SNAPSHOTS_PER_REQUEST } from "../../config/prototypeSettings";
 import { wrapPromptBase } from "./prompts/basePrompt";
 
 export type OpenRouterAdapterConfig = {
@@ -60,8 +61,31 @@ type DecisionCore = {
     modelId: string | null;
     promptHash?: string;
     provider: string;
+    adapterPromptText?: string;
+    tokenUsage?: {
+      inputTokens?: number;
+      outputTokens?: number;
+      totalTokens?: number;
+    };
   };
 };
+
+function extractTokenUsage(payload: any): DecisionCore["meta"]["tokenUsage"] | undefined {
+  const usage = payload?.usage;
+  if (!usage || typeof usage !== "object") return undefined;
+
+  const inputTokens = Number(usage.prompt_tokens);
+  const outputTokens = Number(usage.completion_tokens);
+  const totalTokens = Number(usage.total_tokens);
+
+  const normalized = {
+    ...(Number.isFinite(inputTokens) ? { inputTokens } : {}),
+    ...(Number.isFinite(outputTokens) ? { outputTokens } : {}),
+    ...(Number.isFinite(totalTokens) ? { totalTokens } : {}),
+  };
+
+  return Object.keys(normalized).length > 0 ? normalized : undefined;
+}
 
 function clamp01(x: unknown): number {
   const n = typeof x === "number" && isFinite(x) ? x : 0;
@@ -353,7 +377,7 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
         }
       }
 
-            const maxImages = Math.max(1, Math.min(16, cfg.maxImages ?? 4));
+            const maxImages = Math.max(1, Math.min(16, cfg.maxImages ?? DEFAULT_MAX_SNAPSHOTS_PER_REQUEST));
       const imageInputsCapped = imageInputs.slice(Math.max(0, imageInputs.length - maxImages));
 
             const imageIndex = imageInputsCapped.map((x, i) => ({
@@ -407,6 +431,7 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
         },
         timeoutMs
       );
+      let tokenUsage = extractTokenUsage(json);
 
       if (!ok) {
         const msg = json?.error?.message || `OpenRouter request failed (${status}).`;
@@ -421,8 +446,9 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
           },
           evidence: { snapshotIds: [last.id], mode: last.mode, note: last.meta.note },
           followUp: { request: "NEW_VIEW", params: { reason: "Provider error; try a new view." } },
-          meta: { modelId: cfg.model ?? null, provider: "openrouter" },
+          meta: { modelId: cfg.model ?? null, provider: "openrouter", adapterPromptText: userText },
         };
+        if (tokenUsage) fallback.meta.tokenUsage = tokenUsage;
         return fallback;
       }
 
@@ -468,6 +494,7 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
         if (retry.ok) {
           const retryContent = retry.json?.choices?.[0]?.message?.content ?? retry.json?.choices?.[0]?.text ?? "";
           parsed = parseModelJson<any>(retryContent);
+          tokenUsage = extractTokenUsage(retry.json) ?? tokenUsage;
         }
       }
 
@@ -483,8 +510,9 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
           },
           evidence: { snapshotIds: [last.id], mode: last.mode, note: last.meta.note },
           followUp: undefined,
-          meta: { modelId: cfg.model ?? null, provider: "openrouter" },
-        };
+          meta: { modelId: cfg.model ?? null, provider: "openrouter", adapterPromptText: userText },
+          };
+        if (tokenUsage) fallback.meta.tokenUsage = tokenUsage;
         return fallback;
       }
 
@@ -510,8 +538,9 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
           },
           evidence: { snapshotIds: [last.id], mode: last.mode, note: last.meta.note },
           followUp: undefined,
-          meta: { modelId: cfg.model ?? null, provider: "openrouter" },
+          meta: { modelId: cfg.model ?? null, provider: "openrouter", adapterPromptText: userText },
         };
+        if (tokenUsage) fallback.meta.tokenUsage = tokenUsage;
         return fallback;
       }
 
@@ -603,6 +632,8 @@ if (verdict === "UNCERTAIN") {
         meta: {
           modelId: cfg.model ?? null,
           provider: "openrouter",
+          adapterPromptText: userText,
+          ...(tokenUsage ? { tokenUsage } : {}),
         },
       };
 

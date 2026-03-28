@@ -9,6 +9,10 @@
 //   - VLM reasons semantically over what is visible and uses nav metrics as authoritative.
 
 import type { SnapshotArtifact } from "./snapshotCollector";
+import {
+  DEFAULT_REDUCED_TAVILY_MAX_CHARS,
+  DEFAULT_TAVILY_MAX_CHARS,
+} from "../config/prototypeSettings";
 
 const DEFAULT_ALLOWED_DOMAINS = ["codes.iccsafe.org"];
 const WEB_FETCH_PROXY_BASE_URL =
@@ -120,6 +124,21 @@ export type VlmDecision = {
     modelId: string | null;
     promptHash: string;
     provider: string; // "mock", "openai", "anthropic", ...
+    /**
+     * Prompt assembled in vlmChecker after regulatory-context injection.
+     * This is the text passed into adapter.check(...).
+     */
+    composedPromptText?: string;
+    /**
+     * Final adapter-level prompt payload, if adapter wraps the composed prompt
+     * (e.g. OpenRouter wrapPromptBase with system rubric + evidence index).
+     */
+    adapterPromptText?: string;
+    tokenUsage?: {
+      inputTokens?: number;
+      outputTokens?: number;
+      totalTokens?: number;
+    };
   };
 };
 
@@ -403,6 +422,20 @@ function finalizeDecision(
     missingEvidence: ["Adapter did not provide visibility; defaulted to conservative."],
   };
 
+  const tokenUsage = core.meta?.tokenUsage
+    ? {
+        ...(typeof core.meta.tokenUsage.inputTokens === "number" && isFinite(core.meta.tokenUsage.inputTokens)
+          ? { inputTokens: core.meta.tokenUsage.inputTokens }
+          : {}),
+        ...(typeof core.meta.tokenUsage.outputTokens === "number" && isFinite(core.meta.tokenUsage.outputTokens)
+          ? { outputTokens: core.meta.tokenUsage.outputTokens }
+          : {}),
+        ...(typeof core.meta.tokenUsage.totalTokens === "number" && isFinite(core.meta.tokenUsage.totalTokens)
+          ? { totalTokens: core.meta.tokenUsage.totalTokens }
+          : {}),
+      }
+    : undefined;
+
   return {
     decisionId: crypto.randomUUID(),
     timestampIso: new Date().toISOString(),
@@ -432,6 +465,9 @@ followUp: isFollowUp(core.followUp) ? core.followUp : undefined,
       modelId: core.meta?.modelId ?? input.artifacts[input.artifacts.length - 1]?.meta.modelId ?? null,
       promptHash: core.meta?.promptHash ?? hashPrompt(input.prompt),
       provider: core.meta?.provider ?? provider,
+      composedPromptText: input.prompt,
+      adapterPromptText: core.meta?.adapterPromptText,
+      ...(tokenUsage && Object.keys(tokenUsage).length > 0 ? { tokenUsage } : {}),
     },
   };
 }
@@ -516,6 +552,13 @@ export function createVlmChecker(
     getProviderConfig?: () => ReducerProviderConfig;
   }
 ) {
+  function inferPromptSource(prompt: string): "rule_library" | "custom_user_prompt" | "unknown" {
+    const text = String(prompt ?? "");
+    if (/SOURCE:\s*RULE_LIBRARY/i.test(text)) return "rule_library";
+    if (/SOURCE:\s*CUSTOM_USER_PROMPT/i.test(text)) return "custom_user_prompt";
+    return "unknown";
+  }
+
         async function fetchRegulatoryContextDirect(args: {
         step: number;
         url: string;
@@ -524,7 +567,7 @@ export function createVlmChecker(
         maxChars?: number;
       }): Promise<string | null> {
         const { step, url, userIntent, allowedDomains } = args;
-        const maxChars = args.maxChars ?? 20000;
+        const maxChars = args.maxChars ?? DEFAULT_TAVILY_MAX_CHARS;
 
         // Prefer Tavily
         if (isTavilyAvailable()) {
@@ -683,7 +726,7 @@ export function createVlmChecker(
                 ruleText: args.ruleText,
                 sourceUrl: args.sourceUrl,
                 rawText: args.rawText,
-                maxChars: 3500,
+                maxChars: DEFAULT_REDUCED_TAVILY_MAX_CHARS,
               },
             });
 
@@ -696,13 +739,13 @@ export function createVlmChecker(
             }
 
             return {
-              reducedText: args.rawText.slice(0, 3500),
+              reducedText: args.rawText.slice(0, DEFAULT_REDUCED_TAVILY_MAX_CHARS),
               error: reduced.error,
             };
           }
 
           return {
-            reducedText: args.rawText.slice(0, 3500),
+            reducedText: args.rawText.slice(0, DEFAULT_REDUCED_TAVILY_MAX_CHARS),
             error: "No reducer provider configured; used truncated raw text.",
           };
         }
@@ -715,6 +758,8 @@ export function createVlmChecker(
 
       // Keep original user prompt stable; accumulate regulatory context deterministically.
       const userIntent = norm0.prompt;
+      const promptSource = inferPromptSource(userIntent);
+      const allowWebGrounding = promptSource !== "rule_library";
       let regulatoryContext = "";
       const fetchedUrls = new Set<string>();
 
@@ -729,7 +774,12 @@ export function createVlmChecker(
         });
 
         // Deterministic prefetch: do not rely on the model to request WEB_FETCH first.
-        if (step === 0 && !regulatoryContext.trim() && isVagueCompliancePrompt(userIntent)) {
+        if (
+          allowWebGrounding &&
+          step === 0 &&
+          !regulatoryContext.trim() &&
+          isVagueCompliancePrompt(userIntent)
+        ) {
           const prefetchUrl = guessIccEntrypointUrl(userIntent, allowedDomains);
 
           if (
@@ -744,8 +794,8 @@ export function createVlmChecker(
               url: prefetchUrl,
               userIntent,
               allowedDomains,
-              maxChars: 20000,
-            });
+              maxChars: DEFAULT_TAVILY_MAX_CHARS,
+             });
 
             if (injected) {
               regulatoryContext = (regulatoryContext ? regulatoryContext + "\n\n" : "") + injected;
@@ -777,6 +827,16 @@ export function createVlmChecker(
         // If model requests WEB_FETCH, execute it internally and re-run once.
                 const fu = isFollowUp(core.followUp) ? core.followUp : undefined;
         if (core.verdict === "UNCERTAIN" && fu?.request === "WEB_FETCH") {
+          if (!allowWebGrounding) {
+            const patched = {
+              ...core,
+              followUp: { request: "NEW_VIEW", params: { reason: "WEB_FETCH disabled for predefined rule mode." } } as VlmFollowUp,
+              rationale:
+                (core.rationale ? core.rationale + " " : "") +
+                "Regulatory web-grounding is disabled for predefined rule mode; proceeding with model-view evidence only.",
+            };
+            return finalizeDecision(patched as any, norm, adapter.name);
+          }
           console.log("[VLM] WEB_FETCH requested. raw params:", fu.params);
 
           let url = (fu.params as any)?.url as string | undefined;
@@ -810,7 +870,7 @@ export function createVlmChecker(
           }
           fetchedUrls.add(url);
 
-          const maxChars = (fu.params as any)?.maxChars ?? 20000;
+          const maxChars = (fu.params as any)?.maxChars ?? DEFAULT_TAVILY_MAX_CHARS;
 
           // 1) Prefer Tavily for URL-grounded fetch/extract
           if (isTavilyAvailable()) {

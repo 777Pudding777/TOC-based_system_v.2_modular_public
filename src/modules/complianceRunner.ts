@@ -3,9 +3,21 @@
 // capture snapshot(s), call VLM checker, store decisions, and optionally do follow-ups.
 
 import type { WebEvidenceRecord } from "../types/trace.types";
-import type { CameraPose, StartPosePreset } from "../viewer/api";
+import {
+  DEFAULT_MAX_COMPLIANCE_STEPS,
+  REPEATED_FOLLOW_UPS_BEFORE_ESCALATION,
+} from "../config/prototypeSettings";
+import type { CameraPose, StartPosePreset, ViewerGridReference } from "../viewer/api";
 import type { SnapshotArtifact } from "./snapshotCollector";
 import type { VlmDecision, VlmFollowUp } from "./vlmChecker";
+import {
+  buildTaskGraphPromptSection,
+  createTaskGraph,
+  summarizeTaskGraph,
+  syncTaskGraphEntities,
+  updateTaskGraphFromDecision,
+  updateTaskGraphFromFollowUpResult,
+} from "./taskGraph";
 
 type NavMetrics = {
   projectedAreaRatio?: number;
@@ -34,6 +46,12 @@ type EvidenceContext = {
   availableStoreys?: string[];
   availableSpaces?: string[];
   planCut?: { enabled: boolean; planes?: number };
+  viewerGrid?: ViewerGridReference;
+  taskGraph?: {
+    profile: string;
+    entities: { trackedIds: string[] };
+    tasks: Array<{ id: string; entityId?: string; entityClass?: string; status: string }>;
+  };
 };
 
 type ToastFn = (msg: string, ms?: number) => void;
@@ -75,8 +93,8 @@ export function createComplianceRunner(params: {
     getRendererDomElement?: () => HTMLCanvasElement;
 
     highlightIds?: (ids: string[], style?: "primary" | "warn") => Promise<void>;
-    pickObjectAt?: (x: number, y: number) => Promise<string | null>;
-    getProperties?: (objectId: string) => Promise<Record<string, unknown> | null>;
+    getCurrentIsolateSelection?: () => Record<string, Set<number>> | null;
+    listCategoryObjectIds?: (category: string, limit?: number) => Promise<string[]>;
     hideSelected?: () => Promise<void>;
 
     getActiveScope?: () => Promise<{ storeyId?: string; spaceId?: string }>;
@@ -88,6 +106,7 @@ export function createComplianceRunner(params: {
 
    listStoreys?: () => Promise<string[]>;
    listSpaces?: () => Promise<string[]>;
+   getGridReference?: () => ViewerGridReference;
 
   };
 
@@ -225,6 +244,25 @@ function escalateFollowUp(fu: VlmFollowUp | undefined): VlmFollowUp | undefined 
   async function executeFollowUp(f: VlmFollowUp | undefined) {
     if (!f) return { didSomething: false, reason: "no-followup" as const };
 
+const pickHighlightCandidates = (limit = 3): string[] => {
+  const map = viewerApi.getCurrentIsolateSelection?.();
+  if (!map || typeof map !== "object") return [];
+
+  const out: string[] = [];
+  const modelIds = Object.keys(map).sort();
+  for (const modelId of modelIds) {
+    const set = map[modelId];
+    if (!set) continue;
+    const localIds = Array.from(set).filter((id) => typeof id === "number" && isFinite(id)).sort((a, b) => a - b);
+    for (const localId of localIds) {
+      out.push(`${modelId}:${localId}`);
+      if (out.length >= limit) return out;
+    }
+  }
+  return out;
+};
+
+
 if (f.request === "ISO_VIEW") {
   await viewerApi.setPresetView("iso", true);
   lastViewPreset = "iso";
@@ -276,44 +314,37 @@ if (f.request === "SHOW_CATEGORY") {
 
 // Pick center follow-up (deterministic, avoids pixel math in the VLM)
 if (f.request === "PICK_CENTER") {
-  if (!viewerApi.pickObjectAt) {
-    console.warn("[FollowUp] pickObjectAt not wired");
-    return { didSomething: false, reason: "pick-not-wired" as const };
+  if (!viewerApi.highlightIds) {
+    console.warn("[FollowUp] highlightIds not wired");
+    return { didSomething: false, reason: "highlight-not-wired" as const };
   }
-  const canvas = viewerApi.getRendererDomElement?.();
-  if (!canvas) {
-    console.warn("[FollowUp] getRendererDomElement not wired");
-    return { didSomething: false, reason: "pick-center-no-canvas" as const };
-  }
-  const rect = canvas.getBoundingClientRect();
-  const id = await viewerApi.pickObjectAt(rect.width / 2, rect.height / 2);
-  lastSelectedId = id;
-
-  if (id && viewerApi.highlightIds) {
-    await viewerApi.highlightIds([id], "primary");
-    lastHighlightedIds = [id];
+  const ids = pickHighlightCandidates(1);
+  if (!ids.length) {
+    return { didSomething: false, reason: "highlight-candidates-empty" as const };
   }
 
-  return { didSomething: !!id, reason: id ? "picked-center" as const : "pick-center-empty" as const };
+  await viewerApi.highlightIds(ids, "primary");
+  lastHighlightedIds = ids;
+  lastSelectedId = ids[0] ?? null;
+  return { didSomething: true, reason: "highlight-center-candidate" as const };
 }
 
 // Pick object follow-up
 if (f.request === "PICK_OBJECT") {
-  if (!viewerApi.pickObjectAt) {
-    console.warn("[FollowUp] pickObjectAt not wired");
-    return { didSomething: false, reason: "pick-not-wired" as const };
+  if (!viewerApi.highlightIds) {
+    console.warn("[FollowUp] highlightIds not wired");
+    return { didSomething: false, reason: "highlight-not-wired" as const };
   }
 
-  const id = await viewerApi.pickObjectAt(f.params.x, f.params.y);
-  lastSelectedId = id;
-
-  // Auto-highlight picked item if possible
-  if (id && viewerApi.highlightIds) {
-    await viewerApi.highlightIds([id], "primary");
-    lastHighlightedIds = [id];
+  const ids = pickHighlightCandidates(3);
+  if (!ids.length) {
+    return { didSomething: false, reason: "highlight-candidates-empty" as const };
   }
 
-  return { didSomething: !!id, reason: id ? "picked" as const : "pick-empty" as const };
+  await viewerApi.highlightIds(ids, "primary");
+  lastHighlightedIds = ids;
+  lastSelectedId = ids[0] ?? null;
+  return { didSomething: true, reason: "highlight-picked-candidates" as const };
 }
 
 // Set plan cut follow-up
@@ -362,14 +393,18 @@ if (f.request === "HIGHLIGHT_IDS") {
 
 // Get properties follow-up
 if (f.request === "GET_PROPERTIES") {
-  if (!viewerApi.getProperties) {
-    console.warn("[FollowUp] getProperties not wired");
-    return { didSomething: false, reason: "props-not-wired" as const };
+  const ids = lastHighlightedIds.length ? lastHighlightedIds : pickHighlightCandidates(1);
+  if (!ids.length || !viewerApi.highlightIds) {
+    return { didSomething: false, reason: "highlight-candidates-empty" as const };
   }
-  const props = await viewerApi.getProperties(f.params.objectId);
-  // Store something minimal in state for evidence metadata (optional)
-  lastSelectedId = f.params.objectId;
-  return { didSomething: !!props, reason: props ? "props" as const : "props-null" as const, props };
+  await viewerApi.highlightIds(ids.slice(0, 1), "primary");
+  lastHighlightedIds = ids.slice(0, 1);
+  lastSelectedId = ids[0] ?? null;
+  return {
+    didSomething: true,
+    reason: "properties-deprecated-highlighted-candidate" as const,
+    props: { objectId: ids[0], source: "highlighting-fallback" },
+  };
 }
 
 // Hide selected follow-up
@@ -440,13 +475,24 @@ if (f.request === "NEW_VIEW") {
 
 // Isolate category follow-up
 if (f.request === "ISOLATE_CATEGORY") {
+  const category = f.params.category;
+  console.log("[FollowUp] ISOLATE_CATEGORY", { category });
+
+  if (viewerApi.listCategoryObjectIds && viewerApi.highlightIds) {
+    const ids = await viewerApi.listCategoryObjectIds(category, 24);
+    if (ids.length) {
+      await viewerApi.highlightIds(ids, "primary");
+      lastHighlightedIds = ids;
+      lastSelectedId = ids[0] ?? null;
+      lastIsolatedCategories = [category];
+      return { didSomething: true, reason: "highlight-category-context" as const };
+    }
+  }
+
   if (!viewerApi.isolateCategory) {
     console.warn("[FollowUp] isolateCategory not wired");
     return { didSomething: false, reason: "isolate-category-not-wired" as const };
   }
-
-  const category = f.params.category;
-  console.log("[FollowUp] ISOLATE_CATEGORY", { category });
 
   const map = await viewerApi.isolateCategory(category);
 
@@ -574,7 +620,9 @@ if (f.request === "SHOW_IDS") {
       return { ok: false as const, reason: "empty-prompt" as const };
     }
 
-    const maxSteps = Math.max(1, Math.min(20, params.maxSteps ?? 6));
+    const taskGraph = createTaskGraph(prompt);
+
+    const maxSteps = Math.max(1, Math.min(20, params.maxSteps ?? DEFAULT_MAX_COMPLIANCE_STEPS));
 
     // One rule per project: reset everything relevant
     await viewerApi.resetVisibility();
@@ -620,6 +668,10 @@ let lastActionReason: string | null = null;
 let pendingNav: NavMetrics | undefined = undefined;
 let lastFollowUpKey: string | null = null;
 let repeatedFollowUpCount = 0;
+const syncEntityTasks = () => {
+  if (!lastHighlightedIds.length) return;
+  syncTaskGraphEntities(taskGraph, lastHighlightedIds);
+};
 
     // Step loop
     for (let step = 1; step <= maxSteps; step++) {
@@ -667,6 +719,7 @@ const phase: EvidenceContext["phase"] =
 const availableStoreys = viewerApi.listStoreys ? await viewerApi.listStoreys() : undefined;
 const availableSpaces = viewerApi.listSpaces ? await viewerApi.listSpaces() : undefined;
 const planCutState = (viewerApi as any).getPlanCutState ? await (viewerApi as any).getPlanCutState() : undefined;
+const viewerGrid = viewerApi.getGridReference?.();
 
 // capture current evidence context
 const context: EvidenceContext = {
@@ -683,21 +736,26 @@ const context: EvidenceContext = {
   availableStoreys,
   availableSpaces,
   planCut: planCutState,
+  viewerGrid,
+  taskGraph: summarizeTaskGraph(taskGraph),
 };
 
 // then after you capture the next snapshot:
 pushEvidence({ artifact, nav: pendingNav, context });
 pendingNav = undefined;
+syncEntityTasks
 
 
 
 
       const windowed = getEvidenceWindow();
+      const promptWithChecklist = `${prompt}\n\n${buildTaskGraphPromptSection(taskGraph)}`;
       const decision = await vlmChecker.check({
-        prompt,
+        prompt: promptWithChecklist,
         artifacts: windowed.artifacts,
         evidenceViews: windowed.evidenceViews,
       });
+      updateTaskGraphFromDecision(taskGraph, decision);
 
       // activeRunId is set above; guard anyway for safety
       if (!activeRunId) {
@@ -734,7 +792,7 @@ lastFollowUpKey = fuKey;
 let followUpToRun = decision.followUp;
 
 // If same followUp repeats, escalate instead of resetting
-if (repeatedFollowUpCount >= 1) {
+if (repeatedFollowUpCount >= REPEATED_FOLLOW_UPS_BEFORE_ESCALATION) {
   console.warn("[Compliance] repeating same followUp, escalating", decision.followUp);
   followUpToRun = escalateFollowUp(decision.followUp);
   repeatedFollowUpCount = 0; // reset after escalation so we don't immediately loop
@@ -743,6 +801,8 @@ if (repeatedFollowUpCount >= 1) {
 const acted = await executeFollowUp(followUpToRun);
 lastActionReason = acted.reason;
 pendingNav = (acted as any).nav ?? undefined;
+updateTaskGraphFromFollowUpResult(taskGraph, followUpToRun, acted.didSomething, acted.reason);
+syncEntityTasks();
 
 if (acted.didSomething) {
   await (viewerApi as any).stabilizeForSnapshot?.();
@@ -783,7 +843,7 @@ lastFollowUpKey = fuKey;
 let followUpToRun = decision.followUp;
 
 // If same followUp repeats, escalate instead of resetting
-if (repeatedFollowUpCount >= 1) {
+if (repeatedFollowUpCount >= REPEATED_FOLLOW_UPS_BEFORE_ESCALATION) {
   console.warn("[Compliance] repeating same followUp, escalating", decision.followUp);
   followUpToRun = escalateFollowUp(decision.followUp);
   repeatedFollowUpCount = 0; // reset after escalation so we don't immediately loop
@@ -792,6 +852,8 @@ if (repeatedFollowUpCount >= 1) {
 const acted = await executeFollowUp(followUpToRun);
 lastActionReason = acted.reason;
 pendingNav = (acted as any).nav ?? undefined;
+updateTaskGraphFromFollowUpResult(taskGraph, followUpToRun, acted.didSomething, acted.reason);
+syncEntityTasks();
 
 if (acted.didSomething) {
   await (viewerApi as any).stabilizeForSnapshot?.();

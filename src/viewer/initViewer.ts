@@ -5,6 +5,7 @@ import * as THREE from "three";
 import * as OBC from "@thatopen/components";
 import { viewerEvents } from "./events";
 import { _setActiveModel } from "./state";
+import { VIEWER_GRID_REFERENCE } from "./gridConfig";
 
 export type ViewerContext = {
   components: OBC.Components;
@@ -74,7 +75,11 @@ export async function initViewer(viewerDiv: HTMLDivElement): Promise<ViewerConte
   await world.camera.controls.setLookAt(78, 20, -2.2, 26, -4, 25);
 
   components.init();
-  components.get(OBC.Grids).create(world);
+  const grid = components.get(OBC.Grids).create(world);
+  grid.setup({
+    primarySize: VIEWER_GRID_REFERENCE.primaryCellSize,
+    secondarySize: VIEWER_GRID_REFERENCE.secondaryCellSize,
+  });
 
   const ifcLoader = components.get(OBC.IfcLoader);
   await ifcLoader.setup({

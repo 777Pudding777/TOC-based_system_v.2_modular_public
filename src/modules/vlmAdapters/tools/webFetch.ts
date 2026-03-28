@@ -11,7 +11,9 @@ export type WebFetchParams = {
   };
  };
  
- export type WebFetchResult = {
+import { DEFAULT_TAVILY_MAX_CHARS } from "../../../config/prototypeSettings";
+
+export type WebFetchResult = {
    ok: boolean;
    url: string;
    text: string;
@@ -93,7 +95,7 @@ export async function webFetchViaProxy(params: {
   cache?: WebFetchParams["cache"];
 }): Promise<WebFetchResult> {
   const { targetUrl, allowedDomains, proxyBaseUrl } = params;
-  const maxChars = params.maxChars ?? 20000;
+  const maxChars = params.maxChars ?? DEFAULT_TAVILY_MAX_CHARS;
   const cacheOpts = params.cache ?? { enabled: true, ttlMs: DEFAULT_TTL_MS, persist: true };
   const cacheEnabled = cacheOpts.enabled !== false;
   const ttlMs = typeof cacheOpts.ttlMs === "number" && isFinite(cacheOpts.ttlMs) ? cacheOpts.ttlMs : DEFAULT_TTL_MS;

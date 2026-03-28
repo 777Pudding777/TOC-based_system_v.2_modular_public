@@ -18,6 +18,7 @@ export function wrapPromptBase(input: WrapPromptInput): string {
     "NON-NEGOTIABLES:\n" +
     "- You must NOT guess geometry or dimensions.\n" +
     "- Treat evidenceViews.nav metrics (camera, scale, distances, angles, cut heights, etc.) as authoritative.\n" +
+    "- Use the visible viewer grid as the primary dimensional reference whenever it is clearly visible: 1 primary cell = 1 m x 1 m, 1 major cell = 10 m x 10 m.\n" +
     "- If a measurable requirement cannot be grounded from visible evidence + nav metrics, return UNCERTAIN.\n" +
     "- Return ONLY valid JSON (no markdown, no commentary, no extra keys).\n" +
     "\n" +
@@ -25,7 +26,10 @@ export function wrapPromptBase(input: WrapPromptInput): string {
     "1) Interpret the requirement: identify target element(s), measurable constraint(s), units, thresholds, and applicability.\n" +
     "2) Check visibility: is the rule target visible and unoccluded enough to measure/verify?\n" +
     "3) If measurable: use nav metrics and visible cues to evaluate PASS/FAIL.\n" +
-    "4) If not measurable/ambiguous: choose the single best followUp action to resolve the uncertainty.\n" +
+    "4) For visible spatial checks, start with the static viewer grid as your main scale reference.\n" +
+    "5) If the grid is visible but the view is too distorted/oblique to trust scale, return UNCERTAIN or request a better view.\n" +
+    "6) If the grid alone is insufficient, use dimension annotations, IFC/property values, or request follow-up evidence to extract dimensions from relevant objects.\n" +
+    "7) If not measurable/ambiguous after that, choose the single best followUp action to resolve the uncertainty.\n" +
     "\n" +
     "WEB / REFERENCE POLICY (for compliance clauses):\n" +
     "- If the taskPrompt provides an allowlist (e.g., AllowedSources/domains/links) AND the calling system supports browsing,\n" +
@@ -74,19 +78,17 @@ export function wrapPromptBase(input: WrapPromptInput): string {
     "Isolation & Visibility Actions:\n" +
     "  ISOLATE_STOREY    - Show only one storey. params: { storeyId: string }. storeyId from context.availableStoreys.\n" +
     "  ISOLATE_SPACE     - Show only one space/room. params: { spaceId: string }. spaceId from context.availableSpaces.\n" +
-    "  ISOLATE_CATEGORY  - Show only one IFC category. params: { category: string } e.g. \"IfcDoor\", \"IfcStair\", \"IfcWindow\".\n" +
-    "  HIDE_CATEGORY     - Hide an occluding category. params: { category: string } e.g. \"IfcSlab\", \"IfcCovering\", \"IfcRoof\".\n" +
-    "                       Prefer this over HIDE_IDS for removing visual clutter.\n" +
+    "  ISOLATE_CATEGORY  - Category-targeting action. Runtime may keep context and highlight matching ids instead of fully isolating.\n" +    "  HIDE_CATEGORY     - Hide an occluding category. params: { category: string } e.g. \"IfcSlab\", \"IfcCovering\", \"IfcRoof\".\n" +
     "  SHOW_CATEGORY     - Un-hide a previously hidden category. params: { category: string }.\n" +
     "  HIDE_IDS           - Hide specific elements. params: { ids: string[] }.\n" +
     "  SHOW_IDS           - Un-hide specific elements. params: { ids: string[] }.\n" +
     "  RESET_VISIBILITY   - Restore all hidden/isolated elements to default.\n" +
     "\n" +
     "Selection & Properties Actions:\n" +
-    "  PICK_CENTER       - Pick the object at screen center. Returns objectId for GET_PROPERTIES.\n" +
-    "  PICK_OBJECT       - Pick object at pixel coords. params: { x: number, y: number }.\n" +
-    "  GET_PROPERTIES    - Retrieve IFC properties. params: { objectId: string }. Use after PICK_CENTER/PICK_OBJECT.\n" +
-    "  HIGHLIGHT_IDS     - Visually highlight elements. params: { ids: string[], style?: \"primary\" | \"warn\" }.\n" +
+    "  PICK_CENTER       - Legacy action; runtime may map this to highlight candidate elements.\n" +
+    "  PICK_OBJECT       - Legacy action; runtime may map this to highlight candidate elements.\n" +
+    "  GET_PROPERTIES    - Legacy action; runtime may map this to highlight-only fallback.\n" +
+    "  HIGHLIGHT_IDS     - Preferred action. Visually highlight candidate elements. params: { ids: string[], style?: \"primary\" | \"warn\" }.\n" +
     "  HIDE_SELECTED     - Hide the currently selected/highlighted element.\n" +
     "\n" +
     "Web / Reference Actions:\n" +
@@ -94,8 +96,7 @@ export function wrapPromptBase(input: WrapPromptInput): string {
     "\n" +
     "RECOMMENDED SEQUENCES (follow these patterns for common checks):\n" +
     "  Floor plan check:    ISOLATE_STOREY → TOP_VIEW → SET_PLAN_CUT(1.2) or SET_STOREY_PLAN_CUT\n" +
-    "  Door clearance:      SET_STOREY_PLAN_CUT → ISOLATE_CATEGORY(IfcDoor) → PICK_CENTER → GET_PROPERTIES\n" +
-    "  Stair inspection:    ISOLATE_CATEGORY(IfcStair) → ISO_VIEW → ZOOM_IN\n" +
+    "  Door clearance:      TOP_VIEW/SET_STOREY_PLAN_CUT → ISOLATE_CATEGORY(IfcDoor) for targeting (context preserved) → HIGHLIGHT_IDS\n" +    "  Stair inspection:    ISOLATE_CATEGORY(IfcStair) → ISO_VIEW → ZOOM_IN\n" +
     "  Remove occlusion:    HIDE_CATEGORY(IfcSlab) → HIDE_CATEGORY(IfcCovering)\n" +
     "  Regulatory lookup:   WEB_FETCH(TOC) → WEB_FETCH(chapter) → WEB_FETCH(section)\n" +
     "\n" +
@@ -110,14 +111,12 @@ export function wrapPromptBase(input: WrapPromptInput): string {
      "}\n" +
      "Rules:\n" +
      "- confidence must be within [0,1].\n" +
-     "- Rationale must be short and evidence-grounded: what you saw, what nav metric you used, or what is missing.\n" +
-     "- If the requirement depends on definitions/exceptions not included in the prompt, return UNCERTAIN and ask for them.\n" +
+     "- Rationale must be short and evidence-grounded: what you saw, what nav metric you used, whether the viewer grid was used as the primary dimensional reference, whether a dimension annotation/property was used, or what is missing.\n" +     "- If the requirement depends on definitions/exceptions not included in the prompt, return UNCERTAIN and ask for them.\n" +
      "- If you used WEB_EVIDENCE, mention the clause identifier/section name briefly in the rationale (do not quote long text).\n" +
      "- Prefer action over repeated ZOOM_IN.\n" +
      "- For plan-based checks (doors/stairs clearance), prefer TOP_VIEW + SET_STOREY_PLAN_CUT or SET_PLAN_CUT(height≈1.2m).\n" +
      "- If a storey is mentioned, select it only from context.availableStoreys. Otherwise ask for ISOLATE_STOREY using one of those names.\n" +
-     "- If you need to identify an element, use followUp PICK_CENTER first.\n" +
-     "- After PICK_CENTER succeeds, request GET_PROPERTIES with the returned objectId.\n" +
+     "- If you need to identify an element, prefer HIGHLIGHT_IDS on the likely target category.\n" +
      "- For occluders like slabs/ceilings, prefer HIDE_CATEGORY (e.g., IfcSlab, IfcCovering) instead of listing many ids.\n" +
      "- Zoom at most once. Prefer PLAN_CUT and HIDE_CATEGORY before repeated zoom.\n" +
      "- You are allowed and expected to actively manipulate the model to gather evidence and reduce uncertainty.\n" +

@@ -1,4 +1,8 @@
 // src/modules/vlmAdapters/prompts/vlmPrompt.ts
+//----------------------------------------------------------------
+//-------------Obsolete file, see basePrompt.ts-------------------
+//----------------------------------------------------------------
+
 import type { EvidenceView, VlmFollowUp, VlmVerdict } from "../../vlmChecker";
 
 export type VlmDecisionJson = {

@@ -50,6 +50,20 @@ function formatDuration(ms: number): string {
 function formatConfidence(confidence: number): string {
   return `${(confidence * 100).toFixed(0)}%`;
 }
+/**
+ * Format token counts with thousands separators
+ */
+function formatTokenCount(tokens: number | undefined): string {
+  const safe = typeof tokens === "number" && isFinite(tokens) ? Math.max(0, tokens) : 0;
+  if (!Number.isInteger(safe)) {
+    return safe.toLocaleString("en-US", {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 6,
+    });
+  }
+  return safe.toLocaleString("en-US");
+}
+
 
 /**
  * Get verdict badge color
@@ -405,6 +419,56 @@ function generateCss(): string {
       color: #1f2937;
     }
 
+    .step-prompt {
+      margin-top: 10px;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      background: #fff;
+      overflow: hidden;
+    }
+
+    .step-prompt summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 10px 12px;
+      font-size: 13px;
+      font-weight: 600;
+      color: #374151;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      user-select: none;
+    }
+
+    .step-prompt summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .step-prompt summary::before {
+      content: "▶";
+      font-size: 10px;
+      color: #6b7280;
+      transition: transform 0.2s ease;
+    }
+
+    .step-prompt[open] summary::before {
+      transform: rotate(90deg);
+    }
+
+    .step-prompt pre {
+      margin: 0;
+      padding: 12px;
+      border-top: 1px solid #e5e7eb;
+      background: #f9fafb;
+      color: #1f2937;
+      font-size: 12px;
+      line-height: 1.5;
+      white-space: pre-wrap;
+      word-break: break-word;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+
+
     .footer {
       background: #f9fafb;
       padding: 24px 32px;
@@ -542,6 +606,10 @@ function generateMetricsSection(metrics: InspectionMetrics | undefined): string 
         <div class="metric-card">
           <div class="value">${metrics.totalVlmCalls}</div>
           <div class="label">VLM Calls</div>
+        </div>
+        <div class="metric-card">
+          <div class="value">${formatTokenCount(metrics.complianceTokensUsed)}</div>
+          <div class="label">Compliance Tokens Used</div>
         </div>
         <div class="metric-card">
           <div class="value">${metrics.totalNavigationSteps}</div>
@@ -695,6 +763,34 @@ function generateTraceSection(trace: ConversationTrace): string {
         `
           : "";
 
+        const promptHtml = prompt?.promptText
+          ? `
+          <details class="step-prompt">
+            <summary>Prompt Text</summary>
+            ${prompt.promptSource
+              ? `<div style="padding: 0 12px 10px; color: #6b7280; font-size: 12px;">
+              Source: ${escapeHtml(prompt.promptSource === "rule_library" ? "Rule Library" : "Custom User Prompt")}
+              ${prompt.promptSourceLabel ? ` | Label: ${escapeHtml(prompt.promptSourceLabel)}` : ""}
+            </div>`
+              : ""}
+            ${Array.isArray(prompt.webSourcesUsed) && prompt.webSourcesUsed.length > 0
+              ? `<div style="padding: 0 12px 10px; color: #4b5563; font-size: 12px;">
+              Web sources used:
+              <ul style="margin: 6px 0 0 18px; padding: 0;">
+                ${prompt.webSourcesUsed
+                  .map(
+                    (src) =>
+                      `<li>${escapeHtml(src.sourceType)} | ${escapeHtml(src.url)}${src.via ? ` | ${escapeHtml(src.via)}` : ""}</li>`
+                  )
+                  .join("")}
+              </ul>
+            </div>`
+              : ""}
+            <pre>${escapeHtml(prompt.promptText)}</pre>
+          </details>
+        `
+          : "";
+
         return `
       <div class="step-item ${r.decision.verdict.toLowerCase()}">
         <div class="step-header">
@@ -709,6 +805,7 @@ function generateTraceSection(trace: ConversationTrace): string {
         <div class="step-content">
           <div class="rationale">${escapeHtml(r.decision.rationale)}</div>
           ${snapshotsHtml}
+          ${promptHtml}
           <div class="meta">
             Response time: ${formatDuration(r.responseTimeMs)} | 
             ${new Date(r.timestamp).toLocaleString()}

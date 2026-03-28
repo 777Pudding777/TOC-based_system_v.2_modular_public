@@ -8,6 +8,7 @@ import { getActiveIfcModelId } from "./state";
 import { getActiveIfcTypeIndex } from "./state";
 import { viewerEvents } from "./events";
 import type { ViewerContext } from "./initViewer";
+import { VIEWER_GRID_REFERENCE, type ViewerGridReference } from "./gridConfig";
 
 export type VisibilityState = {
   mode: "all" | "isolate";
@@ -25,6 +26,8 @@ export type ViewerSnapshot = {
   pose: CameraPose;
   meta: { timestampIso: string; modelId: string | null; note?: string };
 };
+
+export type { ViewerGridReference };
 
 /**
  * Deterministic camera presets.
@@ -201,6 +204,62 @@ function getActiveGroupAny(): any | null {
     return style === "warn" ? highlightWarnMat : highlightPrimaryMat;
   }
 
+  const semanticOverlayRoot = new THREE.Group();
+  semanticOverlayRoot.name = "semantic-highlight-overlays";
+  world.scene.three.add(semanticOverlayRoot);
+
+  function clearSemanticOverlays() {
+    for (const child of [...semanticOverlayRoot.children]) {
+      semanticOverlayRoot.remove(child);
+      const c: any = child as any;
+      c.geometry?.dispose?.();
+      c.material?.dispose?.();
+    }
+  }
+
+  async function getMeshesForLocalIds(modelId: string, localIds: number[]): Promise<THREE.Object3D[]> {
+    const listAny: any = (fragments as any).list;
+    const group = typeof listAny?.get === "function" ? listAny.get(modelId) : listAny?.[modelId];
+    if (!group) return [];
+
+    const uniq = Array.from(new Set(localIds)).filter((n) => Number.isFinite(n));
+    if (!uniq.length) return [];
+
+    if (typeof group.getMeshesByItems === "function") {
+      return (await group.getMeshesByItems(uniq)) ?? [];
+    }
+    if (typeof group.getMeshesByItem === "function") {
+      const out: THREE.Object3D[] = [];
+      for (const id of uniq) {
+        const one = (await group.getMeshesByItem(id)) ?? [];
+        out.push(...one);
+      }
+      return out;
+    }
+    return [];
+  }
+
+  async function drawSemanticHighlightOverlays(modelId: string, localIds: number[], style?: "primary" | "warn") {
+    clearSemanticOverlays();
+    const meshes = await getMeshesForLocalIds(modelId, localIds.slice(0, 32));
+    const color = style === "warn" ? 0xff4a4a : 0xffd54a;
+
+    for (const mesh of meshes) {
+      const box = new THREE.Box3().setFromObject(mesh);
+      if (box.isEmpty()) continue;
+
+      const helper = new THREE.Box3Helper(box, color);
+      semanticOverlayRoot.add(helper);
+
+      const center = box.getCenter(new THREE.Vector3());
+      const size = box.getSize(new THREE.Vector3());
+      const dir = new THREE.Vector3(1, 0, 0);
+      const len = Math.max(0.15, Math.min(size.x, size.y, size.z) * 0.6);
+      const arrow = new THREE.ArrowHelper(dir, center, len, color, len * 0.4, len * 0.2);
+      semanticOverlayRoot.add(arrow);
+    }
+  }
+
   function restoreAllHighlights() {
     for (const [uuid, mat] of originalMaterialByMeshUuid.entries()) {
       const obj = world.scene.three.getObjectByProperty("uuid", uuid) as any;
@@ -242,8 +301,7 @@ function getActiveGroupAny(): any | null {
       null;
 
     // Need indices + faceIndex to map triangle -> vertices
-    if (!attr || !hit.faceIndex || !geom?.index) return null;
-
+    if (!attr || hit.faceIndex == null || !geom?.index) return null;
     const index = geom.index;
     const tri = hit.faceIndex;
 
@@ -755,6 +813,7 @@ async resetVisibility() {
   // ✅ clear plan cut too
   planCutState = { enabled: false, planes: [] }
   clearClippingPlanes();
+  clearSemanticOverlays();
 
   fragments.core.update(true);
   world.renderer.three.render(world.scene.three, world.camera.three);
@@ -769,20 +828,31 @@ async resetVisibility() {
 async isolateCategory(category: string): Promise<OBC.ModelIdMap | null> {
   const modelKey = getActiveModelId();
   if (!modelKey) return null;
+  const ids = await this.listCategoryObjectIds(category);
+  if (!ids.length) return null;
+
+  const localIds = ids
+    .map((id) => Number(String(id).split(":")[1]))
+    .filter((n) => Number.isFinite(n));
+
+  if (!localIds.length) return null;
+  const map: OBC.ModelIdMap = { [modelKey]: new Set(localIds) };
+  await this.isolate(map);
+  return map;
+},
+
+async listCategoryObjectIds(category: string, limit = 300): Promise<string[]> {
+  const modelKey = getActiveModelId();
+  if (!modelKey) return [];
 
   const listAny: any = (fragments as any).list;
   const group = typeof listAny?.get === "function" ? listAny.get(modelKey) : listAny?.[modelKey];
-  if (!group) return null;
-
-  if (typeof group.getItemsOfCategories !== "function") {
-    console.warn("[viewerApi] isolateCategory: getItemsOfCategories not available");
-    return null;
+  if (!group || typeof group.getItemsOfCategories !== "function") {
+    return [];
   }
   
-  // ---- NEW: normalize + synonyms ----
   const raw = String(category ?? "").trim();
-  if (!raw) return null;
-
+  if (!raw) return [];
   const upper = raw.toUpperCase();
 
   // deterministic synonym mapping for common user words
@@ -808,38 +878,26 @@ async isolateCategory(category: string): Promise<OBC.ModelIdMap | null> {
 
   // If user passed "IfcDoor" -> "IFCDOOR"
   const ifcLike = upper.startsWith("IFC") ? upper : synonymToIfc[upper] ?? upper;
+  const candidates = [ifcLike, ...(ifcLike.startsWith("IFC") ? [] : [`IFC${ifcLike}`])];
 
-  // Build candidate category patterns in priority order (deterministic)
-  const candidates: string[] = [];
-  candidates.push(ifcLike);
-
-  // also try adding IFC prefix if user provided e.g. "DOOR" (already mapped) or "DOORFITTING"
-  if (!ifcLike.startsWith("IFC")) candidates.push(`IFC${ifcLike}`);
-
-  // if user passed "IFCDOOR", also try "IfcDoor" style is not needed because regex is i
-  // ---- END NEW ----
-
-  // Try exact matches first
   let out: any = null;
+  let chosenTag: string | null = null;
   for (const c of candidates) {
     const re = new RegExp(`^${c}$`, "i");
     try {
       out = await group.getItemsOfCategories([re]);
-    } catch (e) {
-      console.warn("[viewerApi] isolateCategory: getItemsOfCategories threw", e);
-      return null;
+    } catch {
+      out = null;
     }
 
     const ids = extractNumericIdsFromUnknown(out, c);
-    if (ids && ids.length) {
-      const map: OBC.ModelIdMap = { [modelKey]: new Set(ids) };
-      await this.isolate(map);
-      return map;
+    if (ids?.length) {
+      chosenTag = c;
+      break;
     }
   }
 
-  // Fallback: if getCategories exists, try to pick a best category by containment
-  if (typeof group.getCategories === "function") {
+  if (!chosenTag && typeof group.getCategories === "function") {
     let cats: string[] = [];
     try {
       cats = (await group.getCategories()) ?? [];
@@ -847,40 +905,34 @@ async isolateCategory(category: string): Promise<OBC.ModelIdMap | null> {
       cats = [];
     }
 
-    const want = ifcLike; // e.g., IFCDOOR
     const sorted = Array.from(new Set(cats.map((x) => String(x)))).sort();
 
     // deterministic fallback order: exact -> contains -> startsWith
     const pick =
-      sorted.find((k) => k.toUpperCase() === want) ??
-      sorted.find((k) => k.toUpperCase().includes(want)) ??
-      sorted.find((k) => k.toUpperCase().startsWith(want));
+      sorted.find((k) => k.toUpperCase() === ifcLike) ??
+      sorted.find((k) => k.toUpperCase().includes(ifcLike)) ??
+      sorted.find((k) => k.toUpperCase().startsWith(ifcLike));
 
     if (pick) {
       const re = new RegExp(`^${pick}$`, "i");
       try {
         out = await group.getItemsOfCategories([re]);
-      } catch (e) {
-        console.warn("[viewerApi] isolateCategory fallback threw", e);
-        return null;
-      }
-
-      const ids = extractNumericIdsFromUnknown(out, pick.toUpperCase());
-      if (ids && ids.length) {
-        const map: OBC.ModelIdMap = { [modelKey]: new Set(ids) };
-        await this.isolate(map);
-        return map;
+        chosenTag = pick.toUpperCase();
+      } catch {
+        out = null;
       }
     }
   }
 
-  console.warn("[viewerApi] isolateCategory: no ids returned", {
-    category,
-    modelKey,
-    candidates,
-    outInfo: out ? debugDescribeOut(out) : null,
-  });
-  return null;
+  const localIds = extractNumericIdsFromUnknown(out, chosenTag ?? ifcLike) ?? [];
+  if (!localIds.length) return [];
+
+  const uniqSorted = Array.from(new Set(localIds))
+    .filter((n) => Number.isFinite(n))
+    .sort((a, b) => a - b)
+    .slice(0, Math.max(1, limit));
+
+  return uniqSorted.map((localId) => `${modelKey}:${localId}`);
 },
 
 async listStoreys(): Promise<string[]> {
@@ -1251,7 +1303,10 @@ async highlightIds(ids: string[], style?: "primary" | "warn") {
     if (parsed.modelId !== modelId) continue;
     localIds.push(parsed.localId);
   }
-  if (!localIds.length) return;
+  if (!localIds.length) {
+    clearSemanticOverlays();
+    return;
+  }
 
   // Best effort: group.highlight(ids, materialOrStyle?)
   // We keep it deterministic: same style string passed through if supported.
@@ -1264,6 +1319,8 @@ async highlightIds(ids: string[], style?: "primary" | "warn") {
     }
   }
 
+  await drawSemanticHighlightOverlays(modelId, localIds, style);
+  
   fragments.core.update(true);
   world.renderer.three.render(world.scene.three, world.camera.three);
 },
@@ -1283,33 +1340,67 @@ async pickObjectAt(x: number, y: number): Promise<string | null> {
   const nx = (x / rect.width) * 2 - 1;
   const ny = -(y / rect.height) * 2 + 1;
 
-  // Prefer FragmentsGroup.raycast if available (it is, per your proto keys)
-  if (typeof group.raycast === "function") {
-    const hit = group.raycast(world.camera.three, new THREE.Vector2(nx, ny));
-    // hit shape varies by version; try best-effort extraction
-    const ids =
-      (hit && (hit.ids ?? hit.items ?? hit.itemIds ?? hit.id)) ??
-      null;
+  // Prefer FragmentsGroup.raycast if available, but guard against version/signature mismatches.
+    if (typeof group.raycast === "function") {
+    try {
+      // Try both camera shapes used across runtime versions.
+      const hit =
+        group.raycast((world as any).camera, new THREE.Vector2(nx, ny)) ??
+        group.raycast(world.camera.three, new THREE.Vector2(nx, ny));
+      const ids =
+        (hit && (hit.ids ?? hit.items ?? hit.itemIds ?? hit.id)) ??
+        null;
 
-    const pickFirstNumber = (v: any): number | null => {
-      if (typeof v === "number" && isFinite(v)) return v;
-      if (Array.isArray(v)) {
-        const n = v.find((q) => typeof q === "number" && isFinite(q));
-        return n ?? null;
-      }
-      if (v instanceof Set) {
-        for (const q of v) if (typeof q === "number" && isFinite(q)) return q;
-      }
-      return null;
-    };
+      const pickFirstNumber = (v: any): number | null => {
+        if (typeof v === "number" && isFinite(v)) return v;
+        if (Array.isArray(v)) {
+          const n = v.find((q) => typeof q === "number" && isFinite(q));
+          return n ?? null;
+        }
+        if (v instanceof Set) {
+          for (const q of v) if (typeof q === "number" && isFinite(q)) return q;
+        }
+        return null;
+      };
 
-    const localId = pickFirstNumber(ids) ?? pickFirstNumber(hit?.item) ?? pickFirstNumber(hit?.localId);
-    if (localId != null) {
-      const objectId = `${modelId}:${localId}`;
-      lastPickedObjectId = objectId;
-      return objectId;
+      const localId = pickFirstNumber(ids) ?? pickFirstNumber(hit?.item) ?? pickFirstNumber(hit?.localId);
+      if (localId != null) {
+        const objectId = `${modelId}:${localId}`;
+        lastPickedObjectId = objectId;
+        return objectId;
+      }
+    } catch (err) {
+      console.warn("[viewerApi] group.raycast failed; falling back to THREE.Raycaster", err);
     }
   }
+
+  // Fallback raycast against the active model object.
+  const model = getActiveModel();
+  const root = model?.object;
+  if (!root) return null;
+
+  const raycaster = new THREE.Raycaster();
+  raycaster.setFromCamera(new THREE.Vector2(nx, ny), world.camera.three);
+  const intersections: THREE.Intersection[] = [];
+  // Safer than one deep call: traverse meshes and ignore malformed geometry errors.
+  root.traverse((obj: any) => {
+    if (!obj?.isMesh) return;
+    try {
+      const hits = raycaster.intersectObject(obj, false);
+      if (hits?.length) intersections.push(...hits);
+    } catch {
+      // ignore broken buffers/attributes from specific meshes
+    }
+  });
+
+  intersections.sort((a, b) => a.distance - b.distance);
+  for (const hit of intersections) {
+    const localId = extractLocalIdFromIntersection(hit);
+    if (localId == null) continue;
+    const objectId = `${modelId}:${localId}`;
+    lastPickedObjectId = objectId;
+    return objectId;  
+}
 
   return null;
 },
@@ -1561,6 +1652,10 @@ async getSnapshot(opts?: { note?: string }): Promise<ViewerSnapshot> {
 
 async stabilizeForSnapshot(): Promise<void> {
   await stabilizeSceneForSnapshot();
+},
+
+getGridReference(): ViewerGridReference {
+  return VIEWER_GRID_REFERENCE;
 },
 
 async getElementProperties(localId: number): Promise<Record<string, any> | null> {

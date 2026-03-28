@@ -1,3 +1,5 @@
+import { DEFAULT_REDUCED_TAVILY_MAX_CHARS } from "../config/prototypeSettings";
+
 export type RegulatoryReductionInput = {
   ruleText: string;
   sourceUrl: string;
@@ -153,7 +155,7 @@ function buildReducerPrompt(input: RegulatoryReductionInput) {
   const user = JSON.stringify({
     ruleText: input.ruleText,
     sourceUrl: input.sourceUrl,
-    maxChars: input.maxChars ?? 3500,
+    maxChars: input.maxChars ?? DEFAULT_REDUCED_TAVILY_MAX_CHARS,
     fetchedText: input.rawText,
   });
 
@@ -289,8 +291,8 @@ export async function reduceRegulatoryTextWithOpenRouter(args: {
     };
   }
 
-  const reducedText = compactReducedOutput(parsed, args.input.maxChars ?? 3500);
-  const headings = (parsed.relevantClauses ?? [])
+    const reducedText = compactReducedOutput(parsed, args.input.maxChars ?? DEFAULT_REDUCED_TAVILY_MAX_CHARS);
+    const headings = (parsed.relevantClauses ?? [])
     .map((x) => String(x?.heading ?? "").trim())
     .filter(Boolean);
 

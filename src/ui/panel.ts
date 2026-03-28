@@ -8,6 +8,7 @@ import type { RuleDb } from "../storage/ruleDb";
 import type { TraceDb } from "../storage/traceDb";
 import { downloadHtmlReport } from "../reporting/reportGenerator";
 import { OPENROUTER_VISION_MODELS, getDefaultModel, findModelById } from "../config/openRouterModels";
+import { DEFAULT_MAX_COMPLIANCE_STEPS } from "../config/prototypeSettings";
 import { deleteDatabase } from "../storage/dbConfig";
 
 type ToastFn = (msg: string, ms?: number) => void;
@@ -22,6 +23,9 @@ export function mountPanel(params: {
     hasModelLoaded: () => boolean;
     setPresetView: (preset: "iso" | "top", smooth?: boolean) => Promise<void>;
     setCameraPose: (pose: CameraPose, smooth?: boolean) => Promise<void>;
+    getRendererDomElement?: () => HTMLCanvasElement;
+    pickObjectAt?: (x: number, y: number) => Promise<string | null>;
+    highlightIds?: (ids: string[], style?: "primary" | "warn") => Promise<void>;
   };
 
   upload: {
@@ -124,11 +128,34 @@ vlmChecker: {
   type InspectionStatus = "idle" | "running" | "completed" | "failed";
   let inspectionStatus: InspectionStatus = "idle";
   let inspectionStep = 0;
-  const inspectionMaxSteps = 6;
+  const inspectionMaxSteps = DEFAULT_MAX_COMPLIANCE_STEPS;
   let inspectionTrace: ConversationTrace | null = null;
   let inspectionError: string | null = null;
   let inspectionStartTime: number | null = null;
   let inspectionDecisions: VlmDecision[] = [];
+  let debugPickModeEnabled = false;
+  let debugPickListenerAttached = false;
+
+  function getPromptTextForReport(decision: VlmDecision, fallbackPrompt: string): string {  
+   const adapterPrompt = decision.meta?.adapterPromptText?.trim();
+   if (adapterPrompt) return adapterPrompt;
+   const composedPrompt = decision.meta?.composedPromptText?.trim();
+   if (composedPrompt) return composedPrompt;
+   return fallbackPrompt;
+  }
+
+  function getComplianceTokensUsed(decisions: VlmDecision[]): number {
+    return decisions.reduce((sum, decision) => {
+      const usage = decision.meta?.tokenUsage;
+      if (!usage) return sum;
+      const total =
+        usage.totalTokens ??
+        (typeof usage.inputTokens === "number" || typeof usage.outputTokens === "number"
+          ? (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0)
+          : 0);
+      return sum + (Number.isFinite(total) ? total : 0);
+    }, 0);
+  }
 
   // Rule library state
   let rules: ComplianceRule[] = [];
@@ -211,6 +238,37 @@ vlmChecker: {
     };
   }
 
+  function parseNumeric(value: unknown): number | null {
+    if (typeof value === "number" && isFinite(value)) return value;
+    if (typeof value === "string" && value.trim().length > 0) {
+      const parsed = Number(value);
+      return isFinite(parsed) ? parsed : null;
+    }
+    return null;
+  }
+
+  async function fetchOpenRouterUsageValue(key: string): Promise<number | null> {
+    const k = (key ?? "").trim();
+    if (!k) return null;
+    try {
+      const resp = await fetch("https://openrouter.ai/api/v1/auth/key", {
+        method: "GET",
+        headers: { Authorization: `Bearer ${k}` },
+      });
+      if (!resp.ok) return null;
+      const json = await resp.json().catch(() => null);
+      const data = json?.data ?? json;
+      return (
+        parseNumeric(data?.usage) ??
+        parseNumeric(data?.total_usage) ??
+        parseNumeric(data?.spent) ??
+        null
+      );
+    } catch {
+      return null;
+    }
+  }
+
   async function validateOpenRouterKey(key: string) {
     const k = (key ?? "").trim();
     if (!k) {
@@ -279,6 +337,46 @@ vlmChecker: {
     return best;
   }
 
+  function setDebugPickMode(enabled: boolean) {
+    debugPickModeEnabled = enabled;
+    const canvas = viewerApi.getRendererDomElement?.();
+    if (!canvas || !viewerApi.pickObjectAt || !viewerApi.highlightIds) return;
+
+    if (!enabled && debugPickListenerAttached) {
+      canvas.removeEventListener("click", onDebugPickClick);
+      debugPickListenerAttached = false;
+      return;
+    }
+
+    if (enabled && !debugPickListenerAttached) {
+      canvas.addEventListener("click", onDebugPickClick);
+      debugPickListenerAttached = true;
+    }
+  }
+
+  async function onDebugPickClick(ev: MouseEvent) {
+    if (!debugPickModeEnabled) return;
+    const canvas = viewerApi.getRendererDomElement?.();
+    if (!canvas || !viewerApi.pickObjectAt || !viewerApi.highlightIds) return;
+
+    try {
+      const rect = canvas.getBoundingClientRect();
+      const x = ev.clientX - rect.left;
+      const y = ev.clientY - rect.top;
+      const id = await viewerApi.pickObjectAt(x, y);
+      if (!id) {
+        toast?.("Debug pick: no object.");
+        return;
+      }
+      await viewerApi.highlightIds([id], "warn");
+      toast?.(`Debug pick highlighted: ${id}`);
+      console.log("[DebugPick] highlighted", { id, x, y });
+    } catch (error) {
+      console.error("[DebugPick] failed", error);
+      toast?.("Debug pick failed (see console).");
+    }
+  }
+
   function formatDuration(ms: number): string {
     if (ms < 1000) return `${ms}ms`;
     return `${(ms / 1000).toFixed(1)}s`;
@@ -322,6 +420,32 @@ vlmChecker: {
     return parts.join("\n");
   }
 
+  function buildCoupledPrompt(args: {
+    source: "rule_library" | "custom_user_prompt";
+    sourceLabel: string;
+    sourceText: string;
+    rule?: ComplianceRule | null;
+  }): string {
+    const header =
+      args.source === "rule_library"
+        ? [
+            "INSPECTION_INPUT_CONTEXT:",
+            "SOURCE: RULE_LIBRARY",
+            `RULE_ID: ${args.rule?.id ?? "unknown"}`,
+            `RULE_TITLE: ${args.rule?.title ?? args.sourceLabel}`,
+            `RULE_CATEGORY: ${args.rule?.category ?? "unknown"}`,
+            `RULE_SEVERITY: ${args.rule?.severity ?? "unknown"}`,
+          ]
+        : [
+            "INSPECTION_INPUT_CONTEXT:",
+            "SOURCE: CUSTOM_USER_PROMPT",
+            `PROMPT_LABEL: ${args.sourceLabel}`,
+          ];
+
+    return [...header, "", "SOURCE_PROMPT_TEXT:", args.sourceText].join("\n");
+  }
+
+
   // ───────────────── Compliance check (enhanced) ─────────────────
   async function startComplianceCheck() {
     const hasModel = viewerApi.hasModelLoaded();
@@ -329,12 +453,28 @@ vlmChecker: {
 
     // Determine prompt
     let prompt = "";
+    let promptSource: "rule_library" | "custom_user_prompt" = "custom_user_prompt";
+    let promptSourceLabel = "Custom Prompt";
+    let sourceText = "";
     if (ruleInputMode === "library" && selectedRule) {
-      prompt = buildPromptFromRule(selectedRule);
+      sourceText = buildPromptFromRule(selectedRule);
+      promptSource = "rule_library";
+      promptSourceLabel = selectedRule.title;
+      prompt = buildCoupledPrompt({
+        source: "rule_library",
+        sourceLabel: selectedRule.title,
+        sourceText,
+        rule: selectedRule,
+      });
     } else {
-      prompt = (rulePrompt ?? "").trim();
+      sourceText = (rulePrompt ?? "").trim();
+      prompt = buildCoupledPrompt({
+        source: "custom_user_prompt",
+        sourceLabel: "Custom Prompt",
+        sourceText,
+      });
     }
-    if (!prompt) return toast?.("Please select a rule or enter a compliance prompt.");
+    if (!sourceText) return toast?.("Please select a rule or enter a compliance prompt.");
 
     // Build deterministic config
     let deterministic:
@@ -362,6 +502,11 @@ vlmChecker: {
     render();
 
     try {
+      let openRouterUsageBefore: number | null = null;
+      if (vlmProvider === "openrouter") {
+        openRouterUsageBefore = await fetchOpenRouterUsageValue(openRouterApiKey);
+      }
+
       vlmChecker.resetRunWebEvidence();
       const res = await complianceRunner.start({
         prompt,
@@ -382,6 +527,9 @@ vlmChecker: {
         const endTime = Date.now();
         const startTime = inspectionStartTime ?? endTime;
         const decisions: VlmDecision[] = res?.decisions ?? inspectionDecisions;
+        const webEvidenceRecords = [...(vlmChecker.getRunWebEvidence() ?? [])].sort(
+          (a, b) => new Date(a.fetchedAt).getTime() - new Date(b.fetchedAt).getTime()
+        );
         const ruleInfo = selectedRule
           ? { id: selectedRule.id, title: selectedRule.title, description: selectedRule.description, category: selectedRule.category, severity: selectedRule.severity }
           : { id: "custom", title: "Custom Rule", description: prompt.slice(0, 200), category: "custom", severity: "moderate" };
@@ -389,7 +537,41 @@ vlmChecker: {
         console.log("[TRACE] getRunWebEvidence()", vlmChecker.getRunWebEvidence());  
         const run = snapshotCollector.getRun();
         const artifacts = Array.isArray(run?.artifacts) ? run.artifacts : [];
+        let complianceUsageDelta: number | null = null;
+        if (vlmProvider === "openrouter") {
+          const openRouterUsageAfter = await fetchOpenRouterUsageValue(openRouterApiKey);
+          if (
+            typeof openRouterUsageBefore === "number" &&
+            isFinite(openRouterUsageBefore) &&
+            typeof openRouterUsageAfter === "number" &&
+            isFinite(openRouterUsageAfter)
+          ) {
+            complianceUsageDelta = Math.max(0, openRouterUsageAfter - openRouterUsageBefore);
+          }
+        }
         const modelId = vlmProvider === "openrouter" ? openRouterModel : vlmProvider === "openai" ? openAiModel : "mock";
+        const decisionTimes = decisions.map((d) => new Date(d.timestampIso).getTime());
+        const getStepWebSources = (index: number) => {
+          const from = index === 0 ? Number.NEGATIVE_INFINITY : decisionTimes[index - 1];
+          const to = decisionTimes[index];
+          const entries = webEvidenceRecords.filter((entry) => {
+            const t = new Date(entry.fetchedAt).getTime();
+            return t > from && t <= to;
+          });
+          const seen = new Set<string>();
+          return entries
+            .filter((entry) => {
+              const key = `${entry.sourceType}|${entry.url}|${entry.via ?? ""}`;
+              if (seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            })
+            .map((entry) => ({
+              sourceType: entry.sourceType,
+              url: entry.url,
+              via: entry.via,
+            }));
+        };
         const snapshots = artifacts.map((artifact: any, index: number) => ({
           snapshotId: artifact.id,
           reason: artifact.meta?.note ?? `Snapshot ${index + 1}`,
@@ -415,7 +597,11 @@ vlmChecker: {
           status: "completed",
           prompts: decisions.map((d: VlmDecision, i: number) => ({
             step: i + 1,
-            promptText: prompt,
+            promptText: getPromptTextForReport(d, prompt),
+            promptSource,
+            promptSourceLabel,
+            sourceText,
+            webSourcesUsed: getStepWebSources(i),
             ruleContext: {
               ruleId: selectedRule?.id ?? "custom",
               ruleTitle: selectedRule?.title ?? "Custom Rule",
@@ -452,8 +638,9 @@ vlmChecker: {
             finalConfidence: decisions.length > 0 ? decisions[decisions.length - 1].confidence : 0,
             uncertainSteps: decisions.filter((d: VlmDecision) => d.verdict === "UNCERTAIN").length,
             failureNotes: [],
+            complianceTokensUsed: complianceUsageDelta ?? getComplianceTokensUsed(decisions),
           },
-          webEvidence: vlmChecker.getRunWebEvidence(),
+          webEvidence: webEvidenceRecords,
         };
         console.log("[TRACE] trace.webEvidence", trace.webEvidence);
         
@@ -854,6 +1041,16 @@ vlmChecker: {
 
         <!-- ═══════════ DEBUG SECTION ═══════════ -->
         <bim-panel-section label="Debug">
+          <bim-button
+            label=${debugPickModeEnabled ? "Disable pick highlight debug" : "Enable pick highlight debug"}
+            ?disabled=${loading || !hasModel || !viewerApi.pickObjectAt || !viewerApi.highlightIds || !viewerApi.getRendererDomElement}
+            @click=${() => {
+              setDebugPickMode(!debugPickModeEnabled);
+              render();
+              toast?.(debugPickModeEnabled ? "Pick highlight debug enabled. Click model to highlight." : "Pick highlight debug disabled.");
+            }}
+          ></bim-button>
+          
           <bim-button label="Capture snapshot" ?disabled=${loading || !hasModel}
             @click=${async () => {
               try {

@@ -3,6 +3,7 @@
 // Also provides a WebFetch-style Tavily extraction path for authoritative URL grounding.
 
 import { getEnvironmentConfig } from "../../../config/environment";
+import { DEFAULT_TAVILY_MAX_CHARS } from "../../../config/prototypeSettings";
 
 /* ───────── Types ───────── */
 
@@ -304,7 +305,7 @@ export async function webFetchViaTavily(params: {
   };
 }): Promise<TavilyWebFetchResult> {
   const { targetUrl, allowedDomains, userIntent } = params;
-  const maxChars = params.maxChars ?? 20000;
+  const maxChars = params.maxChars ?? DEFAULT_TAVILY_MAX_CHARS;
   const cacheOpts = params.cache ?? { enabled: true, ttlMs: DEFAULT_TTL_MS, persist: true };
   const cacheEnabled = cacheOpts.enabled !== false;
   const ttlMs =
