@@ -164,6 +164,14 @@ export interface InspectionMetrics {
  * Scene state at a point in time
  */
 export interface SceneState {
+  /** Step number represented by this scene state */
+  step?: number;
+  /** Snapshot associated with this state, if any */
+  snapshotId?: string;
+  /** Human-readable state label */
+  label?: string;
+  /** Action or reason that produced this state */
+  action?: string;
   /** Current camera pose */
   cameraPose: CameraPoseTrace;
   /** Current view preset (if applicable) */
@@ -174,12 +182,14 @@ export interface SceneState {
   isolatedSpace?: string;
   /** Currently isolated categories */
   isolatedCategories?: string[];
+  /** Exact isolated element IDs */
+  isolatedIds?: string[];
   /** Hidden element IDs */
   hiddenIds?: string[];
   /** Highlighted element IDs */
   highlightedIds?: string[];
   /** Plan cut state */
-  planCut?: { height: number; thickness?: number; mode?: string };
+  planCut?: { height?: number; absoluteHeight?: number; thickness?: number; mode?: string };
 }
 
 /**

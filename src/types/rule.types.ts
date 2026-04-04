@@ -17,6 +17,7 @@ export type RuleCategory =
   | 'safety'
   | 'circulation'
   | 'egress'
+  | 'quality'
   | 'building_envelope';
 
 /**

@@ -9,6 +9,11 @@ import { getActiveIfcTypeIndex } from "./state";
 import { viewerEvents } from "./events";
 import type { ViewerContext } from "./initViewer";
 import { VIEWER_GRID_REFERENCE, type ViewerGridReference } from "./gridConfig";
+import {
+  DOOR_CLEARANCE_DEFAULTS,
+  HIGHLIGHT_ANNOTATION_DEFAULTS,
+  type HighlightAnnotationMode,
+} from "../config/prototypeSettings";
 
 export type VisibilityState = {
   mode: "all" | "isolate";
@@ -24,7 +29,12 @@ export type CameraPose = {
 export type ViewerSnapshot = {
   imageBase64Png: string;
   pose: CameraPose;
-  meta: { timestampIso: string; modelId: string | null; note?: string };
+  meta: {
+    timestampIso: string;
+    modelId: string | null;
+    note?: string;
+    context?: Record<string, unknown>;
+  };
 };
 
 export type { ViewerGridReference };
@@ -35,6 +45,15 @@ export type { ViewerGridReference };
  * - "top": plan-like view (good for layout, but can hide interiors)
  */
 export type StartPosePreset = "iso" | "top";
+
+type HighlightOverlayEntry = {
+  localId: number;
+  meshes: THREE.Object3D[];
+  boxes: THREE.Box3[];
+  merged: THREE.Box3;
+  ifcClass: string | null;
+  props: Record<string, any> | null;
+};
 
 export function createViewerApi(ctx: ViewerContext) {
   const { world, fragments, hider } = ctx;
@@ -90,6 +109,44 @@ function findClassifier(components: any): any | null {
     if (typeof c.getModelIdMap === "function") return c;
     if (typeof c.find === "function") return c;
   }
+  return null;
+}
+
+function findHighlightController(components: any): any | null {
+  if (!components) return null;
+
+  const candidates: any[] = [];
+  if (typeof components.get === "function") {
+    for (const key of ["FragmentsManager", "Highlighter", "FragmentHighlighter"]) {
+      try {
+        const c = components.get((OBC as any)[key] ?? key);
+        if (c) candidates.push(c);
+      } catch {}
+    }
+  }
+
+  const keys = Object.keys(components).sort();
+  for (const k of keys) {
+    const v = (components as any)[k];
+    if (!v) continue;
+    if (
+      typeof v.getBBoxes === "function" ||
+      typeof v.highlight === "function" ||
+      typeof v.resetHighlight === "function"
+    ) {
+      candidates.push(v);
+    }
+  }
+
+  for (const c of candidates) {
+    if (
+      typeof c.getBBoxes === "function" ||
+      (typeof c.highlight === "function" && typeof c.resetHighlight === "function")
+    ) {
+      return c;
+    }
+  }
+
   return null;
 }
 
@@ -181,32 +238,82 @@ function getActiveGroupAny(): any | null {
   // ----------------------------
   let lastPickedObjectId: string | null = null;
 
-  // Store original materials so we can restore them after highlighting.
-  // Keyed by mesh uuid (stable enough for session).
-  const originalMaterialByMeshUuid = new Map<string, THREE.Material | THREE.Material[]>();
-
   // Single shared highlight materials (deterministic)
   const highlightPrimaryMat = new THREE.MeshBasicMaterial({
     color: 0xffd54a,
     transparent: true,
     opacity: 0.95,
-    depthTest: true,
+    depthTest: false,
+    depthWrite: false,
   });
 
   const highlightWarnMat = new THREE.MeshBasicMaterial({
     color: 0xff4a4a,
     transparent: true,
     opacity: 0.95,
-    depthTest: true,
+    depthTest: false,
+    depthWrite: false,
   });
 
   function pickHighlightMaterial(style?: "primary" | "warn") {
     return style === "warn" ? highlightWarnMat : highlightPrimaryMat;
   }
 
+  const highlightFillRoot = new THREE.Group();
+  highlightFillRoot.name = "semantic-highlight-fill";
+  world.scene.three.add(highlightFillRoot);
   const semanticOverlayRoot = new THREE.Group();
   semanticOverlayRoot.name = "semantic-highlight-overlays";
   world.scene.three.add(semanticOverlayRoot);
+  const viewerHost = world.renderer.three.domElement.parentElement;
+  if (viewerHost && getComputedStyle(viewerHost).position === "static") {
+    viewerHost.style.position = "relative";
+  }
+  const highlightHudEl = document.createElement("div");
+  highlightHudEl.style.position = "absolute";
+  highlightHudEl.style.top = "12px";
+  highlightHudEl.style.left = "50%";
+  highlightHudEl.style.transform = "translateX(-50%)";
+  highlightHudEl.style.zIndex = "20";
+  highlightHudEl.style.pointerEvents = "none";
+  highlightHudEl.style.display = "none";
+  highlightHudEl.style.minWidth = "340px";
+  highlightHudEl.style.maxWidth = "min(720px, calc(100% - 24px))";
+  highlightHudEl.style.padding = "12px 16px";
+  highlightHudEl.style.border = "2px solid rgba(255, 213, 74, 0.9)";
+  highlightHudEl.style.borderRadius = "14px";
+  highlightHudEl.style.background = "rgba(7, 10, 20, 0.9)";
+  highlightHudEl.style.color = "#f8fafc";
+  highlightHudEl.style.fontFamily = "ui-sans-serif, system-ui, sans-serif";
+  highlightHudEl.style.boxShadow = "0 12px 30px rgba(0,0,0,0.3)";
+  highlightHudEl.style.backdropFilter = "blur(6px)";
+  if (viewerHost && !viewerHost.contains(highlightHudEl)) {
+    viewerHost.appendChild(highlightHudEl);
+  }
+  const semanticClassByObjectId = new Map<string, string>();
+  let highlightAnnotationMode: HighlightAnnotationMode = HIGHLIGHT_ANNOTATION_DEFAULTS.mode;
+  let activeHighlightState:
+    | {
+        modelId: string;
+        localIds: number[];
+        style?: "primary" | "warn";
+        entries: HighlightOverlayEntry[];
+      }
+    | null = null;
+  let highlightRefreshScheduled = false;
+  let highlightPlanCutAdjustmentInFlight = false;
+
+  function clearHighlightFillOverlays() {
+    for (const child of [...highlightFillRoot.children]) {
+      highlightFillRoot.remove(child);
+      const c: any = child as any;
+      if (Array.isArray(c.material)) {
+        for (const m of c.material) m?.dispose?.();
+      } else {
+        c.material?.dispose?.();
+      }
+    }
+  }
 
   function clearSemanticOverlays() {
     for (const child of [...semanticOverlayRoot.children]) {
@@ -214,6 +321,116 @@ function getActiveGroupAny(): any | null {
       const c: any = child as any;
       c.geometry?.dispose?.();
       c.material?.dispose?.();
+    }
+  }
+
+  function clearHighlightHud() {
+    highlightHudEl.innerHTML = "";
+    highlightHudEl.style.display = "none";
+  }
+
+  function clearAllHighlightOverlays() {
+    clearHighlightFillOverlays();
+    clearSemanticOverlays();
+    clearHighlightHud();
+  }
+
+  async function clearActiveHighlightState() {
+    const controller = findHighlightController(getComponentsAny());
+    const group = getActiveGroupAny();
+    try {
+      if (controller && typeof controller.resetHighlight === "function") {
+        await controller.resetHighlight();
+      } else if (group && typeof group.resetHighlight === "function") {
+        await group.resetHighlight();
+      }
+    } catch {
+      // best effort: clear overlays/state even if native reset fails
+    }
+    activeHighlightState = null;
+    lastPickedObjectId = null;
+    clearAllHighlightOverlays();
+  }
+
+  function getActiveHighlightObjectIds(): string[] {
+    if (!activeHighlightState) return [];
+    return activeHighlightState.localIds.map((localId) => toObjectId(activeHighlightState.modelId, localId));
+  }
+
+  async function ensurePlanCutContainsActiveHighlight(api: any) {
+    if (
+      highlightPlanCutAdjustmentInFlight ||
+      !planCutState.enabled ||
+      planCutState.mode !== "WORLD_UP" ||
+      !activeHighlightState?.entries.length
+    ) {
+      return false;
+    }
+
+    const union = new THREE.Box3();
+    let hasBox = false;
+    for (const entry of activeHighlightState.entries) {
+      if (!entry?.merged || entry.merged.isEmpty()) continue;
+      union.union(entry.merged);
+      hasBox = true;
+    }
+    if (!hasBox || union.isEmpty()) return false;
+
+    const upAxis = getUpAxis();
+    const minH = upAxis === "y" ? union.min.y : union.min.z;
+    const maxH = upAxis === "y" ? union.max.y : union.max.z;
+    const height = Math.max(0.01, maxH - minH);
+    const margin = Math.max(0.01, height * 0.02);
+    const requiredAbs = maxH + margin;
+
+    if (requiredAbs <= planCutState.absoluteHeight + 1e-4) {
+      return false;
+    }
+
+    highlightPlanCutAdjustmentInFlight = true;
+    try {
+      await api.setPlanCut({
+        absoluteHeight: requiredAbs,
+        mode: planCutState.mode,
+        source: "highlight-top",
+        storeyId: planCutState.storeyId,
+      });
+      return true;
+    } finally {
+      highlightPlanCutAdjustmentInFlight = false;
+    }
+  }
+
+  async function restoreFullModelVisibilityPreserveHighlight() {
+    await hider.set(true);
+    lastIsolateMap = null;
+    visibilityState = { mode: "all", lastIsolateCount: undefined };
+    for (const k of Object.keys(hiddenMapByModel)) delete hiddenMapByModel[k];
+    planCutState = { enabled: false, planes: [] };
+    clearClippingPlanes();
+    fragments.core.update(true);
+    world.renderer.three.render(world.scene.three, world.camera.three);
+  }
+
+  function createLineMaterial(color: number, opacity = 0.94) {
+    return new THREE.LineBasicMaterial({
+      color,
+      linewidth: HIGHLIGHT_ANNOTATION_DEFAULTS.lineWidth,
+      depthTest: false,
+      transparent: true,
+      opacity,
+    });
+  }
+
+  async function getElementPropertiesSafe(modelId: string, localId: number): Promise<Record<string, any> | null> {
+    const activeModelId = getActiveModelId();
+    if (!activeModelId || activeModelId !== modelId) return null;
+    const model = getActiveModel();
+    if (!model || typeof model.getProperties !== "function") return null;
+    try {
+      return (await model.getProperties(localId)) ?? null;
+    } catch {
+      return null;
     }
   }
 
@@ -239,33 +456,771 @@ function getActiveGroupAny(): any | null {
     return [];
   }
 
-  async function drawSemanticHighlightOverlays(modelId: string, localIds: number[], style?: "primary" | "warn") {
-    clearSemanticOverlays();
-    const meshes = await getMeshesForLocalIds(modelId, localIds.slice(0, 32));
-    const color = style === "warn" ? 0xff4a4a : 0xffd54a;
+  async function getBoxesForLocalIds(modelId: string, localIds: number[]): Promise<THREE.Box3[]> {
+    const components = getComponentsAny();
+    const controller = findHighlightController(components);
+    const uniq = Array.from(new Set(localIds)).filter((n) => Number.isFinite(n));
+    if (!controller || !uniq.length || typeof controller.getBBoxes !== "function") return [];
 
-    for (const mesh of meshes) {
-      const box = new THREE.Box3().setFromObject(mesh);
-      if (box.isEmpty()) continue;
-
-      const helper = new THREE.Box3Helper(box, color);
-      semanticOverlayRoot.add(helper);
-
-      const center = box.getCenter(new THREE.Vector3());
-      const size = box.getSize(new THREE.Vector3());
-      const dir = new THREE.Vector3(1, 0, 0);
-      const len = Math.max(0.15, Math.min(size.x, size.y, size.z) * 0.6);
-      const arrow = new THREE.ArrowHelper(dir, center, len, color, len * 0.4, len * 0.2);
-      semanticOverlayRoot.add(arrow);
+    try {
+      const boxes = await controller.getBBoxes({ [modelId]: new Set(uniq) });
+      return Array.isArray(boxes)
+        ? boxes.filter((b: any) => b?.isBox3 && !b.isEmpty())
+        : [];
+    } catch {
+      return [];
     }
   }
 
-  function restoreAllHighlights() {
-    for (const [uuid, mat] of originalMaterialByMeshUuid.entries()) {
-      const obj = world.scene.three.getObjectByProperty("uuid", uuid) as any;
-      if (obj && obj.material) obj.material = mat;
+  function makeTextSprite(text: string, color: number, background = "rgba(7, 10, 20, 0.82)") {
+    const canvas = document.createElement("canvas");
+    canvas.width = 512;
+    canvas.height = 128;
+    const ctx2d = canvas.getContext("2d");
+    if (!ctx2d) return null;
+
+    ctx2d.clearRect(0, 0, canvas.width, canvas.height);
+    ctx2d.fillStyle = background;
+    ctx2d.strokeStyle = `#${color.toString(16).padStart(6, "0")}`;
+    ctx2d.lineWidth = 6;
+    const radius = 20;
+    ctx2d.beginPath();
+    ctx2d.moveTo(radius, 0);
+    ctx2d.lineTo(canvas.width - radius, 0);
+    ctx2d.quadraticCurveTo(canvas.width, 0, canvas.width, radius);
+    ctx2d.lineTo(canvas.width, canvas.height - radius);
+    ctx2d.quadraticCurveTo(canvas.width, canvas.height, canvas.width - radius, canvas.height);
+    ctx2d.lineTo(radius, canvas.height);
+    ctx2d.quadraticCurveTo(0, canvas.height, 0, canvas.height - radius);
+    ctx2d.lineTo(0, radius);
+    ctx2d.quadraticCurveTo(0, 0, radius, 0);
+    ctx2d.closePath();
+    ctx2d.fill();
+    ctx2d.stroke();
+
+    ctx2d.fillStyle = "#f8fafc";
+    ctx2d.font = "bold 42px sans-serif";
+    ctx2d.textAlign = "center";
+    ctx2d.textBaseline = "middle";
+    ctx2d.fillText(text, canvas.width / 2, canvas.height / 2);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.needsUpdate = true;
+    const material = new THREE.SpriteMaterial({
+      map: texture,
+      transparent: true,
+      depthTest: false,
+      depthWrite: false,
+    });
+    const sprite = new THREE.Sprite(material);
+    sprite.renderOrder = 1000;
+    return sprite;
+  }
+
+  function addBadge(text: string, anchor: THREE.Vector3, color: number, scale = 0.8) {
+    const badge = makeTextSprite(text, color);
+    if (!badge) return;
+    badge.position.copy(anchor);
+    badge.scale.set(1.8 * scale, 0.45 * scale, 1);
+    semanticOverlayRoot.add(badge);
+  }
+
+  function getEntrySizeReference(entry: HighlightOverlayEntry) {
+    const { majorSize, minorSize, verticalSize } = getHorizontalAxes(entry.merged);
+    return {
+      width: majorSize,
+      depth: minorSize,
+      height: verticalSize,
+    };
+  }
+
+  function getEntrySemanticLegend(entry: HighlightOverlayEntry, style?: "primary" | "warn") {
+    const accent = `#${pickHighlightMaterial(style).color.getHexString()}`;
+    const ifcClass = String(entry.ifcClass ?? "IfcElement").toUpperCase();
+    if (ifcClass === "IFCDOOR") {
+      return [
+        { color: accent, label: "target" },
+        { color: "#60a5fa", label: "hinge" },
+        { color: "#34d399", label: "latch" },
+        { color: "#f97316", label: "swing" },
+      ];
     }
-    originalMaterialByMeshUuid.clear();
+    if (ifcClass === "IFCRAMP") {
+      return [
+        { color: accent, label: "target" },
+        { color: "#f97316", label: "slope axis" },
+        { color: "#22d3ee", label: "landing edge" },
+      ];
+    }
+    if (ifcClass === "IFCSTAIR" || ifcClass === "IFCSTAIRFLIGHT") {
+      return [
+        { color: accent, label: "target" },
+        { color: "#f97316", label: "run axis" },
+      ];
+    }
+    return [{ color: accent, label: "target" }];
+  }
+
+  function getEntrySemanticLegendMeaning(entry: HighlightOverlayEntry, style?: "primary" | "warn") {
+    const legend = getEntrySemanticLegend(entry, style);
+    const map: Record<string, string> = {
+      target: "Highlighted target footprint, fill, and target emphasis",
+      hinge: "Hinge side marker",
+      latch: "Latch side marker",
+      swing: "Door swing direction and swing arc",
+      "slope axis": "Ramp run direction used to reason about slope and incline",
+      "landing edge": "Ramp transition or landing edge marker",
+      "run axis": "Primary stair run direction marker",
+    };
+    return legend.map((item) => ({ color: item.color, meaning: map[item.label] ?? item.label }));
+  }
+
+  function buildHighlightHudModel(entry: HighlightOverlayEntry, style?: "primary" | "warn") {
+    const sizeRef = getEntrySizeReference(entry);
+    const objectId = activeHighlightState ? `${activeHighlightState.modelId}:${entry.localId}` : `${entry.localId}`;
+    const accent = `#${pickHighlightMaterial(style).color.getHexString()}`;
+    return {
+      accent,
+      title: `${String(entry.ifcClass ?? "Element").toUpperCase()} ${objectId}`,
+      dimensions: `W ${sizeRef.width.toFixed(3)} m   D ${sizeRef.depth.toFixed(3)} m   H ${sizeRef.height.toFixed(3)} m`,
+      legend: getEntrySemanticLegend(entry, style),
+      sizeReference: sizeRef,
+    };
+  }
+
+  function renderHighlightHudDom(entry: HighlightOverlayEntry, style?: "primary" | "warn") {
+    const hud = buildHighlightHudModel(entry, style);
+    const legendHtml = hud.legend.length > 1
+      ? hud.legend
+      .map(
+        (item) =>
+          `<span style="display:inline-flex;align-items:center;gap:6px;margin-right:12px;font-size:12px;text-transform:uppercase;letter-spacing:0.05em;">` +
+          `<span style="display:inline-block;width:10px;height:10px;border-radius:999px;background:${item.color};box-shadow:0 0 0 1px rgba(255,255,255,0.15) inset;"></span>` +
+          `${item.label}</span>`
+      )
+      .join("")
+      : "";
+    highlightHudEl.style.borderColor = hud.accent;
+    highlightHudEl.innerHTML =
+      `<div style="font-size:15px;font-weight:800;letter-spacing:0.04em;text-transform:uppercase;margin-bottom:6px;">${hud.title}</div>` +
+      `<div style="font-size:14px;font-weight:700;margin-bottom:8px;">${hud.dimensions}</div>` +
+      (legendHtml ? `<div style="font-size:11px;opacity:0.9;">${legendHtml}</div>` : "");
+    highlightHudEl.style.display = "block";
+  }
+
+  function getHorizontalAxes(box: THREE.Box3) {
+    const upAxis = getUpAxis();
+    const size = box.getSize(new THREE.Vector3());
+    const vertical = upAxis === "y" ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(0, 0, 1);
+    const horizontalAxes =
+      upAxis === "y"
+        ? [
+            { axis: new THREE.Vector3(1, 0, 0), size: size.x },
+            { axis: new THREE.Vector3(0, 0, 1), size: size.z },
+          ]
+        : [
+            { axis: new THREE.Vector3(1, 0, 0), size: size.x },
+            { axis: new THREE.Vector3(0, 1, 0), size: size.y },
+          ];
+    horizontalAxes.sort((a, b) => b.size - a.size);
+    return {
+      vertical,
+      majorAxis: horizontalAxes[0]?.axis ?? new THREE.Vector3(1, 0, 0),
+      majorSize: horizontalAxes[0]?.size ?? 0,
+      minorAxis: horizontalAxes[1]?.axis ?? new THREE.Vector3(0, 0, 1),
+      minorSize: horizontalAxes[1]?.size ?? 0,
+      verticalSize: upAxis === "y" ? size.y : size.z,
+    };
+  }
+
+  function getCameraOverlayBias(distance = 0.035) {
+    const dir = new THREE.Vector3();
+    world.camera.three.getWorldDirection(dir);
+    return dir.multiplyScalar(-distance);
+  }
+
+  function inferDoorAnnotation(props: Record<string, any> | null) {
+    const raw =
+      [
+        props?.OperationType,
+        props?.operationType,
+        props?.UserDefinedOperationType,
+        props?.OverallOperationType,
+        props?.Name,
+      ]
+        .filter((v) => typeof v === "string" && v.trim())
+        .join(" ")
+        .toUpperCase();
+
+    const hingeSide =
+      raw.includes("RIGHT")
+        ? "right"
+        : raw.includes("LEFT")
+          ? "left"
+          : "left";
+    const swingSide =
+      raw.includes("REVERSE") || raw.includes("OUT") || raw.includes("OUTSWING")
+        ? "reverse"
+        : "forward";
+
+    return { hingeSide, swingSide, raw };
+  }
+
+  function buildDoorClearanceFocusBox(entry: HighlightOverlayEntry): THREE.Box3 {
+    const union = entry.merged.clone();
+    const center = union.getCenter(new THREE.Vector3());
+    const { vertical, majorAxis, majorSize, minorAxis, minorSize, verticalSize } = getHorizontalAxes(union);
+    const { hingeSide, swingSide } = inferDoorAnnotation(entry.props);
+    const hingeSign = hingeSide === "right" ? 1 : -1;
+    const swingSign = swingSide === "reverse" ? -1 : 1;
+    const pushDir = minorAxis.clone().normalize().multiplyScalar(swingSign);
+    const pullDir = pushDir.clone().multiplyScalar(-1);
+    const latchDir = majorAxis.clone().normalize().multiplyScalar(-hingeSign);
+
+    const addPoint = (base: THREE.Vector3) => union.expandByPoint(base);
+    const halfWidth = Math.max(majorSize * 0.5, 0.25);
+    const halfDepth = Math.max(minorSize * 0.5, 0.05);
+    const halfHeight = Math.max(verticalSize * 0.5, 0.1);
+    const baseCorners = [
+      center.clone().addScaledVector(majorAxis, halfWidth).addScaledVector(minorAxis, halfDepth),
+      center.clone().addScaledVector(majorAxis, halfWidth).addScaledVector(minorAxis, -halfDepth),
+      center.clone().addScaledVector(majorAxis, -halfWidth).addScaledVector(minorAxis, halfDepth),
+      center.clone().addScaledVector(majorAxis, -halfWidth).addScaledVector(minorAxis, -halfDepth),
+    ];
+    for (const corner of baseCorners) {
+      addPoint(corner.clone().addScaledVector(pushDir, DOOR_CLEARANCE_DEFAULTS.pushSideDepthMeters));
+      addPoint(corner.clone().addScaledVector(pullDir, DOOR_CLEARANCE_DEFAULTS.pullSideDepthMeters));
+      addPoint(corner.clone().addScaledVector(latchDir, DOOR_CLEARANCE_DEFAULTS.latchSideMeters));
+      addPoint(corner.clone().addScaledVector(vertical, halfHeight * 0.15));
+    }
+
+    union.expandByScalar(0.06);
+    return union;
+  }
+
+  function buildCenteredTopPoseFromBox(box: THREE.Box3, currentPose: CameraPose): CameraPose | null {
+    if (!box || box.isEmpty()) return null;
+    const center = box.getCenter(new THREE.Vector3());
+    const upAxis = getUpAxis();
+    if (upAxis === "y") {
+      const height = Math.max(0.5, Math.abs(currentPose.eye.y - currentPose.target.y));
+      return {
+        eye: { x: center.x, y: center.y + height, z: center.z },
+        target: { x: center.x, y: center.y, z: center.z },
+      };
+    }
+
+    const height = Math.max(0.5, Math.abs(currentPose.eye.z - currentPose.target.z));
+    return {
+      eye: { x: center.x, y: center.y, z: center.z + height },
+      target: { x: center.x, y: center.y, z: center.z },
+    };
+  }
+
+  function boxVolume(box: THREE.Box3 | null | undefined) {
+    if (!box || !box.isBox3 || box.isEmpty()) return 0;
+    const size = box.getSize(new THREE.Vector3());
+    return Math.max(0, size.x) * Math.max(0, size.y) * Math.max(0, size.z);
+  }
+
+  function updateHighlightHud(entry?: HighlightOverlayEntry | null, style?: "primary" | "warn") {
+    clearHighlightHud();
+    if (!entry) return;
+    renderHighlightHudDom(entry, style);
+  }
+
+  function getHighlightAnnotationContext() {
+    const style = activeHighlightState?.style ?? "primary";
+    const topDown = isTopDownOverlayView();
+    const primaryClass = activeHighlightState?.entries[0]?.ifcClass ?? null;
+    const activeEntry = activeHighlightState?.entries.length === 1 ? activeHighlightState.entries[0] : undefined;
+    const sizeReference = activeHighlightState?.entries.length === 1 && activeHighlightState?.entries[0]
+      ? getEntrySizeReference(activeHighlightState.entries[0])
+      : undefined;
+    const legend = activeHighlightState?.entries.length === 1
+      ? getEntrySemanticLegendMeaning(activeHighlightState.entries[0], style)
+      : [];
+    const isDoor = String(primaryClass ?? "").toUpperCase() === "IFCDOOR";
+    const doorClearanceFocusBox = isDoor && activeEntry ? buildDoorClearanceFocusBox(activeEntry) : null;
+    const entryBoxVolume = activeEntry ? boxVolume(activeEntry.merged) : 0;
+    const focusBoxVolume = doorClearanceFocusBox ? boxVolume(doorClearanceFocusBox) : 0;
+    const doorClearanceReadiness = isDoor
+      ? {
+          measurableLikely: Boolean(
+            topDown &&
+            planCutState.enabled &&
+            sizeReference &&
+            activeHighlightState?.entries.length === 1 &&
+            focusBoxVolume > entryBoxVolume * 1.2
+          ),
+          missing: [
+            ...(topDown ? [] : ["top_view_alignment"]),
+            ...(planCutState.enabled ? [] : ["storey_plan_cut"]),
+            ...(sizeReference ? [] : ["size_reference"]),
+            ...(doorClearanceFocusBox ? [] : ["clearance_focus_box"]),
+          ],
+          evidenceBundle: {
+            needsTopMeasurementView: true,
+            needsContextConfirmView: true,
+            topMeasurementViewReady: Boolean(topDown && planCutState.enabled && doorClearanceFocusBox),
+            contextConfirmViewReady: Boolean(!topDown && sizeReference),
+          },
+          requiredZones: {
+            pullSideDepthMeters: DOOR_CLEARANCE_DEFAULTS.pullSideDepthMeters,
+            pushSideDepthMeters: DOOR_CLEARANCE_DEFAULTS.pushSideDepthMeters,
+            latchSideMeters: DOOR_CLEARANCE_DEFAULTS.latchSideMeters,
+          },
+          focusBox: doorClearanceFocusBox
+            ? {
+                min: { x: doorClearanceFocusBox.min.x, y: doorClearanceFocusBox.min.y, z: doorClearanceFocusBox.min.z },
+                max: { x: doorClearanceFocusBox.max.x, y: doorClearanceFocusBox.max.y, z: doorClearanceFocusBox.max.z },
+              }
+            : undefined,
+        }
+      : undefined;
+
+    return {
+      highlightAnnotations: {
+        mode: highlightAnnotationMode,
+        viewLayout: topDown ? "top_down" : "angled",
+        lineWidth: HIGHLIGHT_ANNOTATION_DEFAULTS.lineWidth,
+        highlightedIds: activeHighlightState
+          ? activeHighlightState.localIds.map((localId) => `${activeHighlightState!.modelId}:${localId}`)
+          : [],
+        primaryClass,
+        sizeReference,
+        sizeHudVisible: Boolean(sizeReference),
+        hudContents: activeHighlightState?.entries.length === 1
+          ? buildHighlightHudModel(activeHighlightState.entries[0], style)
+          : undefined,
+        legend,
+        ...(doorClearanceReadiness ? { doorClearanceReadiness } : {}),
+        note:
+          highlightAnnotationMode === "color_legend"
+            ? "The top HUD is rendered into snapshots with class, id, dimensions, and color legend."
+            : "On-image wording is enabled for visual reasoning, and the top HUD provides metric dimensions.",
+      },
+    } satisfies Record<string, unknown>;
+  }
+
+  async function composeSnapshotWithHud(imageBase64Png: string): Promise<string> {
+    const entry = activeHighlightState?.entries.length === 1 ? activeHighlightState.entries[0] : null;
+    if (!entry) return imageBase64Png;
+
+    const hud = buildHighlightHudModel(entry, activeHighlightState?.style);
+    const dataUrl = `data:image/png;base64,${imageBase64Png}`;
+    const image = new Image();
+    image.decoding = "async";
+    await new Promise<void>((resolve, reject) => {
+      image.onload = () => resolve();
+      image.onerror = () => reject(new Error("hud-image-load-failed"));
+      image.src = dataUrl;
+    });
+
+    const canvas = document.createElement("canvas");
+    canvas.width = image.width;
+    canvas.height = image.height;
+    const ctx2d = canvas.getContext("2d");
+    if (!ctx2d) return imageBase64Png;
+
+    ctx2d.drawImage(image, 0, 0);
+
+    const panelWidth = Math.min(canvas.width - 24, Math.max(420, canvas.width * 0.48));
+    const hasLegend = hud.legend.length > 1;
+    const panelHeight = hasLegend ? 88 : 62;
+    const x = Math.round((canvas.width - panelWidth) / 2);
+    const y = 14;
+    const radius = 16;
+
+    ctx2d.fillStyle = "rgba(7, 10, 20, 0.9)";
+    ctx2d.strokeStyle = hud.accent;
+    ctx2d.lineWidth = 3;
+    ctx2d.beginPath();
+    ctx2d.moveTo(x + radius, y);
+    ctx2d.lineTo(x + panelWidth - radius, y);
+    ctx2d.quadraticCurveTo(x + panelWidth, y, x + panelWidth, y + radius);
+    ctx2d.lineTo(x + panelWidth, y + panelHeight - radius);
+    ctx2d.quadraticCurveTo(x + panelWidth, y + panelHeight, x + panelWidth - radius, y + panelHeight);
+    ctx2d.lineTo(x + radius, y + panelHeight);
+    ctx2d.quadraticCurveTo(x, y + panelHeight, x, y + panelHeight - radius);
+    ctx2d.lineTo(x, y + radius);
+    ctx2d.quadraticCurveTo(x, y, x + radius, y);
+    ctx2d.closePath();
+    ctx2d.fill();
+    ctx2d.stroke();
+
+    ctx2d.fillStyle = "#f8fafc";
+    ctx2d.textAlign = "center";
+    ctx2d.textBaseline = "middle";
+    ctx2d.font = "bold 20px sans-serif";
+    ctx2d.fillText(hud.title, x + panelWidth / 2, y + 22);
+    ctx2d.font = "600 16px sans-serif";
+    ctx2d.fillText(hud.dimensions, x + panelWidth / 2, y + 46);
+
+    if (hasLegend) {
+      const legendY = y + 69;
+      const itemSpacing = panelWidth / (hud.legend.length + 1);
+      hud.legend.forEach((item, index) => {
+        const itemX = x + itemSpacing * (index + 1);
+        ctx2d.fillStyle = item.color;
+        ctx2d.beginPath();
+        ctx2d.arc(itemX - 28, legendY, 5, 0, Math.PI * 2);
+        ctx2d.fill();
+        ctx2d.fillStyle = "#f8fafc";
+        ctx2d.font = "600 12px sans-serif";
+        ctx2d.fillText(item.label.toUpperCase(), itemX + 10, legendY);
+      });
+    }
+
+    const out = canvas.toDataURL("image/png");
+    return out.startsWith("data:image/") ? (out.split(",")[1] ?? imageBase64Png) : out;
+  }
+
+  function drawLinearGuide(
+    start: THREE.Vector3,
+    end: THREE.Vector3,
+    color: number,
+    label?: string,
+    labelOffset?: THREE.Vector3,
+  ) {
+    const geometry = new THREE.BufferGeometry().setFromPoints([start, end]);
+    const line = new THREE.Line(
+      geometry,
+      createLineMaterial(color, 0.96)
+    );
+    line.renderOrder = 980;
+    semanticOverlayRoot.add(line);
+
+    const dir = end.clone().sub(start);
+    const len = dir.length();
+    if (len > 1e-5) {
+      const arrow = new THREE.ArrowHelper(
+        dir.clone().normalize(),
+        start.clone(),
+        len,
+        color,
+        Math.max(0.04, len * 0.18),
+        Math.max(0.02, len * 0.09)
+      );
+      arrow.renderOrder = 981;
+      arrow.traverse((child: any) => {
+        child.renderOrder = 981;
+        if (child.material) {
+          child.material.depthTest = false;
+          child.material.depthWrite = false;
+          child.material.transparent = true;
+        }
+      });
+      semanticOverlayRoot.add(arrow);
+    }
+
+    if (label && highlightAnnotationMode === "worded") {
+      const labelPos = start.clone().lerp(end, 0.5).add(labelOffset ?? new THREE.Vector3(0, 0.15, 0));
+      addBadge(label, labelPos, color, 0.55);
+    }
+  }
+
+  function addMeshHighlightFill(meshes: THREE.Object3D[], style?: "primary" | "warn") {
+    const baseMaterial = pickHighlightMaterial(style);
+    for (const mesh of meshes) {
+      const anyMesh: any = mesh as any;
+      if (!anyMesh?.isMesh || !anyMesh.geometry) continue;
+
+      const overlayMat = new THREE.MeshBasicMaterial({
+        color: (baseMaterial.color?.getHex?.() ?? 0xffd54a),
+        transparent: true,
+        opacity: style === "warn" ? 0.24 : 0.14,
+        depthTest: false,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+        polygonOffset: true,
+        polygonOffsetFactor: -2,
+        polygonOffsetUnits: -2,
+      });
+
+      const clone = new THREE.Mesh(anyMesh.geometry, overlayMat);
+      clone.matrixAutoUpdate = false;
+      clone.matrix.copy(anyMesh.matrixWorld);
+      clone.matrixWorld.copy(anyMesh.matrixWorld);
+      clone.frustumCulled = false;
+      clone.renderOrder = 800;
+      highlightFillRoot.add(clone);
+    }
+  }
+
+  function renderHighlightOverlayEntries(entries: HighlightOverlayEntry[], style?: "primary" | "warn") {
+    clearAllHighlightOverlays();
+    const color = pickHighlightMaterial(style).color.getHex();
+    updateHighlightHud(entries.length === 1 ? entries[0] : null, style);
+
+    for (const entry of entries) {
+      if (entry.meshes.length) addMeshHighlightFill(entry.meshes, style);
+      if (entry.merged.isEmpty()) continue;
+
+      const helper = new THREE.Box3Helper(entry.merged, color);
+      semanticOverlayRoot.add(helper);
+      helper.renderOrder = 920;
+
+      drawGeneralSemanticOverlay(entry.merged, entry.ifcClass, color);
+      if (typeof entry.ifcClass === "string" && entry.ifcClass.toUpperCase() === "IFCDOOR") {
+        drawDoorSemanticOverlay(entry.merged, color, entry.props);
+      } else if (typeof entry.ifcClass === "string" && entry.ifcClass.toUpperCase() === "IFCRAMP") {
+        drawRampSemanticOverlay(entry.merged, color);
+      }
+    }
+  }
+
+  async function resolveHighlightOverlayEntries(
+    modelId: string,
+    localIds: number[],
+  ): Promise<HighlightOverlayEntry[]> {
+    const entries: HighlightOverlayEntry[] = [];
+    const uniqueIds = Array.from(new Set(localIds)).slice(0, 12);
+
+    for (const localId of uniqueIds) {
+      const boxes = await getBoxesForLocalIds(modelId, [localId]);
+      const meshes = await getMeshesForLocalIds(modelId, [localId]);
+      const ifcClass = await inferSemanticClass(modelId, localId);
+      const props = await getElementPropertiesSafe(modelId, localId);
+
+      const merged = new THREE.Box3();
+      for (const box of boxes) {
+        if (!box.isEmpty()) merged.union(box);
+      }
+      for (const mesh of meshes) {
+        const meshBox = new THREE.Box3().setFromObject(mesh);
+        if (!meshBox.isEmpty()) merged.union(meshBox);
+      }
+      if (merged.isEmpty()) continue;
+
+      entries.push({ localId, boxes, meshes, merged, ifcClass, props });
+    }
+
+    return entries;
+  }
+
+  function scheduleHighlightOverlayRefresh() {
+    if (highlightRefreshScheduled) return;
+    highlightRefreshScheduled = true;
+    requestAnimationFrame(() => {
+      highlightRefreshScheduled = false;
+      if (!activeHighlightState) return;
+      renderHighlightOverlayEntries(activeHighlightState.entries, activeHighlightState.style);
+    });
+  }
+
+  async function inferSemanticClass(modelId: string, localId: number): Promise<string | null> {
+    const key = `${modelId}:${localId}`;
+    const cached = semanticClassByObjectId.get(key);
+    if (cached) return cached;
+
+    let ifcClass: string | null = null;
+    try {
+      const props = await getElementPropertiesSafe(modelId, localId);
+      const raw =
+        (props as any)?.type ??
+        (props as any)?.ifcType ??
+        (props as any)?.ifcClass ??
+        (props as any)?.className ??
+        null;
+      if (typeof raw === "string" && raw.trim()) ifcClass = raw.trim();
+    } catch {
+      // ignore: fallback below
+    }
+
+    if (!ifcClass) {
+      const listAny: any = (fragments as any).list;
+      const group = typeof listAny?.get === "function" ? listAny.get(modelId) : listAny?.[modelId];
+      if (group?.getItemsOfCategories) {
+        for (const candidate of ["IFCDOOR", "IFCRAMP", "IFCSTAIR", "IFCSTAIRFLIGHT"]) {
+          try {
+            const out = await group.getItemsOfCategories([new RegExp(`^${candidate}$`, "i")]);
+            const ids = extractNumericIdsFromUnknown(out, candidate);
+            if (Array.isArray(ids) && ids.includes(localId)) {
+              ifcClass = candidate.replace(/^IFC/, "Ifc");
+              break;
+            }
+          } catch {
+            // ignore fallback failure
+          }
+        }
+      }
+    }
+
+    if (ifcClass) semanticClassByObjectId.set(key, ifcClass);
+    return ifcClass;
+  }
+
+  function drawGeneralSemanticOverlay(box: THREE.Box3, ifcClass: string | null, color: number) {
+    const center = box.getCenter(new THREE.Vector3());
+    const { vertical, majorAxis, majorSize, minorAxis, minorSize, verticalSize } = getHorizontalAxes(box);
+    const topDown = isTopDownOverlayView();
+    const calloutLift = Math.max(0.36, verticalSize * 0.9);
+    const sideOffset = majorAxis.clone().multiplyScalar(Math.max(0.55, majorSize * 0.9));
+    const badgeAnchor = topDown
+      ? center.clone().add(sideOffset).addScaledVector(vertical, Math.max(0.08, verticalSize * 0.18))
+      : center.clone().addScaledVector(vertical, calloutLift);
+    const scaleBoost = HIGHLIGHT_ANNOTATION_DEFAULTS.generalMarkerScale;
+    const highlightRadius = Math.max(0.18, Math.max(majorSize, minorSize) * 0.52 * scaleBoost);
+
+    const crosshairMajor = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([
+        center.clone().addScaledVector(majorAxis, -highlightRadius),
+        center.clone().addScaledVector(majorAxis, highlightRadius),
+      ]),
+      createLineMaterial(color, 0.82)
+    );
+    crosshairMajor.renderOrder = 911;
+    semanticOverlayRoot.add(crosshairMajor);
+
+    const crosshairMinor = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([
+        center.clone().addScaledVector(minorAxis, -highlightRadius),
+        center.clone().addScaledVector(minorAxis, highlightRadius),
+      ]),
+      createLineMaterial(color, 0.82)
+    );
+    crosshairMinor.renderOrder = 911;
+    semanticOverlayRoot.add(crosshairMinor);
+
+    if (topDown && highlightAnnotationMode === "worded") {
+      const leaderStart = center.clone().addScaledVector(majorAxis, highlightRadius * 0.8);
+      const leaderEnd = badgeAnchor.clone().addScaledVector(majorAxis, -0.3);
+      const leader = new THREE.Line(
+        new THREE.BufferGeometry().setFromPoints([leaderStart, leaderEnd]),
+        createLineMaterial(color, 0.88)
+      );
+      leader.renderOrder = 912;
+      semanticOverlayRoot.add(leader);
+    }
+
+    if (highlightAnnotationMode === "worded") {
+      addBadge(`TARGET ${String(ifcClass ?? "ELEMENT").toUpperCase()}`, badgeAnchor, color, topDown ? 0.78 : 0.92);
+    }
+  }
+
+  function drawDoorSemanticOverlay(
+    box: THREE.Box3,
+    color: number,
+    props: Record<string, any> | null,
+  ) {
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const { vertical, majorAxis, majorSize, minorAxis, minorSize, verticalSize } = getHorizontalAxes(box);
+    const topDown = isTopDownOverlayView();
+    const doorWidth = Math.max(majorSize, 0.25);
+    const doorDepth = Math.max(minorSize, 0.08);
+    const { hingeSide, swingSide } = inferDoorAnnotation(props);
+    const hingeSign = hingeSide === "right" ? 1 : -1;
+    const swingSign = swingSide === "reverse" ? -1 : 1;
+    const hinge = center.clone().addScaledVector(majorAxis, hingeSign * doorWidth * 0.5);
+    const latch = center.clone().addScaledVector(majorAxis, -hingeSign * doorWidth * 0.5);
+    const lift = vertical.clone().multiplyScalar(Math.max(0.06, verticalSize * 0.08));
+    const cameraBias = getCameraOverlayBias(Math.max(HIGHLIGHT_ANNOTATION_DEFAULTS.cameraOverlayBias, doorDepth * 0.45));
+    const swingDir = minorAxis.clone().normalize().multiplyScalar(swingSign);
+    const openTip = hinge.clone()
+      .addScaledVector(swingDir, Math.max(doorWidth * 0.7, doorDepth * 1.6))
+      .addScaledVector(majorAxis, -hingeSign * doorWidth * 0.1)
+      .add(cameraBias);
+
+    const markerRadius = topDown
+      ? Math.max(HIGHLIGHT_ANNOTATION_DEFAULTS.doorMarkerRadiusTop, Math.max(doorDepth, doorWidth * 0.14))
+      : Math.max(HIGHLIGHT_ANNOTATION_DEFAULTS.doorMarkerRadius, Math.min(size.x, size.y, size.z) * 0.12);
+    const hingeMarker = new THREE.Mesh(
+      new THREE.SphereGeometry(markerRadius, 16, 16),
+      new THREE.MeshBasicMaterial({ color: 0x60a5fa, depthTest: false, depthWrite: false })
+    );
+    hingeMarker.position.copy(hinge.clone().add(lift).add(cameraBias));
+    hingeMarker.renderOrder = 950;
+    semanticOverlayRoot.add(hingeMarker);
+
+    const latchMarker = new THREE.Mesh(
+      new THREE.SphereGeometry(markerRadius, 16, 16),
+      new THREE.MeshBasicMaterial({ color: 0x34d399, depthTest: false, depthWrite: false })
+    );
+    latchMarker.position.copy(latch.clone().add(lift).add(cameraBias));
+    latchMarker.renderOrder = 950;
+    semanticOverlayRoot.add(latchMarker);
+
+    if (highlightAnnotationMode === "worded") {
+      const sideOffset = majorAxis.clone().multiplyScalar(doorWidth * 0.18);
+      const hingeBadgePos = topDown
+        ? center.clone()
+            .addScaledVector(majorAxis, -Math.max(0.55, doorWidth * 0.95))
+            .addScaledVector(minorAxis, Math.max(0.32, doorDepth * 2.4))
+            .addScaledVector(vertical, Math.max(0.06, verticalSize * 0.12))
+        : hinge.clone().add(lift).add(cameraBias).addScaledVector(vertical, 0.18).add(sideOffset);
+      addBadge(
+        hingeSide === "right" ? "HINGE RIGHT" : "HINGE LEFT",
+        hingeBadgePos,
+        0x60a5fa,
+        topDown ? 0.46 : 0.5
+      );
+    }
+    drawLinearGuide(
+      hinge.clone().add(lift).add(cameraBias),
+      openTip.clone().add(lift).add(cameraBias),
+      0xf97316,
+      "SWING",
+      topDown
+        ? swingDir.clone().multiplyScalar(0.3).add(majorAxis.clone().multiplyScalar(-0.22))
+        : vertical.clone().multiplyScalar(-0.2).add(swingDir.clone().multiplyScalar(0.12)),
+    );
+
+    const arcRadius = Math.max(doorWidth * 0.72, 0.2);
+    const arcPoints: THREE.Vector3[] = [];
+    const stepCount = 20;
+    for (let i = 0; i <= stepCount; i++) {
+      const t = i / stepCount;
+      const theta = t * (Math.PI / 2);
+      const closedDir = majorAxis.clone().multiplyScalar(-hingeSign * Math.cos(theta) * arcRadius);
+      const swingOffset = minorAxis.clone().multiplyScalar(swingSign * Math.sin(theta) * arcRadius);
+      const point = hinge.clone().add(closedDir).add(swingOffset).add(lift).add(cameraBias);
+      arcPoints.push(point);
+    }
+    const arc = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(arcPoints),
+      createLineMaterial(0xf97316, 0.95)
+    );
+    arc.renderOrder = 930;
+    semanticOverlayRoot.add(arc);
+  }
+
+  function drawRampSemanticOverlay(box: THREE.Box3, color: number) {
+    const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const { vertical, majorAxis, majorSize, minorAxis, minorSize, verticalSize } = getHorizontalAxes(box);
+    const lift = vertical.clone().multiplyScalar(Math.max(0.06, verticalSize * 0.06));
+    const cameraBias = getCameraOverlayBias(Math.max(HIGHLIGHT_ANNOTATION_DEFAULTS.cameraOverlayBias, Math.min(majorSize, minorSize) * 0.2));
+    const halfRun = Math.max(majorSize * 0.45, 0.2);
+    const start = center.clone().addScaledVector(majorAxis, -halfRun).add(lift).add(cameraBias);
+    const end = center.clone().addScaledVector(majorAxis, halfRun).add(lift).add(cameraBias);
+    drawLinearGuide(
+      start,
+      end,
+      0xf97316,
+      "SLOPE AXIS",
+      isTopDownOverlayView()
+        ? minorAxis.clone().multiplyScalar(Math.max(0.14, minorSize * 0.35))
+        : vertical.clone().multiplyScalar(0.12)
+    );
+
+    const landingRadius = Math.max(0.045, Math.min(majorSize, minorSize, verticalSize) * 0.18, 0.06);
+    for (const pos of [start, end]) {
+      const marker = new THREE.Mesh(
+        new THREE.SphereGeometry(landingRadius, 16, 16),
+        new THREE.MeshBasicMaterial({ color: 0x22d3ee, depthTest: false, depthWrite: false })
+      );
+      marker.position.copy(pos);
+      marker.renderOrder = 950;
+      semanticOverlayRoot.add(marker);
+    }
+  }
+
+  async function drawSemanticHighlightOverlays(modelId: string, localIds: number[], style?: "primary" | "warn") {
+    const entries = await resolveHighlightOverlayEntries(modelId, localIds);
+    activeHighlightState = { modelId, localIds: [...localIds], style, entries };
+    renderHighlightOverlayEntries(entries, style);
   }
 
   function buildModelIdMapFromObjectIds(objectIds: string[]): OBC.ModelIdMap {
@@ -359,8 +1314,15 @@ function normalizeIfcCategory(raw: string): string {
 
 // Plan cut state
 let planCutState:
-  | { enabled: false }
-  | { enabled: true; planes: THREE.Plane[] } = { enabled: false };
+  | { enabled: false; planes: [] }
+  | {
+      enabled: true;
+      planes: THREE.Plane[];
+      absoluteHeight: number;
+      mode: "WORLD_UP" | "CAMERA";
+      source?: "relative" | "absolute" | "highlight-top";
+      storeyId?: string;
+    } = { enabled: false, planes: [] };
 
 type SavedMatState = {
   side: number;
@@ -443,6 +1405,15 @@ function getUpAxis(): "y" | "z" {
   return "y";
 }
 
+function isTopDownOverlayView() {
+  const cam = world.camera.three;
+  const upAxis = getUpAxis();
+  const forward = new THREE.Vector3();
+  cam.getWorldDirection(forward);
+  const verticalAbs = upAxis === "y" ? Math.abs(forward.y) : Math.abs(forward.z);
+  return verticalAbs > 0.9;
+}
+
 /**
  * Wait for camera controls to finish moving.  
  */
@@ -465,6 +1436,9 @@ function waitForControlsRest(timeoutMs = 1200): Promise<void> {
     window.setTimeout(() => onRest(), timeoutMs);
   });
 }
+
+  world.camera.controls?.addEventListener?.("update", scheduleHighlightOverlayRefresh);
+  world.camera.controls?.addEventListener?.("rest", scheduleHighlightOverlayRefresh);
 
 /**
  * Stabilize the scene for snapshot capture: 
@@ -696,7 +1670,17 @@ function debugDescribeOut(out: any) {
     },
 
     renderNow() {
+      scheduleHighlightOverlayRefresh();
       world.renderer.three.render(world.scene.three, world.camera.three);
+    },
+
+    setHighlightAnnotationMode(mode: HighlightAnnotationMode) {
+      highlightAnnotationMode = mode;
+      scheduleHighlightOverlayRefresh();
+    },
+
+    getHighlightAnnotationMode() {
+      return highlightAnnotationMode;
     },
 
     getLastSelection(): OBC.ModelIdMap | null {
@@ -734,6 +1718,7 @@ function debugDescribeOut(out: any) {
 
         // Reset visibility state
         visibilityState = { mode: "all", lastIsolateCount: undefined };
+        await clearActiveHighlightState();
 
         // Optional: emit event so UI modules can react
         viewerEvents.emit("modelUnloaded", {});
@@ -774,6 +1759,23 @@ function debugDescribeOut(out: any) {
      * - Used for: controlled experiments OR a fallback if user pose is too occluded.
      */
     async setPresetView(preset: StartPosePreset, smooth = true) {
+      if (preset === "top" && activeHighlightState?.entries.length) {
+        const currentPose = await this.getCameraPose();
+        const union = new THREE.Box3();
+        let hasBox = false;
+        for (const entry of activeHighlightState.entries) {
+          if (!entry?.merged || entry.merged.isEmpty()) continue;
+          union.union(entry.merged);
+          hasBox = true;
+        }
+        if (hasBox && !union.isEmpty()) {
+          const centeredTop = buildCenteredTopPoseFromBox(union, currentPose);
+          if (centeredTop) {
+            await this.setCameraPose(centeredTop, smooth);
+            return;
+          }
+        }
+      }
       const pose = getPresetPose(preset);
       if (!pose) return;
       await this.setCameraPose(pose, smooth);
@@ -793,6 +1795,7 @@ async isolate(map: OBC.ModelIdMap) {
 
   await hider.set(true);
   await hider.isolate(map);
+  await clearActiveHighlightState();
 
   // update visibility state for metadata/logging
   lastIsolateMap = cloneModelIdMap(map);
@@ -813,7 +1816,7 @@ async resetVisibility() {
   // ✅ clear plan cut too
   planCutState = { enabled: false, planes: [] }
   clearClippingPlanes();
-  clearSemanticOverlays();
+  await clearActiveHighlightState();
 
   fragments.core.update(true);
   world.renderer.three.render(world.scene.three, world.camera.three);
@@ -1000,9 +2003,17 @@ async isolateSpace(spaceId: string): Promise<OBC.ModelIdMap | null> {
 
 
 
-async setPlanCut(params: { height: number; thickness?: number; mode?: "WORLD_UP" | "CAMERA" }) {
-  const height = params.height;
-  if (!Number.isFinite(height)) return;
+async setPlanCut(params: {
+  height?: number;
+  absoluteHeight?: number;
+  thickness?: number;
+  mode?: "WORLD_UP" | "CAMERA";
+  source?: "relative" | "absolute" | "highlight-top";
+  storeyId?: string;
+}) {
+  const hasAbsoluteHeight = Number.isFinite(params.absoluteHeight);
+  const hasRelativeHeight = Number.isFinite(params.height);
+  if (!hasAbsoluteHeight && !hasRelativeHeight) return;
 
   const mode = params.mode ?? "WORLD_UP";
 
@@ -1025,7 +2036,7 @@ async setPlanCut(params: { height: number; thickness?: number; mode?: "WORLD_UP"
     base = upAxis === "y" ? pose.target.y : pose.target.z;
   }
 
-  let abs = base + height;
+  let abs = hasAbsoluteHeight ? Number(params.absoluteHeight) : base + Number(params.height);
 
   // Clamp inside model bounds so we never clip everything by accident
   const model = getActiveModel();
@@ -1091,13 +2102,20 @@ async setPlanCut(params: { height: number; thickness?: number; mode?: "WORLD_UP"
 
   const planes = [plane];
 
-  planCutState = { enabled: true, planes };
+  planCutState = {
+    enabled: true,
+    planes,
+    absoluteHeight: abs,
+    mode,
+    source: params.source ?? (hasAbsoluteHeight ? "absolute" : "relative"),
+    storeyId: params.storeyId,
+  };
   applyClippingPlanes(planes);
 
   fragments.core.update(true);
   world.renderer.three.render(world.scene.three, world.camera.three);
 
-  console.log("[PlanCut:Single]", { mode, upAxis, base, height, abs });
+  console.log("[PlanCut:Single]", { mode, upAxis, base, height: params.height, abs, source: planCutState.source, storeyId: params.storeyId });
 },
 
 
@@ -1114,19 +2132,24 @@ async setStoreyPlanCut(params: {
 }) {
   const storeyId = params.storeyId;
   const mode = params.mode ?? "WORLD_UP";
+  const levels = (ctx as any).classifier?.list?.get?.("Levels");
+  const entry = levels?.get?.(String(storeyId));
+  const map = entry?.get ? await entry.get() : null;
+  const highlightedIds = getActiveHighlightObjectIds();
+  const highlightedMap = highlightedIds.length ? buildModelIdMapFromObjectIds(highlightedIds) : null;
+  const highlightBox = highlightedMap ? await this.getSelectionWorldBox(highlightedMap) : null;
+  const box = map ? await this.getSelectionWorldBox(map) : null;
+  const upAxis = getUpAxis();
+  let abs: number | null = null;
 
-  // 1) isolate storey to get its map
-  const map = await this.isolateStorey(storeyId);
-  if (!map) {
-    console.warn("[setStoreyPlanCut] could not isolate storey", storeyId);
-    return;
+  if (highlightBox && !highlightBox.isEmpty()) {
+    const highlightTop = upAxis === "y" ? highlightBox.max.y : highlightBox.max.z;
+    const highlightMin = upAxis === "y" ? highlightBox.min.y : highlightBox.min.z;
+    const height = Math.max(0.02, highlightTop - highlightMin);
+    abs = highlightTop + Math.max(0.01, height * 0.02);
   }
 
-  // 2) get storey bounding box
-  const box = await this.getSelectionWorldBox(map);
-  const upAxis = getUpAxis();
-
-  if (box && !box.isEmpty()) {
+  if (abs == null && box && !box.isEmpty()) {
     const minH = upAxis === "y" ? box.min.y : box.min.z;
     const maxH = upAxis === "y" ? box.max.y : box.max.z;
     const storeyHeight = maxH - minH;
@@ -1137,15 +2160,27 @@ async setStoreyPlanCut(params: {
     if (storeyHeight < 3.0 || offset > storeyHeight * 0.8) {
       offset = storeyHeight * 0.4;
     }
-    // Use internal setPlanCut with the calculated offset
-    // setPlanCut adds offset to base (which will be the storey's bounding box min)
-    await this.setPlanCut({ height: offset, mode });
-  } else {
-    // Fallback: just use 1.2 m from camera target
-    await this.setPlanCut({ height: params.offsetFromFloor ?? 1.2, mode });
+    abs = minH + offset;
   }
 
-  console.log("[setStoreyPlanCut]", { storeyId, mode });
+  if (abs == null) {
+    const pose = await this.getCameraPose();
+    abs = (upAxis === "y" ? pose.target.y : pose.target.z) + (params.offsetFromFloor ?? 1.2);
+  }
+
+  await restoreFullModelVisibilityPreserveHighlight();
+  await this.setPlanCut({
+    absoluteHeight: abs,
+    mode,
+    source: highlightBox && !highlightBox.isEmpty() ? "highlight-top" : "absolute",
+    storeyId,
+  });
+
+  if (highlightedIds.length) {
+    await this.highlightIds(highlightedIds, "primary");
+  }
+
+  console.log("[setStoreyPlanCut]", { storeyId, mode, absoluteHeight: abs, highlightedIds: highlightedIds.length });
 },
 
 async clearPlanCut() {
@@ -1157,8 +2192,15 @@ async clearPlanCut() {
 
 getPlanCutState() {
   return planCutState.enabled
-    ? { enabled: true, planes: planCutState.planes.length }
-    : { enabled: false };
+    ? {
+        enabled: true,
+        planes: planCutState.planes.length,
+        absoluteHeight: planCutState.absoluteHeight,
+        mode: planCutState.mode,
+        source: planCutState.source,
+        storeyId: planCutState.storeyId,
+      }
+    : { enabled: false, planes: 0 };
 },
 
 
@@ -1288,11 +2330,18 @@ async highlightIds(ids: string[], style?: "primary" | "warn") {
   if (!modelId) return;
 
   const group = getActiveGroupAny();
-  if (!group) return;
+  const controller = findHighlightController(getComponentsAny());
+  if (!group && !controller) return;
 
   // reset previous highlights
-  if (typeof group.resetHighlight === "function") {
-    group.resetHighlight();
+  try {
+    if (controller && typeof controller.resetHighlight === "function") {
+      await controller.resetHighlight();
+    } else if (group && typeof group.resetHighlight === "function") {
+      await group.resetHighlight();
+    }
+  } catch {
+    // no-op
   }
 
   // Convert objectIds to local numeric ids
@@ -1304,22 +2353,46 @@ async highlightIds(ids: string[], style?: "primary" | "warn") {
     localIds.push(parsed.localId);
   }
   if (!localIds.length) {
-    clearSemanticOverlays();
+    activeHighlightState = null;
+    clearAllHighlightOverlays();
     return;
   }
 
-  // Best effort: group.highlight(ids, materialOrStyle?)
-  // We keep it deterministic: same style string passed through if supported.
-  if (typeof group.highlight === "function") {
+  const map = buildModelIdMapFromObjectIds(ids);
+  const baseMaterial = pickHighlightMaterial(style);
+  const highlightDefinition: any = {
+    color: baseMaterial.color.clone(),
+    renderedFaces: 1,
+    opacity: Math.max(0.4, Math.min(0.92, baseMaterial.opacity ?? 0.82)),
+    transparent: true,
+    depthTest: false,
+    customId: `semantic-highlight-${style ?? "primary"}`,
+  };
+
+  let nativeHighlightApplied = false;
+  if (controller && typeof controller.highlight === "function") {
     try {
-      group.highlight(localIds, { style: style ?? "primary" });
+      await controller.highlight(highlightDefinition, map);
+      nativeHighlightApplied = true;
     } catch {
-      // many versions accept just ids
-      group.highlight(localIds);
+      nativeHighlightApplied = false;
+    }
+  }
+
+  if (!nativeHighlightApplied && group && typeof group.highlight === "function") {
+    try {
+      await group.highlight(localIds, highlightDefinition);
+    } catch {
+      try {
+        await group.highlight(localIds);
+      } catch {
+        // overlay fallback below still runs
+      }
     }
   }
 
   await drawSemanticHighlightOverlays(modelId, localIds, style);
+  await ensurePlanCutContainsActiveHighlight(this);
   
   fragments.core.update(true);
   world.renderer.three.render(world.scene.three, world.camera.three);
@@ -1329,9 +2402,7 @@ async highlightIds(ids: string[], style?: "primary" | "warn") {
 async pickObjectAt(x: number, y: number): Promise<string | null> {
   const modelId = getActiveModelId();
   if (!modelId) return null;
-
   const group = getActiveGroupAny();
-  if (!group) return null;
 
   const canvas = world.renderer.three.domElement;
   const rect = canvas.getBoundingClientRect();
@@ -1339,48 +2410,70 @@ async pickObjectAt(x: number, y: number): Promise<string | null> {
   // Convert to normalized device coords
   const nx = (x / rect.width) * 2 - 1;
   const ny = -(y / rect.height) * 2 + 1;
+  const ndc = new THREE.Vector2(nx, ny);
 
-  // Prefer FragmentsGroup.raycast if available, but guard against version/signature mismatches.
-    if (typeof group.raycast === "function") {
-    try {
-      // Try both camera shapes used across runtime versions.
-      const hit =
-        group.raycast((world as any).camera, new THREE.Vector2(nx, ny)) ??
-        group.raycast(world.camera.three, new THREE.Vector2(nx, ny));
-      const ids =
-        (hit && (hit.ids ?? hit.items ?? hit.itemIds ?? hit.id)) ??
-        null;
-
-      const pickFirstNumber = (v: any): number | null => {
-        if (typeof v === "number" && isFinite(v)) return v;
-        if (Array.isArray(v)) {
-          const n = v.find((q) => typeof q === "number" && isFinite(q));
-          return n ?? null;
-        }
-        if (v instanceof Set) {
-          for (const q of v) if (typeof q === "number" && isFinite(q)) return q;
-        }
-        return null;
-      };
-
-      const localId = pickFirstNumber(ids) ?? pickFirstNumber(hit?.item) ?? pickFirstNumber(hit?.localId);
-      if (localId != null) {
-        const objectId = `${modelId}:${localId}`;
-        lastPickedObjectId = objectId;
-        return objectId;
+  const resolveThreeCamera = (): THREE.Camera | null => {
+    const candidates: any[] = [
+      (world as any)?.camera?.three,
+      (world as any)?.camera?.camera,
+      (world as any)?.camera?.controls?.camera,
+    ];
+    for (const c of candidates) {
+      if (!c) continue;
+      if (c.isCamera === true) return c as THREE.Camera;
+      if (typeof c.updateProjectionMatrix === "function" && c.matrixWorld && c.projectionMatrix) {
+        return c as THREE.Camera;
       }
-    } catch (err) {
-      console.warn("[viewerApi] group.raycast failed; falling back to THREE.Raycaster", err);
     }
-  }
+    return null;
+  };
 
-  // Fallback raycast against the active model object.
   const model = getActiveModel();
   const root = model?.object;
   if (!root) return null;
+  const threeCamera = resolveThreeCamera();
+  if (!threeCamera) {
+    console.warn("[viewerApi] pickObjectAt: no valid THREE camera available");
+    return null;
+  }
 
   const raycaster = new THREE.Raycaster();
-  raycaster.setFromCamera(new THREE.Vector2(nx, ny), world.camera.three);
+  try {
+    raycaster.setFromCamera(ndc, threeCamera);
+  } catch (err) {
+    console.warn("[viewerApi] pickObjectAt: setFromCamera failed", err);
+    return null;
+  }
+
+  // Prefer modern fragments raycast API when available:
+  // group.raycast({ camera, mouse, dom }) -> { localId, ... }
+  if (group && typeof group.raycast === "function") {
+    const candidates = [new THREE.Vector2(x, y), ndc];
+    for (const mouse of candidates) {
+      try {
+        const hit: any = await Promise.resolve(
+          group.raycast({
+            camera: threeCamera,
+            mouse,
+            dom: canvas,
+          })
+        );
+        const localId =
+          (typeof hit?.localId === "number" ? hit.localId : null) ??
+          (typeof hit?.itemId === "number" ? hit.itemId : null) ??
+          (typeof hit?.id === "number" ? hit.id : null);
+        if (localId != null && isFinite(localId)) {
+          const objectId = `${modelId}:${localId}`;
+          lastPickedObjectId = objectId;
+          return objectId;
+        }
+      } catch (err) {
+        console.warn("[viewerApi] pickObjectAt: group.raycast(data) failed", err);
+      }
+    }
+  }
+
+  // Fallback: traverse meshes with THREE.Raycaster.
   const intersections: THREE.Intersection[] = [];
   // Safer than one deep call: traverse meshes and ignore malformed geometry errors.
   root.traverse((obj: any) => {
@@ -1549,6 +2642,35 @@ dumpItemsOfCategories: async (cat: string) =>{
       const model = getActiveModel();
       if (!model?.object) return null;
 
+      const union = new THREE.Box3();
+      let hasSelectionBox = false;
+      const modelIds = Object.keys(map ?? {}).sort();
+      for (const modelId of modelIds) {
+        const localIds = Array.from(map[modelId] ?? [])
+          .filter((id) => typeof id === "number" && isFinite(id))
+          .sort((a, b) => a - b);
+        if (!localIds.length) continue;
+
+        const boxes = await getBoxesForLocalIds(modelId, localIds);
+        for (const box of boxes) {
+          if (!box?.isBox3 || box.isEmpty()) continue;
+          union.union(box);
+          hasSelectionBox = true;
+        }
+
+        const meshes = await getMeshesForLocalIds(modelId, localIds);
+        for (const mesh of meshes) {
+          const meshBox = new THREE.Box3().setFromObject(mesh);
+          if (meshBox.isEmpty()) continue;
+          union.union(meshBox);
+          hasSelectionBox = true;
+        }
+      }
+
+      if (hasSelectionBox && !union.isEmpty()) {
+        return union;
+      }
+
       // Try common OBC/fragments helpers if they exist (version differences)
       const f: any = fragments as any;
 
@@ -1572,6 +2694,35 @@ dumpItemsOfCategories: async (cat: string) =>{
       const box = new THREE.Box3().setFromObject(model.object);
       if (box.isEmpty()) return null;
       return box;
+    },
+
+    async getDoorClearanceFocusBox(ids?: string[]): Promise<THREE.Box3 | null> {
+      const modelId = getActiveModelId();
+      if (!modelId) return null;
+
+      let targetEntry = activeHighlightState?.entries.length === 1 ? activeHighlightState.entries[0] : null;
+      if (ids?.length) {
+        const wanted = new Set(ids.map((id) => String(id)));
+        const localIds: number[] = [];
+        for (const raw of ids) {
+          const parsed = parseObjectId(raw);
+          if (!parsed || parsed.modelId !== modelId) continue;
+          localIds.push(parsed.localId);
+        }
+        if (localIds.length === 1) {
+          const overlays = await resolveHighlightOverlayEntries(modelId, localIds);
+          const candidate = overlays[0];
+          if (candidate && wanted.has(`${modelId}:${candidate.localId}`)) {
+            targetEntry = candidate;
+          }
+        }
+      }
+
+      if (!targetEntry || String(targetEntry.ifcClass ?? "").toUpperCase() !== "IFCDOOR") {
+        return null;
+      }
+
+      return buildDoorClearanceFocusBox(targetEntry);
     },
 
 async getSelectionMeshes(map: OBC.ModelIdMap): Promise<THREE.Object3D[]> {
@@ -1624,6 +2775,10 @@ async getSnapshot(opts?: { note?: string }): Promise<ViewerSnapshot> {
   await stabilizeSceneForSnapshot();
   fragments.core.update(true);
 
+  if (activeHighlightState) {
+    renderHighlightOverlayEntries(activeHighlightState.entries, activeHighlightState.style);
+  }
+
   // 2) Wait for browser to paint at least once
   await new Promise<void>((r) => requestAnimationFrame(() => r()));
   await new Promise<void>((r) => requestAnimationFrame(() => r()));
@@ -1633,9 +2788,10 @@ async getSnapshot(opts?: { note?: string }): Promise<ViewerSnapshot> {
 
   const canvas = world.renderer.three.domElement;
   const dataUrl = canvas.toDataURL("image/png");
-  const imageBase64Png = dataUrl.startsWith("data:image/")
+  const rawImageBase64Png = dataUrl.startsWith("data:image/")
     ? (dataUrl.split(",")[1] ?? "")
     : dataUrl;
+  const imageBase64Png = await composeSnapshotWithHud(rawImageBase64Png);
 
   const pose = await this.getCameraPose();
 
@@ -1646,6 +2802,7 @@ async getSnapshot(opts?: { note?: string }): Promise<ViewerSnapshot> {
       timestampIso: new Date().toISOString(),
       modelId: getActiveModelId(),
       note: opts?.note,
+      context: getHighlightAnnotationContext(),
     },
   };
 },

@@ -29,6 +29,7 @@ export type NavOptions = {
   // Stop thresholds
   minTargetAreaRatio?: number; // e.g. 0.10 = 10%
   maxOcclusionRatio?: number;  // e.g. 0.35
+  focusBox?: THREE.Box3;
 
   // Iteration controls
   maxSteps?: number;
@@ -271,7 +272,9 @@ const { viewerApi, toast, getSceneObjects } = params;
       occlusionSamples = 16,
     } = opts ?? {};
 
-    const box = await viewerApi.getSelectionWorldBox(map);
+    const box = opts?.focusBox?.isBox3
+      ? opts.focusBox.clone()
+      : await viewerApi.getSelectionWorldBox(map);
     if (!box) {
       return { targetAreaRatio: 0, occlusionRatio: null, steps: 0, success: false, reason: "empty-selection-box" };
     }

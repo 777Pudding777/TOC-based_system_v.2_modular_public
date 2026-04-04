@@ -51,8 +51,12 @@ function resolveIfcModelIdDeterministic(ifcLoader: any, model: any): number | nu
   const direct =
     asNum(model?.modelID) ??
     asNum(model?.modelId) ??
+    asNum(model?.ifcModelId) ??
+    asNum(model?.ifcID) ??
     asNum(model?.id) ??
     asNum(model?._id) ??
+    asNum(model?.ifcMetadata?.modelID) ??
+    asNum(model?.ifcMetadata?.modelId) ??
     null;
   if (direct != null) return direct;
 
@@ -108,28 +112,39 @@ async function buildIfcTypeIndexBestEffort(model: any): Promise<Record<string, n
   const out: Record<string, number[]> = {};
 
   // Strategy A: model exposes a list of element IDs
-  const ids: number[] =
+  let ids: number[] =
     typeof model?.getAllExpressIds === "function"
       ? await model.getAllExpressIds()
       : Array.isArray(model?.expressIDs)
         ? model.expressIDs
         : [];
 
+  // Strategy B: infer ids from model.properties map/object
   if (!ids.length) {
-    // If we cannot enumerate, fail so caller keeps index null.
-    throw new Error("No way to enumerate express IDs (getAllExpressIds/expressIDs missing).");
+    const propsStore: any = model?.properties;
+    if (propsStore instanceof Map) {
+      ids = Array.from(propsStore.keys()).filter((x) => typeof x === "number" && isFinite(x));
+    } else if (propsStore && typeof propsStore === "object") {
+      ids = Object.keys(propsStore).map((k) => Number(k)).filter((x) => Number.isFinite(x));
+    }
   }
-
-  // Strategy B: model exposes getProperties(expressId) -> { type / ifcType / ... }
-  if (typeof model?.getProperties !== "function") {
-    throw new Error("model.getProperties is missing.");
-  }
+  if (!ids.length) throw new Error("No way to enumerate express IDs.");
 
   // Deterministic iteration order
   ids.sort((a, b) => a - b);
 
+  const readProps = async (id: number): Promise<any> => {
+    if (typeof model?.getProperties === "function") {
+      return await model.getProperties(id);
+    }
+    const propsStore: any = model?.properties;
+    if (propsStore instanceof Map) return propsStore.get(id) ?? null;
+    if (propsStore && typeof propsStore === "object") return propsStore[id] ?? propsStore[String(id)] ?? null;
+    return null;
+  };
+
   for (const id of ids) {
-    const props = await model.getProperties(id);
+    const props = await readProps(id);
     const t =
       props?.type ??
       props?.ifcType ??
@@ -192,7 +207,7 @@ try {
 console.log("[IFC] loaded model ids", { modelId: file.name, ifcModelId });
 
 // If still null, log *only* lightweight structural info (no huge objects)
-if (ifcModelId == null)if (ifcModelId == null) {
+if (ifcModelId == null) {
   const mgr: any = (ifcLoader as any)?.ifcManager;
 
   const mgrProto = mgr ? Object.getPrototypeOf(mgr) : null;
@@ -203,7 +218,7 @@ if (ifcModelId == null)if (ifcModelId == null) {
   const stateVal = hasState ? (mgr as any).state : undefined;
   const stateProto = stateVal ? Object.getPrototypeOf(stateVal) : null;
 
-  console.warn("[IFC] could not resolve numeric ifcModelId. Debug:", {
+  console.info("[IFC] numeric ifcModelId unavailable in this loader build (continuing). Debug:", {
     modelKeys: Object.getOwnPropertyNames(model ?? {}).slice(0, 80),
     modelProtoKeys: model ? Object.getOwnPropertyNames(Object.getPrototypeOf(model)).slice(0, 80) : [],
     ifcManagerType: mgr ? typeof mgr : "missing",

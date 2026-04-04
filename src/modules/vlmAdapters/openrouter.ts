@@ -10,7 +10,7 @@
 import type { SnapshotArtifact } from "../snapshotCollector";
 import type { EvidenceView, VlmAdapter, VlmCheckInput, VlmFollowUp, VlmVerdict } from "../vlmChecker";
 import { DEFAULT_MAX_SNAPSHOTS_PER_REQUEST } from "../../config/prototypeSettings";
-import { wrapPromptBase } from "./prompts/basePrompt";
+import { wrapPromptBase, wrapPromptEnhanced } from "./prompts/promptWrappers";
 
 export type OpenRouterAdapterConfig = {
   apiKey: string;
@@ -188,6 +188,18 @@ function stableEvidenceJson(evidenceViews: EvidenceView[]): string {
 function getLastContext(evidenceViews: any[]): any | undefined {
   const last = evidenceViews?.[evidenceViews.length - 1];
   return last?.context;
+}
+
+function getLastNav(evidenceViews: any[]): any | undefined {
+  const last = evidenceViews?.[evidenceViews.length - 1];
+  return last?.nav;
+}
+
+function inferPromptSource(prompt: string): "rule_library" | "custom_user_prompt" | "unknown" {
+  const text = String(prompt ?? "");
+  if (/SOURCE:\s*RULE_LIBRARY/i.test(text)) return "rule_library";
+  if (/SOURCE:\s*CUSTOM_USER_PROMPT/i.test(text)) return "custom_user_prompt";
+  return "unknown";
 }
 
 function normalize(s: string) {
@@ -388,7 +400,9 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
 
 
       const evidenceViewsJson = stableEvidenceJson(input.evidenceViews);
-      const userText = wrapPromptBase({
+      const promptSource = inferPromptSource(input.prompt);
+      const promptWrapper = promptSource === "custom_user_prompt" ? wrapPromptEnhanced : wrapPromptBase;
+      const userText = promptWrapper({
         taskPrompt: input.prompt,
         evidenceViewsJson,
         imageIndexJson,
@@ -564,52 +578,190 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
       } as const;
 
 let followUp = isFollowUp(parsed?.followUp) ? parsed.followUp : undefined;
+const rationaleText = typeof parsed?.rationale === "string" ? parsed.rationale.toLowerCase() : "";
+const rationaleWantsPlanCut =
+  rationaleText.includes("plan cut") ||
+  rationaleText.includes("top-down plan cut") ||
+  rationaleText.includes("top down plan cut") ||
+  rationaleText.includes("true top-down") ||
+  rationaleText.includes("true top down");
+if (followUp?.request === "ZOOM_IN" && getLastNav(input.evidenceViews as any[])?.zoomPotentialExhausted) {
+  followUp = undefined;
+}
+if (followUp?.request === "TOP_VIEW" && getLastContext(input.evidenceViews as any[])?.lastActionReason === "top") {
+  followUp = undefined;
+}
 
 // --- Deterministic guardrail: prevent infinite NEW_VIEW loops for PoC ---
 if (verdict === "UNCERTAIN") {
   const ctxAny = getLastContext(input.evidenceViews as any[]);
+  const navAny = getLastNav(input.evidenceViews as any[]);
   const availableStoreys: string[] | undefined = ctxAny?.availableStoreys;
   const currentScopeStorey: string | undefined = ctxAny?.scope?.storeyId;
   const currentViewPreset: string | undefined = ctxAny?.viewPreset; // "iso" | "top"
   const isolatedCats: string[] | undefined = ctxAny?.isolatedCategories;
+  const highlightedIds: string[] | undefined = ctxAny?.highlightedIds;
+  const lastActionReason: string | undefined = ctxAny?.lastActionReason;
+  const planCutEnabled: boolean = Boolean(ctxAny?.planCut?.enabled);
+  const zoomPotentialExhausted: boolean = Boolean(navAny?.zoomPotentialExhausted);
+  const floorContextMissing: boolean = Boolean(ctxAny?.floorContext?.missingLikely);
+  const taskProfile: string | undefined = ctxAny?.taskGraph?.profile;
+  const primaryClass: string | undefined = ctxAny?.taskGraph?.primaryClass;
+  const activeEntityId: string | undefined = ctxAny?.taskGraph?.activeEntity?.id;
+  const activeEntityClass: string | undefined = ctxAny?.taskGraph?.activeEntity?.class;
+  const activeStoreyId: string | undefined = ctxAny?.taskGraph?.activeStoreyId;
+  const concernList: string[] = Array.isArray(ctxAny?.taskGraph?.concerns) ? ctxAny.taskGraph.concerns : [];
+  const targetClass = activeEntityClass ?? primaryClass;
+  const isDoorTask = taskProfile === "door" || Boolean(targetClass && normalize(targetClass).includes("ifcdoor"));
+  const isStairTask =
+    taskProfile === "stair" ||
+    Boolean(targetClass && (normalize(targetClass).includes("ifcstair") || normalize(targetClass).includes("ifcstairflight")));
+  const isRampTask = taskProfile === "ramp" || Boolean(targetClass && normalize(targetClass).includes("ifcramp"));
+  const accessibilityFocused =
+    concernList.some((c) => normalize(c) === "accessibility") ||
+    normalize(input.prompt).includes("accessible") ||
+    normalize(input.prompt).includes("accessibility") ||
+    normalize(input.prompt).includes("wheelchair") ||
+    normalize(input.prompt).includes("ada");
+  const doorPrepReady =
+    isDoorTask &&
+    Boolean(highlightedIds?.length) &&
+    Boolean(isolatedCats?.some((c) => normalize(c).includes("ifcdoor"))) &&
+    currentViewPreset === "top";
 
-  const wantedStorey = pickStoreyFromPrompt(input.prompt, availableStoreys);
+  const wantedStorey = activeStoreyId ?? pickStoreyFromPrompt(input.prompt, availableStoreys);
 
   const followUpIsNewView = followUp?.request === "NEW_VIEW";
 
+  // Strong door-task ordering guard: top view first, then storey plan cut, then entity work.
+  if (
+    isDoorTask &&
+    currentViewPreset !== "top" &&
+    lastActionReason !== "top" &&
+    followUp?.request !== "TOP_VIEW"
+  ) {
+    followUp = { request: "TOP_VIEW" } as any;
+  } else if (
+    isDoorTask &&
+    wantedStorey &&
+    currentViewPreset === "top" &&
+    !planCutEnabled &&
+    followUp?.request !== "SET_STOREY_PLAN_CUT"
+  ) {
+    followUp = {
+      request: "SET_STOREY_PLAN_CUT",
+      params: { storeyId: wantedStorey, offsetFromFloor: 1.2, mode: "WORLD_UP" },
+    } as any;
+  }
+
   // If model says NEW_VIEW but we have an obvious next action, override it.
   if (!followUp || followUpIsNewView) {
-    // 1) If prompt references a storey, isolate it first.
-    if (wantedStorey && currentScopeStorey !== wantedStorey) {
+    if (isRampTask && wantedStorey && currentScopeStorey !== wantedStorey) {
       followUp = { request: "ISOLATE_STOREY", params: { storeyId: wantedStorey } } as any;
     }
-    // 2) Then go to TOP view for accessibility checks.
-    else if (currentViewPreset !== "top") {
+    else if (isRampTask && currentViewPreset !== "iso") {
+      followUp = { request: "ISO_VIEW" } as any;
+    }
+    else if (isRampTask && activeEntityId && !highlightedIds?.includes(activeEntityId)) {
+      followUp = { request: "HIGHLIGHT_IDS", params: { ids: [activeEntityId], style: "primary" } } as any;
+    }
+    else if (isRampTask && safeVisibility.occlusionAssessment === "HIGH" && lastActionReason !== "orbit20deg") {
+      followUp = { request: "NEW_VIEW", params: { reason: "Need a side or less occluded view of the ramp run." } } as any;
+    }
+    else if (isRampTask && accessibilityFocused && currentViewPreset !== "top") {
       followUp = { request: "TOP_VIEW" } as any;
     }
-    // 3) Then apply plan cut to remove walls above doors.
-    else {
+    else if (isRampTask && wantedStorey && !planCutEnabled && (accessibilityFocused || floorContextMissing || rationaleWantsPlanCut)) {
       followUp = {
-        request: "SET_PLAN_CUT",
-        params: { height: 1.2, mode: "WORLD_UP" },
+        request: "SET_STOREY_PLAN_CUT",
+        params: { storeyId: wantedStorey, offsetFromFloor: 1.2, mode: "WORLD_UP" },
       } as any;
     }
-
-    // 4) Once we already are in top+plan cut, isolate doors.
-    // (We can’t detect planCut state yet, so use isolatedCats heuristic.)
-    if (
-      followUp?.request === "SET_PLAN_CUT" &&
-      isolatedCats &&
-      isolatedCats.some((c) => normalize(c).includes("ifcdoor"))
-    ) {
-      // Already doors isolated, don't replace.
-    } else if (
-      currentViewPreset === "top" &&
-      isolatedCats &&
-      isolatedCats.length > 0 &&
-      !isolatedCats.some((c) => normalize(c).includes("ifcdoor"))
-    ) {
-      followUp = { request: "ISOLATE_CATEGORY", params: { category: "IfcDoor" } } as any;
+    else if (isRampTask && !planCutEnabled && (floorContextMissing || rationaleWantsPlanCut) && lastActionReason !== "plan-cut") {
+      followUp = { request: "SET_PLAN_CUT", params: { height: 1.2, mode: "CAMERA" } } as any;
+    }
+    else if (isRampTask && !zoomPotentialExhausted && lastActionReason !== "zoom-to-highlighted-entity") {
+      followUp = { request: "ZOOM_IN", params: { factor: 1.15 } } as any;
+    }
+    else if (isStairTask && wantedStorey && currentScopeStorey !== wantedStorey) {
+      followUp = { request: "ISOLATE_STOREY", params: { storeyId: wantedStorey } } as any;
+    }
+    else if (isStairTask && currentViewPreset !== "iso") {
+      followUp = { request: "ISO_VIEW" } as any;
+    }
+    else if (isStairTask && activeEntityId && !highlightedIds?.includes(activeEntityId)) {
+      followUp = { request: "HIGHLIGHT_IDS", params: { ids: [activeEntityId], style: "primary" } } as any;
+    }
+    else if (isStairTask && safeVisibility.occlusionAssessment === "HIGH" && lastActionReason !== "orbit20deg") {
+      followUp = { request: "NEW_VIEW", params: { reason: "Need a clearer side or landing view of the stair run." } } as any;
+    }
+    else if (isStairTask && accessibilityFocused && currentViewPreset !== "top") {
+      followUp = { request: "TOP_VIEW" } as any;
+    }
+    else if (isStairTask && wantedStorey && !planCutEnabled && (accessibilityFocused || floorContextMissing || rationaleWantsPlanCut)) {
+      followUp = {
+        request: "SET_STOREY_PLAN_CUT",
+        params: { storeyId: wantedStorey, offsetFromFloor: 1.2, mode: "WORLD_UP" },
+      } as any;
+    }
+    else if (isStairTask && !zoomPotentialExhausted && lastActionReason !== "zoom-to-highlighted-entity") {
+      followUp = { request: "ZOOM_IN", params: { factor: 1.15 } } as any;
+    }
+    // 1) Go to TOP view for accessibility checks.
+    else if (isDoorTask && currentViewPreset !== "top") {
+      followUp = { request: "TOP_VIEW" } as any;
+    }
+    // 2) Then prepare a storey-aware plan cut for the active storey.
+    else if (isDoorTask && wantedStorey && !planCutEnabled) {
+      followUp = {
+        request: "SET_STOREY_PLAN_CUT",
+        params: { storeyId: wantedStorey, offsetFromFloor: 1.2, mode: "WORLD_UP" },
+      } as any;
+    }
+    // 3) Then isolate the relevant category before tighter framing.
+    else if (targetClass && (!isolatedCats || !isolatedCats.some((c) => normalize(c).includes(normalize(targetClass))))) {
+      followUp = { request: "ISOLATE_CATEGORY", params: { category: targetClass } } as any;
+    }
+    // 4) Then force the active door highlight inside the current storey cluster.
+    else if (activeEntityId && !highlightedIds?.includes(activeEntityId)) {
+      followUp = { request: "HIGHLIGHT_IDS", params: { ids: [activeEntityId], style: "primary" } } as any;
+    }
+    // 5) If floor context is missing or the rationale explicitly wants plan cut, prefer storey plan cut.
+    else if (isDoorTask && wantedStorey && (floorContextMissing || rationaleWantsPlanCut) && !planCutEnabled) {
+      followUp = {
+        request: "SET_STOREY_PLAN_CUT",
+        params: { storeyId: wantedStorey, offsetFromFloor: 1.2, mode: "WORLD_UP" },
+      } as any;
+    }
+    else if (isDoorTask && doorPrepReady && !planCutEnabled && lastActionReason === "zoom-to-highlighted-entity") {
+      followUp = wantedStorey
+        ? ({
+            request: "SET_STOREY_PLAN_CUT",
+            params: { storeyId: wantedStorey, offsetFromFloor: 1.2, mode: "WORLD_UP" },
+          } as any)
+        : ({
+            request: "SET_PLAN_CUT",
+            params: { height: 1.2, mode: "WORLD_UP" },
+          } as any);
+    }
+    // 6) Only after top view + storey plan cut prep, allow a tighter entity-focused zoom.
+    else if ((!highlightedIds?.length || lastActionReason !== "zoom-to-highlighted-entity") && !zoomPotentialExhausted) {
+      followUp = { request: "ZOOM_IN", params: { factor: 2 } } as any;
+    }
+    else if (zoomPotentialExhausted) {
+      followUp = undefined;
+    }
+    // 7) Keep the storey plan cut as the preferred prepared state for later doors on the same storey.
+    else {
+      followUp = isDoorTask && wantedStorey && !planCutEnabled
+        ? ({
+            request: "SET_STOREY_PLAN_CUT",
+            params: { storeyId: wantedStorey, offsetFromFloor: 1.2, mode: "WORLD_UP" },
+          } as any)
+        : ({
+            request: "SET_PLAN_CUT",
+            params: { height: 1.2, mode: "WORLD_UP" },
+          } as any);
     }
   }
 }
@@ -627,7 +779,12 @@ if (verdict === "UNCERTAIN") {
           note: parsed?.evidence?.note ?? last.meta.note,
         },
         followUp: verdict === "UNCERTAIN"
-          ? (followUp ?? { request: "NEW_VIEW", params: { reason: "Need more evidence." } })
+          ? (
+              followUp ??
+              (getLastNav(input.evidenceViews as any[])?.zoomPotentialExhausted
+                ? undefined
+                : { request: "NEW_VIEW", params: { reason: "Need more evidence." } })
+            )
           : followUp,
         meta: {
           modelId: cfg.model ?? null,

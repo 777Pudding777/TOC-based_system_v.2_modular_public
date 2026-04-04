@@ -43,6 +43,7 @@ export type SnapshotArtifact = {
 
     contextPath?: string[];
     note?: string;
+    context?: Record<string, unknown>;
   };
 };
 
@@ -234,6 +235,7 @@ let run: SnapshotRun = {
         visibility,
         contextPath: [],
         note,
+        context: wide.meta.context,
       },
     };
   }
@@ -262,6 +264,7 @@ let run: SnapshotRun = {
         visibility,
         contextPath: [],
         note,
+        context: snap.meta.context,
       },
     };
 

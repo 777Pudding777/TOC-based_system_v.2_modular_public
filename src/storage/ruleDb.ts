@@ -47,6 +47,27 @@ export function createRuleDb() {
     },
 
     /**
+     * Get stored rule library metadata, if present.
+     */
+    async getMetadata(): Promise<RuleMetadata | null> {
+      const db = await openDb();
+      const tx = db.transaction([STORE_RULE_META], "readonly");
+      const store = tx.objectStore(STORE_RULE_META);
+      const req = store.get("library_metadata");
+
+      return new Promise((resolve, reject) => {
+        req.onsuccess = () => {
+          db.close();
+          resolve((req.result as RuleMetadata) ?? null);
+        };
+        req.onerror = () => {
+          db.close();
+          reject(req.error);
+        };
+      });
+    },
+
+    /**
      * Initialize the rule library from JSON data
      */
     async initializeFromLibrary(library: RuleLibrary): Promise<void> {

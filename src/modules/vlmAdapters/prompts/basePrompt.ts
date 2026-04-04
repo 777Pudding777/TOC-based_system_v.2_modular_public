@@ -1,4 +1,5 @@
 // src/modules/vlmAdapters/prompts/basePrompt.ts
+// BasePrompt was replaced by promptWrappers.ts which is a more flexible system for composing prompts. The original basePrompt is kept here for reference and potential reuse of shared prompt components.
 
 export type WrapPromptInput = {
   taskPrompt: string;
@@ -18,18 +19,23 @@ export function wrapPromptBase(input: WrapPromptInput): string {
     "NON-NEGOTIABLES:\n" +
     "- You must NOT guess geometry or dimensions.\n" +
     "- Treat evidenceViews.nav metrics (camera, scale, distances, angles, cut heights, etc.) as authoritative.\n" +
+    "- If evidenceViews.context.highlightAnnotations is present, use its legend as the authoritative explanation of overlay colors.\n" +
+    "- If a top HUD/info tab is visible, treat its shown IFC class, object id, dimensions, and color legend as explicit snapshot reference evidence.\n" +
     "- Use the visible viewer grid as the primary dimensional reference whenever it is clearly visible: 1 primary cell = 1 m x 1 m, 1 major cell = 10 m x 10 m.\n" +
     "- If a measurable requirement cannot be grounded from visible evidence + nav metrics, return UNCERTAIN.\n" +
     "- Return ONLY valid JSON (no markdown, no commentary, no extra keys).\n" +
     "\n" +
     "WORKFLOW (do internally; keep rationale brief):\n" +
     "1) Interpret the requirement: identify target element(s), measurable constraint(s), units, thresholds, and applicability.\n" +
-    "2) Check visibility: is the rule target visible and unoccluded enough to measure/verify?\n" +
-    "3) If measurable: use nav metrics and visible cues to evaluate PASS/FAIL.\n" +
-    "4) For visible spatial checks, start with the static viewer grid as your main scale reference.\n" +
-    "5) If the grid is visible but the view is too distorted/oblique to trust scale, return UNCERTAIN or request a better view.\n" +
-    "6) If the grid alone is insufficient, use dimension annotations, IFC/property values, or request follow-up evidence to extract dimensions from relevant objects.\n" +
-    "7) If not measurable/ambiguous after that, choose the single best followUp action to resolve the uncertainty.\n" +
+    "2) Treat DYNAMIC_CHECKLIST as the entity plan extracted from model metadata. If it provides activeStorey / activeEntity / activeCluster / activeClusterQueue, work storey-wise and focus on that active entity first. If evidenceViews.context.floorContext indicates missing floor context, treat that as a strong signal to request SET_STOREY_PLAN_CUT for the activeStorey. Do not reason about all remaining entities at once.\n" +
+    "3) Check visibility: is the active rule target visible and unoccluded enough to measure/verify?\n" +
+    "4) If measurable: use nav metrics and visible cues to evaluate PASS/FAIL for the active entity or active cluster.\n" +
+    "5) For visible spatial checks, start with the static viewer grid as your main scale reference.\n" +
+    "6) If the grid is visible but the view is too distorted/oblique to trust scale, return UNCERTAIN or request a better view.\n" +
+    "7) If the grid alone is insufficient, use dimension annotations, IFC/property values, or request follow-up evidence to extract dimensions from relevant objects.\n" +
+    "8) If the active entity is too small in frame, request HIGHLIGHT_IDS or ZOOM_IN so the focused target occupies a meaningful portion of the image before judging compliance.\n" +
+    "9) If precise storey isolation hides the local floor or landing context needed for clearance measurement, prefer SET_STOREY_PLAN_CUT(activeStorey) as the fallback instead of broadening to multiple fully visible storeys.\n" +
+    "10) If not measurable/ambiguous after that, choose the single best followUp action to resolve the uncertainty for the active entity.\n" +
     "\n" +
     "WEB / REFERENCE POLICY (for compliance clauses):\n" +
     "- If the taskPrompt provides an allowlist (e.g., AllowedSources/domains/links) AND the calling system supports browsing,\n" +
@@ -96,7 +102,8 @@ export function wrapPromptBase(input: WrapPromptInput): string {
     "\n" +
     "RECOMMENDED SEQUENCES (follow these patterns for common checks):\n" +
     "  Floor plan check:    ISOLATE_STOREY → TOP_VIEW → SET_PLAN_CUT(1.2) or SET_STOREY_PLAN_CUT\n" +
-    "  Door clearance:      TOP_VIEW/SET_STOREY_PLAN_CUT → ISOLATE_CATEGORY(IfcDoor) for targeting (context preserved) → HIGHLIGHT_IDS\n" +    "  Stair inspection:    ISOLATE_CATEGORY(IfcStair) → ISO_VIEW → ZOOM_IN\n" +
+    "  Door clearance:      ISOLATE_STOREY(activeStorey) → TOP_VIEW → ISOLATE_CATEGORY(IfcDoor) → HIGHLIGHT_IDS(activeEntity first) → ZOOM_IN → SET_STOREY_PLAN_CUT(activeStorey) only if local floor context is missing or cluttered → finish that door → next door in activeClusterQueue → next storey\n" +
+    "  Stair inspection:    ISOLATE_CATEGORY(IfcStair) → ISO_VIEW → ZOOM_IN\n" +
     "  Remove occlusion:    HIDE_CATEGORY(IfcSlab) → HIDE_CATEGORY(IfcCovering)\n" +
     "  Regulatory lookup:   WEB_FETCH(TOC) → WEB_FETCH(chapter) → WEB_FETCH(section)\n" +
     "\n" +
@@ -113,8 +120,14 @@ export function wrapPromptBase(input: WrapPromptInput): string {
      "- confidence must be within [0,1].\n" +
      "- Rationale must be short and evidence-grounded: what you saw, what nav metric you used, whether the viewer grid was used as the primary dimensional reference, whether a dimension annotation/property was used, or what is missing.\n" +     "- If the requirement depends on definitions/exceptions not included in the prompt, return UNCERTAIN and ask for them.\n" +
      "- If you used WEB_EVIDENCE, mention the clause identifier/section name briefly in the rationale (do not quote long text).\n" +
+     "- When on-image wording is minimal, rely on evidenceViews.context.highlightAnnotations.legend instead of guessing the annotation meaning from color alone.\n" +
+     "- If evidenceViews.context.highlightAnnotations.sizeReference, hudContents, or a visible top HUD provides highlighted-object class/id/dimensions/color legend, you may use those as explicit reference evidence from the snapshot.\n" +
      "- Prefer action over repeated ZOOM_IN.\n" +
-     "- For plan-based checks (doors/stairs clearance), prefer TOP_VIEW + SET_STOREY_PLAN_CUT or SET_PLAN_CUT(height≈1.2m).\n" +
+     "- For door clearance checks, prefer TOP_VIEW + entity-focused HIGHLIGHT_IDS/ZOOM_IN before using plan cut.\n" +
+     "- Use SET_STOREY_PLAN_CUT after zoom when nearby walls, landings, overhead geometry, or missing floor context still make the clearance unreadable.\n" +
+     "- Prefer precise single-storey isolation as the default. Do not broaden to multiple fully visible storeys just to recover floor context unless a storey-aware plan cut is unavailable.\n" +
+     "- When multiple similar entities exist, navigate and measure entity-by-entity. Use DYNAMIC_CHECKLIST.activeEntity and entityQueue to avoid bulk reasoning.\n" +
+     "- Prefer storey-scoped inspection for repeated targets: isolate activeStorey first, then finish doors one-by-one in activeClusterQueue before moving to the next storey.\n" +
      "- If a storey is mentioned, select it only from context.availableStoreys. Otherwise ask for ISOLATE_STOREY using one of those names.\n" +
      "- If you need to identify an element, prefer HIGHLIGHT_IDS on the likely target category.\n" +
      "- For occluders like slabs/ceilings, prefer HIDE_CATEGORY (e.g., IfcSlab, IfcCovering) instead of listing many ids.\n" +

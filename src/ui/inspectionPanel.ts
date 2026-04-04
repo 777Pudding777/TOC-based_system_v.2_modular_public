@@ -13,6 +13,8 @@ import type { VlmDecision, VlmVerdict } from "../modules/vlmChecker";
 import type { RuleDb } from "../storage/ruleDb";
 import type { TraceDb } from "../storage/traceDb";
 import { downloadHtmlReport } from "../reporting/reportGenerator";
+import { buildPromptFromRule } from "../modules/vlmAdapters/prompts/promptWrappers";
+import { DEFAULT_MAX_COMPLIANCE_STEPS } from "../config/prototypeSettings";
 
 type ToastFn = (msg: string, ms?: number) => void;
 
@@ -97,7 +99,7 @@ export function mountInspectionPanel(params: {
     selectedRule: null,
     selectedModel: OPENROUTER_MODELS[0].id,
     currentStep: 0,
-    totalSteps: 6,
+    totalSteps: DEFAULT_MAX_COMPLIANCE_STEPS,
     decisions: [],
     metrics: null,
     findings: [],
@@ -115,10 +117,18 @@ export function mountInspectionPanel(params: {
    */
   async function loadRules() {
     try {
-      rules = await ruleDb.listEnabledRules();
+      rules = (await ruleDb.listEnabledRules()).slice().sort((a, b) => {
+        const categoryCmp = a.category.localeCompare(b.category);
+        if (categoryCmp !== 0) return categoryCmp;
+        return a.title.localeCompare(b.title);
+      });
+      if (state.selectedRule) {
+        state.selectedRule = rules.find((rule) => rule.id === state.selectedRule?.id) ?? null;
+      }
     } catch (e) {
       console.error("[InspectionPanel] Failed to load rules:", e);
       rules = [];
+      state.selectedRule = null;
     }
   }
 
@@ -199,7 +209,7 @@ export function mountInspectionPanel(params: {
       const result = await complianceRunner.start({
         prompt,
         deterministic: { enabled: true, mode: "iso" },
-        maxSteps: 6,
+        maxSteps: DEFAULT_MAX_COMPLIANCE_STEPS,
       });
 
       if (result?.ok === false) {
@@ -227,38 +237,6 @@ export function mountInspectionPanel(params: {
   /**
    * Build a VLM prompt from a compliance rule
    */
-  function buildPromptFromRule(rule: ComplianceRule): string {
-    const parts = [
-      `COMPLIANCE RULE: ${rule.title}`,
-      ``,
-      `DESCRIPTION: ${rule.description}`,
-      ``,
-      `CATEGORY: ${rule.category}`,
-      `SEVERITY: ${rule.severity}`,
-      ``,
-      `WHAT TO LOOK FOR:`,
-      ...rule.visualEvidence.lookFor.map((item) => `- ${item}`),
-      ``,
-      `PASS INDICATORS:`,
-      ...rule.visualEvidence.passIndicators.map((item) => `- ${item}`),
-      ``,
-      `FAIL INDICATORS:`,
-      ...rule.visualEvidence.failIndicators.map((item) => `- ${item}`),
-      ``,
-      `EVALUATION CRITERIA:`,
-      `PASS if: ${rule.evaluationCriteria.pass.join("; ")}`,
-      `FAIL if: ${rule.evaluationCriteria.fail.join("; ")}`,
-      `UNCERTAIN if: ${rule.evaluationCriteria.uncertain.join("; ")}`,
-      ``,
-      `NAVIGATION HINTS:`,
-      `Recommended views: ${rule.navigationHints.recommendedViews.join(", ")}`,
-      `Zoom level: ${rule.navigationHints.zoomLevel ?? "medium"}`,
-      ...(rule.navigationHints.tips || []).map((tip) => `- ${tip}`),
-    ];
-
-    return parts.join("\n");
-  }
-
   /**
    * Create conversation trace from inspection results
    */

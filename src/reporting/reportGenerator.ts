@@ -390,7 +390,7 @@ function generateCss(): string {
     .step-snapshot-card img {
       display: block;
       width: 100%;
-      height: 600px;
+      height: 800px;
       object-fit: cover;
       background: #111827;
     }
@@ -399,7 +399,7 @@ function generateCss(): string {
       display: flex;
       align-items: center;
       justify-content: center;
-      height: 600px;
+      height: 800px;
       background: #1f2937;
       color: #9ca3af;
       font-size: 12px;
@@ -713,6 +713,128 @@ function generateSnapshotsSection(trace: ConversationTrace, embedImages: boolean
   `;
 }
 
+function parseChecklistValue(promptText: string, key: string): string | null {
+  const match = String(promptText ?? "").match(new RegExp(`^${key}=([^\\n]+)$`, "m"));
+  return match ? match[1].trim() : null;
+}
+
+type EntitySummaryItem = {
+  taskLabel: string;
+  entityId: string;
+  verdict: string;
+  stepStart: number;
+  stepEnd: number;
+};
+
+function buildEntitySummary(trace: ConversationTrace): {
+  completed: EntitySummaryItem[];
+  remainingCount: number | null;
+} {
+  const promptByStep = new Map(trace.prompts.map((prompt) => [prompt.step, prompt]));
+  const groups: Array<{
+    entityId: string;
+    taskLabel: string;
+    stepStart: number;
+    stepEnd: number;
+    finalVerdict: string;
+    finalized: boolean;
+  }> = [];
+
+  for (const response of trace.responses) {
+    const prompt = promptByStep.get(response.step);
+    const promptText = prompt?.promptText ?? "";
+    const entityId = parseChecklistValue(promptText, "activeEntity");
+    if (!entityId || entityId === "none") continue;
+
+    const activeTaskRaw = parseChecklistValue(promptText, "activeTask") ?? "entity.review|in_progress";
+    const taskId = activeTaskRaw.split("|")[0] ?? "entity.review";
+    const taskLabel = taskId.replace(/^entity\./, "").replace(/_/g, " ");
+    const hasNoFollowUp = !response.decision.followUp;
+    const verdictIsFinal = response.decision.verdict === "PASS" || response.decision.verdict === "FAIL";
+
+    const current = groups[groups.length - 1];
+    if (current && current.entityId === entityId) {
+      current.stepEnd = response.step;
+      current.finalVerdict = response.decision.verdict;
+      current.finalized = current.finalized || hasNoFollowUp || verdictIsFinal;
+    } else {
+      groups.push({
+        entityId,
+        taskLabel,
+        stepStart: response.step,
+        stepEnd: response.step,
+        finalVerdict: response.decision.verdict,
+        finalized: hasNoFollowUp || verdictIsFinal,
+      });
+    }
+  }
+
+  const completed = groups
+    .filter((group, index) => {
+      if (group.finalized) return true;
+      const next = groups[index + 1];
+      return Boolean(next && next.entityId !== group.entityId);
+    })
+    .map((group, index) => ({
+      taskLabel: `Task ${index + 1} - ${group.taskLabel}`,
+      entityId: group.entityId,
+      verdict: group.finalVerdict,
+      stepStart: group.stepStart,
+      stepEnd: group.stepEnd,
+    }));
+
+  const lastPrompt = trace.prompts[trace.prompts.length - 1];
+  const entityProgressRaw = parseChecklistValue(lastPrompt?.promptText ?? "", "entityProgress");
+  let remainingCount: number | null = null;
+  if (entityProgressRaw && entityProgressRaw.includes("/")) {
+    const [completedCountRaw, totalCountRaw] = entityProgressRaw.split("/");
+    const completedCount = Number(completedCountRaw);
+    const totalCount = Number(totalCountRaw);
+    if (Number.isFinite(completedCount) && Number.isFinite(totalCount)) {
+      remainingCount = Math.max(0, totalCount - completedCount);
+    }
+  }
+
+  return { completed, remainingCount };
+}
+
+function generateEntitySummarySection(trace: ConversationTrace): string {
+  const summary = buildEntitySummary(trace);
+
+  if (!summary.completed.length) {
+    return `
+      <div class="section">
+        <h2> Entity Summary</h2>
+        <p style="color: #6b7280;">No entity tasks were completed in this run.</p>
+        ${summary.remainingCount !== null ? `<p style="margin-top: 12px; color: #4b5563;">${summary.remainingCount} more entit${summary.remainingCount === 1 ? "y needs" : "ies need"} check.</p>` : ""}
+      </div>
+    `;
+  }
+
+  const cardsHtml = summary.completed
+    .map(
+      (item) => `
+      <div class="rule-card" style="margin-bottom: 12px;">
+        <div class="title">${escapeHtml(item.taskLabel)}</div>
+        <div class="description" style="margin-bottom: 8px;">Entity: ${escapeHtml(item.entityId)}</div>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+          <span class="badge" style="background:${getVerdictColor(item.verdict)};color:#fff;">${escapeHtml(item.verdict)}</span>
+          <span style="color:#4b5563;font-size:14px;">Steps ${item.stepStart}${item.stepEnd !== item.stepStart ? `-${item.stepEnd}` : ""}</span>
+        </div>
+      </div>
+    `
+    )
+    .join("");
+
+  return `
+    <div class="section">
+      <h2> Entity Summary</h2>
+      ${cardsHtml}
+      ${summary.remainingCount !== null ? `<p style="margin-top: 8px; color: #4b5563;">${summary.remainingCount} more entit${summary.remainingCount === 1 ? "y needs" : "ies need"} check.</p>` : ""}
+    </div>
+  `;
+}
+
 /**
  * Generate step-by-step trace section
  */
@@ -974,6 +1096,7 @@ export function generateHtmlReport(trace: ConversationTrace, options: ReportOpti
     ${generateMetricsSection(trace.metrics)}
     ${generateFindingsSection(trace.stressedFindings)}
     ${generateSnapshotsSection(trace, embedImages)}
+    ${generateEntitySummarySection(trace)}
     ${generateTraceSection(trace)}
     ${generateModelSection(trace)}
     ${generateWebEvidenceAppendix(trace)}

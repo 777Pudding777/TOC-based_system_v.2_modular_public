@@ -91,6 +91,7 @@ export type VlmFollowUp =
   | { request: "SET_PLAN_CUT"; params: { height: number; thickness?: number; mode?: "WORLD_UP" | "CAMERA" } }
   | { request: "SET_STOREY_PLAN_CUT"; params: { storeyId: string; offsetFromFloor?: number; mode?: "WORLD_UP" | "CAMERA" } }
   | { request: "CLEAR_PLAN_CUT" }
+  | { request: "RESTORE_VIEW"; params: { step?: number; snapshotId?: string; bookmarkId?: string } }
 
 // Internal tool-like step (no viewer action): fetch authoritative code text via allowlisted proxy
   | { request: "WEB_FETCH"; params: { url: string; maxChars?: number; selector?: string; focus?: { contains?: string[]; windowChars?: number } } };
@@ -266,9 +267,34 @@ function isFollowUp(x: any): x is VlmFollowUp {
     case "HIDE_CATEGORY":
     case "SHOW_CATEGORY":
     case "PICK_CENTER":
-    case "SET_PLAN_CUT":
     case "CLEAR_PLAN_CUT":
       return true;
+
+    case "SET_PLAN_CUT":
+      return (
+        x.params &&
+        typeof x.params.height === "number" &&
+        isFinite(x.params.height) &&
+        (x.params.thickness === undefined || (typeof x.params.thickness === "number" && isFinite(x.params.thickness))) &&
+        (x.params.mode === undefined || x.params.mode === "WORLD_UP" || x.params.mode === "CAMERA")
+      );
+
+    case "SET_STOREY_PLAN_CUT":
+      return (
+        x.params &&
+        typeof x.params.storeyId === "string" &&
+        x.params.storeyId.length > 0 &&
+        (x.params.offsetFromFloor === undefined || (typeof x.params.offsetFromFloor === "number" && isFinite(x.params.offsetFromFloor))) &&
+        (x.params.mode === undefined || x.params.mode === "WORLD_UP" || x.params.mode === "CAMERA")
+      );
+
+    case "RESTORE_VIEW":
+      return (
+        x.params &&
+        (x.params.step === undefined || (typeof x.params.step === "number" && isFinite(x.params.step))) &&
+        (x.params.snapshotId === undefined || typeof x.params.snapshotId === "string") &&
+        (x.params.bookmarkId === undefined || typeof x.params.bookmarkId === "string")
+      );
 
     default:
       return false;

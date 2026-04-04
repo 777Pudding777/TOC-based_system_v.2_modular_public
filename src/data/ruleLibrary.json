@@ -1,24 +1,153 @@
 {
   "version": "1.0.0",
-  "lastUpdated": "2026-03-15",
+  "lastUpdated": "2026-03-30",
   "metadata": {
-    "totalRules": 6,
-    "enabledRules": 6,
-    "categories": ["accessibility", "circulation", "safety", "egress"],
+    "totalRules": 8,
+    "enabledRules": 8,
+    "categories": ["accessibility", "circulation", "quality", "safety"],
     "description": "Solibri-based rule library for VLM visual compliance checking. Focused on rules that can be evaluated through visual inspection of IFC/BIM model snapshots."
   },
   "rules": [
     {
+      "id": "VLM-ACC-RAMP-001",
+      "title": "207 Accessible Ramp Rule",
+      "description": "Verifies ramp accessibility by checking slope/gradient, width, handrail presence and configuration, landing dimensions, and clear floor space. Ensures ramps comply with accessibility standards.",
+      "category": "accessibility",
+      "severity": "critical",
+      "source": {
+        "solibriId": "SOL-207",
+        "solibriTitle": "207 Accessible Ramp Rule",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500004738262-207-Accessible-Ramp-Rule",
+        "version": "v25.9.0+"
+      },
+      "visualSuitability": {
+        "isSuitable": true,
+        "confidence": 0.82,
+        "reasoning": "Ramp slope is visually assessable, handrails are clearly visible, and landing presence can be confirmed. VLM can evaluate relative steepness and identify safety features.",
+        "visualAspects": [
+          "Ramp slope visually apparent",
+          "Handrail presence observable",
+          "Landing size and position visible",
+          "Ramp width measurable",
+          "Edge protection (curbs) visible"
+        ],
+        "limitations": [
+          "Exact slope percentage difficult without measurements",
+          "Handrail height precise measurement challenging",
+          "Very gentle slopes (<5%) hard to distinguish from level surfaces"
+        ]
+      },
+      "visualEvidence": {
+        "lookFor": [
+          "Ramp incline and slope",
+          "Ramp width",
+          "Handrails on one or both sides",
+          "Landing at top and bottom",
+          "Intermediate landings for long ramps",
+          "Edge protection/curbs",
+          "Clear floor space at ramp ends"
+        ],
+        "passIndicators": [
+          "Gentle visible slope (appears <8%)",
+          "Handrails present on both sides",
+          "Level landings at transitions",
+          "Adequate ramp width",
+          "Edge protection visible"
+        ],
+        "failIndicators": [
+          "Steep slope (visibly >8%)",
+          "Missing handrails",
+          "No landing at top or bottom",
+          "Ramp too narrow",
+          "Missing edge protection on drop-offs"
+        ],
+        "uncertainIndicators": [
+          "Slope appears borderline, cannot determine exact percentage",
+          "Unclear if handrails meet height requirements",
+          "Landing size unclear from current view",
+          "Cannot see full ramp length"
+        ]
+      },
+      "evaluationCriteria": {
+        "pass": [
+          "Ramp slope appears gentle (consistent with 1:12 or less)",
+          "Handrails present and appear continuous",
+          "Level landings visible at top, bottom, and intermediate points",
+          "Adequate width for wheelchair passage"
+        ],
+        "fail": [
+          "Ramp slope appears steep (inconsistent with 1:12 max)",
+          "Handrails absent or discontinuous",
+          "Missing required landings",
+          "Ramp width appears insufficient"
+        ],
+        "uncertain": [
+          "Slope percentage not determinable from current view",
+          "Need side elevation to assess slope properly",
+          "Handrail configuration unclear",
+          "Landing dimensions not fully visible"
+        ]
+      },
+      "navigationHints": {
+        "recommendedViews": ["SIDE", "ISO", "FRONT"],
+        "zoomLevel": "medium",
+        "isolateCategories": ["IFCRAMP", "IFCRAMPFLIGHT", "IFCRAILING", "IFCSLAB"],
+        "usePlanCut": false,
+        "tips": [
+          "Use side elevation to assess slope angle",
+          "Front view shows handrail presence",
+          "Zoom to check landing levelness",
+          "Orbit to verify handrails on both sides"
+        ]
+      },
+      "findingTemplates": {
+        "pass": "Ramp meets accessibility standards. Slope appears compliant, handrails present, landings adequate.",
+        "fail": "Ramp fails accessibility check. {issue}: {details}.",
+        "uncertain": "Cannot fully assess ramp compliance. {reason}. Recommend {action}.",
+        "placeholders": ["issue", "details", "reason", "action"]
+      },
+      "dimensionalRequirements": [
+        {
+          "parameter": "Maximum Slope",
+          "typicalValue": "1:12 (8.33%)",
+          "referenceStandard": "ADA 405.2",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Minimum Width",
+          "typicalValue": "36 inches (915mm) clear",
+          "referenceStandard": "ADA 405.5",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Handrail Height",
+          "typicalValue": "34-38 inches (865-965mm)",
+          "referenceStandard": "ADA 505.4",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Landing Size",
+          "typicalValue": "60\" x 60\" minimum",
+          "referenceStandard": "ADA 405.7",
+          "visuallyMeasurable": true
+        }
+      ],
+      "tags": ["accessibility", "ramp", "slope", "handrails", "ADA", "wheelchair"],
+      "enabled": true,
+      "notes": "Maximum slope 1:12 for new construction. Steeper slopes (up to 1:8) may be allowed for existing facilities with space constraints. Handrail extensions required at top and bottom."
+    },
+
+    {
       "id": "VLM-ACC-DOOR-001",
-      "title": "Accessible Door Clearance",
-      "description": "Verifies that doors have adequate maneuvering clearance on both pull and push sides, including free space in front of the door and on the latch/hinge sides. Checks door width, opening direction, and surrounding obstacles.",
+      "title": "208 Accessible Door Rule",
+      "description": "Verifies door accessibility from different perspectives, including dimensions, glazing ratios, opening directions, and free spaces around the door.",
       "category": "accessibility",
       "severity": "critical",
       "source": {
         "solibriId": "SOL-208",
         "solibriTitle": "208 Accessible Door Rule",
         "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500004738282-208-Accessible-Door-Rule",
-        "version": "v9.6+"
+        "version": "not stated in dedicated help article"
       },
       "visualSuitability": {
         "isSuitable": true,
@@ -126,9 +255,153 @@
       "enabled": true,
       "notes": "This rule is based on ADA and ICC A117.1 standards. Clearance requirements vary based on approach direction (front, latch, hinge) and whether door has a closer and latch."
     },
+
+    {
+      "id": "VLM-ACC-FLOOR-001",
+      "title": "209 Free Floor Space",
+      "description": "Checks accessibility-related free floor space in selected spaces, such as unobstructed corridor width, wheelchair turning space, and clearance zones needed for access and maneuvering.",
+      "category": "accessibility",
+      "severity": "critical",
+      "source": {
+        "solibriId": "SOL-209",
+        "solibriTitle": "209 Free Floor Space",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500004610661-209-Free-Floor-Space",
+        "version": "not stated in dedicated help article"
+      },
+      "visualSuitability": {
+        "isSuitable": true,
+        "confidence": 0.91,
+        "reasoning": "Free floor space, turning areas, and corridor clearances are strongly visible in plan and plan-cut views. A VLM can assess whether open floor zones are occupied by walls, fixtures, furniture, or other modeled elements.",
+        "visualAspects": [
+          "Open floor area is visible in plan view",
+          "Turning-circle zones can be approximated visually",
+          "Corridor pinch points are visible",
+          "Furniture or fixtures intruding into clear space are visible",
+          "Access space next to beds, sanitary fixtures, or doors can be inspected"
+        ],
+        "limitations": [
+          "Exact compliance depends on rule parameters and reference dimensions",
+          "Movable versus fixed objects may be ambiguous",
+          "Overlapping clearances may require metadata or measured geometry"
+        ]
+      },
+      "visualEvidence": {
+        "lookFor": [
+          "Unobstructed corridor width",
+          "Wheelchair turning space inside rooms",
+          "Open floor space next to fixtures, beds, or equipment",
+          "Walls, furniture, or components intruding into required clear areas",
+          "Pinch points or dead-end maneuvering zones"
+        ],
+        "passIndicators": [
+          "Continuous open floor space is visible",
+          "Turning area appears unobstructed",
+          "Corridor width appears consistently clear",
+          "Approach space to the relevant object or area appears usable"
+        ],
+        "failIndicators": [
+          "Furniture or fixtures block turning or approach space",
+          "Corridor width is visibly narrowed by obstructions",
+          "Required free floor zone is occupied by fixed elements",
+          "Access beside the target object appears pinched or blocked"
+        ],
+        "uncertainIndicators": [
+          "Exact free-space dimensions cannot be confirmed from the current view",
+          "Partial occlusion hides room corners or clearance edges",
+          "It is unclear whether the object causing the obstruction is movable",
+          "The intended checked use case is unclear without rule parameters"
+        ]
+      },
+      "evaluationCriteria": {
+        "pass": [
+          "Required free floor space appears unobstructed",
+          "Turning or approach space appears continuous and usable",
+          "No obvious fixed obstruction intrudes into the required clear area"
+        ],
+        "fail": [
+          "A fixed object clearly intrudes into the required free floor area",
+          "Turning or maneuvering space is visibly insufficient",
+          "The circulation zone is clearly obstructed or pinched"
+        ],
+        "uncertain": [
+          "The relevant free-space requirement depends on project-specific parameters",
+          "A dimensioned or top view is needed to verify compliance",
+          "The current evidence does not show the full required clearance area"
+        ]
+      },
+      "navigationHints": {
+        "recommendedViews": ["TOP", "ISO"],
+        "zoomLevel": "medium",
+        "isolateCategories": [
+          "IFCSPACE",
+          "IFCWALL",
+          "IFCFURNISHINGELEMENT",
+          "IFCSANITARYTERMINAL",
+          "IFCBUILDINGELEMENTPROXY",
+          "IFCSLAB"
+        ],
+        "usePlanCut": true,
+        "planCutHeight": "1.0m",
+        "tips": [
+          "Use plan view first to inspect clear floor areas",
+          "Check the narrowest points of the space",
+          "Inspect turning areas around fixtures and inside bathrooms",
+          "Hide upper elements if they visually clutter floor-space assessment"
+        ]
+      },
+      "findingTemplates": {
+        "pass": "Required free floor space appears adequate and unobstructed for the checked accessibility condition.",
+        "fail": "Free floor space is insufficient. {obstruction_type} intrudes into the required {zone_type}.",
+        "uncertain": "Cannot fully verify free floor space. {reason}. Recommend {suggested_action}.",
+        "placeholders": ["obstruction_type", "zone_type", "reason", "suggested_action"]
+      },
+      "dimensionalRequirements": [
+        {
+          "parameter": "Unobstructed Corridor Width",
+          "typicalValue": "1.2 m",
+          "referenceStandard": "Explicit example on Solibri Rule 209 page",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Wheelchair Turning Circle",
+          "typicalValue": "1.5 m diameter",
+          "referenceStandard": "Explicit example on Solibri Rule 209 page",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Turning Space (ADA reference)",
+          "typicalValue": "60 inches (1525 mm) diameter minimum",
+          "referenceStandard": "ADA / Access Board Section 304.3.1",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "T-Shaped Turning Space (ADA reference)",
+          "typicalValue": "60 inches x 60 inches overall minimum, arms/base 36 inches minimum",
+          "referenceStandard": "ADA / Access Board Section 304.3.2",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Clear Floor or Ground Space (ADA reference)",
+          "typicalValue": "30 inches x 48 inches minimum",
+          "referenceStandard": "ADA / Access Board Section 305",
+          "visuallyMeasurable": true
+        }
+      ],
+      "tags": [
+        "accessibility",
+        "free floor space",
+        "turning space",
+        "corridor width",
+        "wheelchair",
+        "ADA"
+      ],
+      "enabled": true,
+      "notes": "The dedicated Solibri Rule 209 documentation describes this as a configurable rule for different accessibility-related free-space checks and gives examples of 1.2 m unobstructed corridor width and a 1.5 m wheelchair turning circle. The ADA values listed here are external reference values for visual interpretation and should be treated as code references, not as fixed Solibri defaults. Spaces must be classified by usage to use the Solibri rule."
+    },
+
     {
       "id": "VLM-ACC-STAIR-001",
-      "title": "Accessible Stair Geometry and Safety",
+      "title": "210 Accessible Stair Rule",
       "description": "Checks staircase accessibility including riser height consistency, tread depth uniformity, stair width, handrail presence and height, landing dimensions, and headroom clearance. Ensures stairs are safe and accessible.",
       "category": "accessibility",
       "severity": "critical",
@@ -267,146 +540,405 @@
       ],
       "tags": ["accessibility", "stairs", "handrails", "safety", "egress", "IBC"],
       "enabled": true,
-      "notes": "Riser height consistency is critical for safety. Maximum 3/8 inch variation between risers in a flight per IBC. Handrails must be continuous without interruption."
+      "notes": "The dedicated Solibri rule checks stairs, landings, handrails, and tactile ground surface indicators (TGSI). Stairs must be classified in the Vertical Access classification. Dimensional thresholds are defined through rule parameters and can follow local standards such as IBC."
     },
+
     {
-      "id": "VLM-ACC-RAMP-001",
-      "title": "Accessible Ramp Slope and Features",
-      "description": "Verifies ramp accessibility by checking slope/gradient, width, handrail presence and configuration, landing dimensions, and clear floor space. Ensures ramps comply with accessibility standards.",
-      "category": "accessibility",
-      "severity": "critical",
+      "id": "VLM-MAINT-FRONT-001",
+      "title": "226 Free Area in Front of Components",
+      "description": "Checks that required free area exists in front of selected components, ensuring sufficient space for access, operation, and maintenance.",
+      "category": "safety",
+      "severity": "moderate",
       "source": {
-        "solibriId": "SOL-207",
-        "solibriTitle": "207 Accessible Ramp Rule",
-        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500004738262-207-Accessible-Ramp-Rule",
-        "version": "v25.9.0+"
+        "solibriId": "SOL-226",
+        "solibriTitle": "226 Free Area in Front of Components",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/4406907043351-226-Free-Area-in-Front-of-Components",
+        "version": "not stated in dedicated help article"
       },
       "visualSuitability": {
         "isSuitable": true,
-        "confidence": 0.82,
-        "reasoning": "Ramp slope is visually assessable, handrails are clearly visible, and landing presence can be confirmed. VLM can evaluate relative steepness and identify safety features.",
+        "confidence": 0.9,
+        "reasoning": "Front clearance zones are strongly visible in plan and 3D views. A VLM can determine whether required access space in front of components is obstructed by walls, equipment, or furniture.",
         "visualAspects": [
-          "Ramp slope visually apparent",
-          "Handrail presence observable",
-          "Landing size and position visible",
-          "Ramp width measurable",
-          "Edge protection (curbs) visible"
+          "Component front face is visible",
+          "Clear space in front of component can be visually assessed",
+          "Obstructions such as walls, furniture, or equipment are visible",
+          "Relative depth of clearance area can be approximated",
+          "Multiple components and their interactions can be observed"
         ],
         "limitations": [
-          "Exact slope percentage difficult without measurements",
-          "Handrail height precise measurement challenging",
-          "Very gentle slopes (<5%) hard to distinguish from level surfaces"
+          "Exact depth and width of free area depend on rule parameters",
+          "Component orientation may require IFC metadata",
+          "Front direction may not always be visually explicit",
+          "Movable vs fixed obstructions may be ambiguous"
         ]
       },
       "visualEvidence": {
         "lookFor": [
-          "Ramp incline and slope",
-          "Ramp width",
-          "Handrails on one or both sides",
-          "Landing at top and bottom",
-          "Intermediate landings for long ramps",
-          "Edge protection/curbs",
-          "Clear floor space at ramp ends"
+          "Component front face (doors, panels, equipment, windows, cabinets)",
+          "Clear space directly in front of the component",
+          "Walls, furniture, or other components blocking access",
+          "Depth of usable space in front of the component",
+          "Overlap of clearance zones between adjacent components"
         ],
         "passIndicators": [
-          "Gentle visible slope (appears <8%)",
-          "Handrails present on both sides",
-          "Level landings at transitions",
-          "Adequate ramp width",
-          "Edge protection visible"
+          "Front area appears open and unobstructed",
+          "Sufficient space exists for approach and operation",
+          "No visible obstruction blocks access to the component",
+          "Clearance zone appears continuous"
         ],
         "failIndicators": [
-          "Steep slope (visibly >8%)",
-          "Missing handrails",
-          "No landing at top or bottom",
-          "Ramp too narrow",
-          "Missing edge protection on drop-offs"
+          "Object or wall directly blocks front access",
+          "Clearance area is visibly too shallow",
+          "Component is placed too close to another element",
+          "Overlapping elements reduce usable front space"
         ],
         "uncertainIndicators": [
-          "Slope appears borderline, cannot determine exact percentage",
-          "Unclear if handrails meet height requirements",
-          "Landing size unclear from current view",
-          "Cannot see full ramp length"
+          "Front orientation of component unclear",
+          "Exact required clearance depth cannot be determined",
+          "Partial occlusion of clearance area",
+          "Unclear whether obstruction is permanent"
         ]
       },
       "evaluationCriteria": {
         "pass": [
-          "Ramp slope appears gentle (consistent with 1:12 or less)",
-          "Handrails present and appear continuous",
-          "Level landings visible at top, bottom, and intermediate points",
-          "Adequate width for wheelchair passage"
+          "Required free area in front of the component appears unobstructed",
+          "Access to the component appears possible",
+          "Clearance zone appears continuous and usable"
         ],
         "fail": [
-          "Ramp slope appears steep (inconsistent with 1:12 max)",
-          "Handrails absent or discontinuous",
-          "Missing required landings",
-          "Ramp width appears insufficient"
+          "Front clearance is visibly obstructed",
+          "Insufficient space for access or operation",
+          "Component cannot be approached due to obstruction"
         ],
         "uncertain": [
-          "Slope percentage not determinable from current view",
-          "Need side elevation to assess slope properly",
-          "Handrail configuration unclear",
-          "Landing dimensions not fully visible"
+          "Required clearance depends on rule parameters",
+          "Component orientation unclear",
+          "Need measurements or different view to confirm"
         ]
       },
       "navigationHints": {
-        "recommendedViews": ["SIDE", "ISO", "FRONT"],
+        "recommendedViews": ["TOP", "ISO", "FRONT"],
         "zoomLevel": "medium",
-        "isolateCategories": ["IFCRAMP", "IFCRAMPFLIGHT", "IFCRAILING", "IFCSLAB"],
-        "usePlanCut": false,
+        "isolateCategories": [
+          "IFCDOOR",
+          "IFCWINDOW",
+          "IFCFURNISHINGELEMENT",
+          "IFCELECTRICDISTRIBUTIONBOARD",
+          "IFCFLOWTERMINAL",
+          "IFCWALL"
+        ],
+        "usePlanCut": true,
+        "planCutHeight": "1.2m",
         "tips": [
-          "Use side elevation to assess slope angle",
-          "Front view shows handrail presence",
-          "Zoom to check landing levelness",
-          "Orbit to verify handrails on both sides"
+          "View the component orthogonally to understand front direction",
+          "Use plan view to assess depth of clearance",
+          "Inspect equipment rooms and service areas",
+          "Check for overlapping clearance zones"
         ]
       },
       "findingTemplates": {
-        "pass": "Ramp meets accessibility standards. Slope appears compliant, handrails present, landings adequate.",
-        "fail": "Ramp fails accessibility check. {issue}: {details}.",
-        "uncertain": "Cannot fully assess ramp compliance. {reason}. Recommend {action}.",
-        "placeholders": ["issue", "details", "reason", "action"]
+        "pass": "Required free area in front of the component appears adequate and unobstructed.",
+        "fail": "Front clearance is insufficient. {obstruction} blocks required access in front of the component.",
+        "uncertain": "Cannot fully verify front clearance. {reason}. Recommend {action}.",
+        "placeholders": ["obstruction", "reason", "action"]
       },
       "dimensionalRequirements": [
         {
-          "parameter": "Maximum Slope",
-          "typicalValue": "1:12 (8.33%)",
-          "referenceStandard": "ADA 405.2",
+          "parameter": "Free Area in Front of Component",
+          "typicalValue": "Configurable (depends on component type and rule settings)",
+          "referenceStandard": "Solibri Rule 226 parameter",
           "visuallyMeasurable": true
         },
         {
-          "parameter": "Minimum Width",
-          "typicalValue": "36 inches (915mm) clear",
-          "referenceStandard": "ADA 405.5",
+          "parameter": "Working Clearance Depth (reference)",
+          "typicalValue": "Varies by system (e.g., electrical panels often ~36 inches / 915mm)",
+          "referenceStandard": "Typical code practice (e.g., NEC / local regulations)",
           "visuallyMeasurable": true
         },
         {
-          "parameter": "Handrail Height",
-          "typicalValue": "34-38 inches (865-965mm)",
-          "referenceStandard": "ADA 505.4",
-          "visuallyMeasurable": true
-        },
-        {
-          "parameter": "Landing Size",
-          "typicalValue": "60\" x 60\" minimum",
-          "referenceStandard": "ADA 405.7",
+          "parameter": "Accessible Clear Floor Space (ADA reference)",
+          "typicalValue": "30 inches x 48 inches (760mm x 1220mm)",
+          "referenceStandard": "ADA Section 305",
           "visuallyMeasurable": true
         }
       ],
-      "tags": ["accessibility", "ramp", "slope", "handrails", "ADA", "wheelchair"],
+      "tags": [
+        "clearance",
+        "front area",
+        "maintenance",
+        "access",
+        "equipment",
+        "safety"
+      ],
       "enabled": true,
-      "notes": "Maximum slope 1:12 for new construction. Steeper slopes (up to 1:8) may be allowed for existing facilities with space constraints. Handrail extensions required at top and bottom."
+      "notes": "The dedicated Solibri Rule 226 checks that sufficient free area exists in front of selected components. The size and orientation of the clearance area are defined through rule parameters and depend on component type. External reference values (e.g., ADA or electrical codes) are included for interpretation and are not fixed Solibri defaults."
     },
+
+    {
+      "id": "VLM-SAFE-GUARD-001",
+      "title": "236 Guarding Against Falling",
+      "description": "Checks that horizontal structures such as slabs, balconies, and platforms are protected against falling by walls, railings, or adjacent structures when a height difference creates a fall hazard.",
+      "category": "safety",
+      "severity": "critical",
+      "source": {
+        "solibriId": "SOL-236",
+        "solibriTitle": "236 Horizontal Structures Must Be Guarded Against Falling",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500004610901-236-Horizontal-Structures-Must-Be-Guarded-Against-Falling",
+        "version": "not stated in dedicated help article"
+      },
+      "visualSuitability": {
+        "isSuitable": true,
+        "confidence": 0.9,
+        "reasoning": "Edges of horizontal structures and presence or absence of guarding elements are highly visible in 3D and elevation views. A VLM can detect open edges, drops, and missing or incomplete barriers.",
+        "visualAspects": [
+          "Horizontal slab edges are clearly visible",
+          "Height differences between adjacent levels are observable",
+          "Railings, walls, or parapets are visible",
+          "Open edges or voids can be identified",
+          "Continuity of guarding elements can be assessed"
+        ],
+        "limitations": [
+          "Exact fall height threshold depends on rule parameters",
+          "Guardrail height cannot be precisely measured without scale",
+          "Small gaps or openings in railings may be hard to detect",
+          "Requires 3D or elevation view for accurate assessment"
+        ]
+      },
+      "visualEvidence": {
+        "lookFor": [
+          "Edges of slabs, balconies, mezzanines, or platforms",
+          "Height differences between walking surface and adjacent lower level",
+          "Presence of railings, parapets, or walls at edges",
+          "Open sides without protection",
+          "Continuity of guarding elements along edges"
+        ],
+        "passIndicators": [
+          "All exposed edges appear protected by guardrails or walls",
+          "No visible open edge with significant drop",
+          "Guarding elements appear continuous along edge",
+          "Adjacent structures provide equivalent protection"
+        ],
+        "failIndicators": [
+          "Open edge with visible drop and no guarding",
+          "Missing railing or parapet at exposed edge",
+          "Discontinuity or gap in guarding element",
+          "Platform or balcony edge left unprotected"
+        ],
+        "uncertainIndicators": [
+          "Height difference unclear from current view",
+          "Guarding element partially occluded",
+          "Need different angle to confirm edge protection",
+          "Unclear if adjacent surface provides sufficient protection"
+        ]
+      },
+      "evaluationCriteria": {
+        "pass": [
+          "All exposed edges appear protected against falling",
+          "Guarding elements appear continuous and effective",
+          "No visible fall hazard along horizontal surfaces"
+        ],
+        "fail": [
+          "Exposed edge lacks visible guarding",
+          "Guarding is clearly incomplete or missing",
+          "Obvious fall hazard present at horizontal edge"
+        ],
+        "uncertain": [
+          "Fall height threshold cannot be determined visually",
+          "Need elevation or section view to confirm",
+          "Guarding adequacy unclear without measurements"
+        ]
+      },
+      "navigationHints": {
+        "recommendedViews": ["ISO", "SIDE", "FRONT"],
+        "zoomLevel": "medium",
+        "isolateCategories": [
+          "IFCSLAB",
+          "IFCWALL",
+          "IFCRAILING",
+          "IFCSTAIR",
+          "IFCRAMP"
+        ],
+        "usePlanCut": false,
+        "tips": [
+          "Orbit around slab and balcony edges",
+          "Inspect mezzanines and voids carefully",
+          "Check continuity of railings along edges",
+          "Use side view to understand height differences"
+        ]
+      },
+      "findingTemplates": {
+        "pass": "Horizontal structure appears adequately protected against falling.",
+        "fail": "Fall protection issue detected. {location} has an exposed edge without sufficient guarding.",
+        "uncertain": "Cannot fully verify fall protection. {reason}. Recommend {action}.",
+        "placeholders": ["location", "reason", "action"]
+      },
+      "dimensionalRequirements": [
+        {
+          "parameter": "Fall Height Threshold",
+          "typicalValue": "Configurable (project/code-dependent)",
+          "referenceStandard": "Solibri Rule 236 parameter",
+          "visuallyMeasurable": false
+        },
+        {
+          "parameter": "Guardrail Height (reference)",
+          "typicalValue": "Typically ~42 inches (1065mm)",
+          "referenceStandard": "IBC / common safety standards",
+          "visuallyMeasurable": true
+        }
+      ],
+      "tags": [
+        "safety",
+        "guardrail",
+        "fall protection",
+        "balcony",
+        "edge protection"
+      ],
+      "enabled": true,
+      "notes": "The dedicated Solibri Rule 236 checks whether horizontal structures with a height difference are properly protected against falling by guardrails, walls, or adjacent structures. The minimum fall height and required guarding are defined through rule parameters. External reference values such as guardrail heights are based on building codes and are not fixed Solibri defaults."
+    },
+
+    {
+      "id": "VLM-ACC-SPACE-001",
+      "title": "246 Accessible Space",
+      "description": "Checks that required accessible spaces exist within selected spaces and that these spaces are reachable from the passageway, ensuring sufficient maneuvering and usability.",
+      "category": "accessibility",
+      "severity": "critical",
+      "source": {
+        "solibriId": "SOL-246",
+        "solibriTitle": "246 Accessible Space",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/33043676957975-246-Accessible-Space",
+        "version": "v25.6.0+"
+      },
+      "visualSuitability": {
+        "isSuitable": true,
+        "confidence": 0.9,
+        "reasoning": "Accessible spaces and their connectivity to entrances are visually assessable in plan and 3D views. A VLM can determine whether required maneuvering zones exist and whether they are reachable without obstruction.",
+        "visualAspects": [
+          "Clear maneuvering space inside rooms is visible",
+          "Access path from door to target space is visible",
+          "Obstructions within accessible zones are visible",
+          "Spatial relationships between entrance and target area are observable",
+          "Continuity of free space can be visually traced"
+        ],
+        "limitations": [
+          "Exact geometry of required space (cylinder/cuboid) depends on parameters",
+          "Accessibility requirements vary by use case",
+          "Connectivity may depend on IFC classification or semantics",
+          "Precise dimensions require scale reference"
+        ]
+      },
+      "visualEvidence": {
+        "lookFor": [
+          "Accessible space inside rooms (e.g., bathrooms, circulation zones)",
+          "Clear path from entrance or door to accessible space",
+          "Furniture or fixtures obstructing maneuvering areas",
+          "Continuity of free floor space",
+          "Entrances and their relation to accessible zones"
+        ],
+        "passIndicators": [
+          "Accessible space appears present and unobstructed",
+          "Continuous clear path exists from entrance to accessible area",
+          "No visible obstruction blocks maneuvering or access",
+          "Space appears usable for intended accessibility purpose"
+        ],
+        "failIndicators": [
+          "Required accessible space is missing or occupied",
+          "Path from entrance to accessible space is blocked",
+          "Furniture or fixtures obstruct required maneuvering area",
+          "Accessible space is isolated and not reachable"
+        ],
+        "uncertainIndicators": [
+          "Exact size or shape of accessible space unclear",
+          "Connectivity cannot be verified from current view",
+          "Partial occlusion of relevant areas",
+          "Need plan view or measurements to confirm"
+        ]
+      },
+      "evaluationCriteria": {
+        "pass": [
+          "Accessible space appears present and reachable from entrance",
+          "Required maneuvering area appears unobstructed",
+          "Continuous access path is visible"
+        ],
+        "fail": [
+          "Accessible space is missing, obstructed, or not reachable",
+          "No clear path connects entrance to accessible space",
+          "Required maneuvering area is clearly insufficient"
+        ],
+        "uncertain": [
+          "Accessibility depends on configured rule parameters",
+          "Exact dimensions or connectivity cannot be verified visually",
+          "Need plan view or measurements for confirmation"
+        ]
+      },
+      "navigationHints": {
+        "recommendedViews": ["TOP", "ISO"],
+        "zoomLevel": "medium",
+        "isolateCategories": [
+          "IFCSPACE",
+          "IFCDOOR",
+          "IFCFURNISHINGELEMENT",
+          "IFCSANITARYTERMINAL",
+          "IFCWALL"
+        ],
+        "usePlanCut": true,
+        "planCutHeight": "1.0m",
+        "tips": [
+          "Use plan view to verify accessible space and paths",
+          "Inspect entrance-to-space connectivity",
+          "Check maneuvering zones around fixtures",
+          "Ensure full visibility of the room footprint"
+        ]
+      },
+      "findingTemplates": {
+        "pass": "Accessible space appears adequate and reachable from the entrance.",
+        "fail": "Accessible space requirement not met. {issue} prevents proper maneuvering or access.",
+        "uncertain": "Cannot fully verify accessible space. {reason}. Recommend {action}.",
+        "placeholders": ["issue", "reason", "action"]
+      },
+      "dimensionalRequirements": [
+        {
+          "parameter": "Accessible Space Volume",
+          "typicalValue": "Configurable (cylinder or cuboid depending on rule settings)",
+          "referenceStandard": "Solibri Rule 246 parameter",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Wheelchair Turning Space (ADA reference)",
+          "typicalValue": "60 inches (1525 mm) diameter",
+          "referenceStandard": "ADA Section 304.3",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Clear Floor Space (ADA reference)",
+          "typicalValue": "30 inches x 48 inches (760 mm x 1220 mm)",
+          "referenceStandard": "ADA Section 305",
+          "visuallyMeasurable": true
+        }
+      ],
+      "tags": [
+        "accessibility",
+        "accessible space",
+        "maneuvering",
+        "clearance",
+        "wheelchair",
+        "ADA"
+      ],
+      "enabled": true,
+      "notes": "The dedicated Solibri Rule 246 checks that required accessible space exists within a space and that it is reachable from the passageway. The space can be defined as a cylinder or cuboid depending on rule parameters. ADA values are included as external references and are not fixed Solibri defaults."
+    },
+
     {
       "id": "VLM-CIRC-WIDTH-001",
-      "title": "Free Floor Space",
+      "title": "247 Local Accessible Circulation Rule",
       "description": "Checks that corridors and circulation spaces have adequate width for accessible passage, identifies obstructions that narrow the path, and verifies clear floor space. Ensures wheelchair-accessible circulation.",
       "category": "circulation",
       "severity": "critical",
       "source": {
         "solibriId": "SOL-247",
-        "solibriTitle": "247 Local Accessible Circulation",
-        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500004610661-209-Free-Floor-Space",
+        "solibriTitle": "247 Local Accessible Circulation Rule",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/36284303842583-247-Local-Accessible-Circulation-Rule",
         "version": "v25.12.0+"
       },
       "visualSuitability": {
@@ -492,38 +1024,298 @@
       },
       "dimensionalRequirements": [
         {
-          "parameter": "Minimum Corridor Width",
-          "typicalValue": "36 inches (915mm) clear",
-          "referenceStandard": "ADA 403.5.1",
+          "parameter": "Minimum Width",
+          "typicalValue": "1.20 m default",
+          "referenceStandard": "Solibri Rule 247 default parameter",
           "visuallyMeasurable": true
         },
         {
-          "parameter": "Passing Space Width",
-          "typicalValue": "60 inches (1525mm) at intervals",
-          "referenceStandard": "ADA 403.5.3",
-          "visuallyMeasurable": true
+          "parameter": "Default Bottom Elevation",
+          "typicalValue": "200 mm",
+          "referenceStandard": "Solibri Rule 247 default parameter",
+          "visuallyMeasurable": false
         },
         {
-          "parameter": "Maximum Protruding Objects",
-          "typicalValue": "4 inches (100mm) into path",
-          "referenceStandard": "ADA 307",
-          "visuallyMeasurable": true
+          "parameter": "Default Top Elevation",
+          "typicalValue": "2.00 m",
+          "referenceStandard": "Solibri Rule 247 default parameter",
+          "visuallyMeasurable": false
+        },
+        {
+          "parameter": "Connection Tolerance",
+          "typicalValue": "250 mm default",
+          "referenceStandard": "Solibri Rule 247 default parameter",
+          "visuallyMeasurable": false
+        },
+        {
+          "parameter": "Maximum Distance Between Free Spaces",
+          "typicalValue": "25.00 m default when enabled",
+          "referenceStandard": "Solibri Rule 247 default parameter",
+          "visuallyMeasurable": false
         }
       ],
       "tags": ["circulation", "corridor", "width", "accessibility", "clearance", "ADA"],
       "enabled": true,
-      "notes": "36-inch minimum for accessible routes. 60-inch width required for two wheelchairs to pass. Protruding objects limited to 4 inches between 27-80 inches above floor."
+      "notes": "Mapped to SOL-247 Local Accessible Circulation, not the Solibri 209 Free Floor Space article. 36-inch minimum for accessible routes. 60-inch width required for two wheelchairs to pass. Protruding objects limited to 4 inches between 27-80 inches above floor."
     },
+
+    {
+      "id": "VLM-ACC-OBJECT-001",
+      "title": "248 Accessible Area around Objects",
+      "description": "Checks that required accessible areas exist around selected objects, such as in front of, behind, or beside components, ensuring sufficient clearance for approach and use.",
+      "category": "accessibility",
+      "severity": "critical",
+      "source": {
+        "solibriId": "SOL-248",
+        "solibriTitle": "248 Accessible Area around Objects Rule",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/37117476999063-248-Accessible-Area-around-Objects-Rule",
+        "version": "v25.12.0+"
+      },
+      "visualSuitability": {
+        "isSuitable": true,
+        "confidence": 0.93,
+        "reasoning": "Clearance zones around objects are highly visible in plan and 3D views. A VLM can detect whether required approach spaces are obstructed by walls, fixtures, or furniture.",
+        "visualAspects": [
+          "Target object location is clearly visible",
+          "Front, side, and rear clearance zones can be visually approximated",
+          "Obstructions within clearance zones are visible",
+          "Relative spacing between objects and walls is observable",
+          "Accessible approach directions can be inferred"
+        ],
+        "limitations": [
+          "Exact clearance dimensions depend on rule parameters",
+          "Orientation of clearance zones may require metadata",
+          "Movable vs fixed objects may be ambiguous",
+          "Overlapping clearance zones may be difficult to interpret visually"
+        ]
+      },
+      "visualEvidence": {
+        "lookFor": [
+          "Target objects such as toilets, sinks, equipment, or doors",
+          "Clear floor space in front of, beside, or behind the object",
+          "Walls, fixtures, or furniture intruding into clearance zones",
+          "Available approach directions to the object",
+          "Spacing between adjacent objects"
+        ],
+        "passIndicators": [
+          "Clear space exists around the object in required directions",
+          "No visible obstruction within the accessible area",
+          "Object appears reachable and usable from at least one side",
+          "Clearance zone appears continuous and unobstructed"
+        ],
+        "failIndicators": [
+          "Wall or fixture blocks required side or front clearance",
+          "Object is tightly enclosed with no usable approach space",
+          "Clearance area is visibly occupied by another element",
+          "Access path to the object is obstructed"
+        ],
+        "uncertainIndicators": [
+          "Exact clearance dimensions cannot be verified visually",
+          "Orientation of required clearance is unclear",
+          "Partial occlusion of object or surrounding space",
+          "Unclear whether obstruction is permanent or movable"
+        ]
+      },
+      "evaluationCriteria": {
+        "pass": [
+          "Required accessible area around the object appears unobstructed",
+          "At least one valid approach direction appears usable",
+          "No visible fixed obstruction intrudes into the required clearance zone"
+        ],
+        "fail": [
+          "Required accessible area is visibly obstructed",
+          "Object cannot be approached or used due to surrounding elements",
+          "Clearance zone is clearly insufficient for accessibility"
+        ],
+        "uncertain": [
+          "Clearance requirements depend on object type and parameters",
+          "Need plan view or dimensions to verify exact compliance",
+          "Object orientation or clearance direction is unclear"
+        ]
+      },
+      "navigationHints": {
+        "recommendedViews": ["TOP", "ISO", "FRONT"],
+        "zoomLevel": "medium",
+        "isolateCategories": [
+          "IFCSANITARYTERMINAL",
+          "IFCFURNISHINGELEMENT",
+          "IFCDOOR",
+          "IFCSPACE",
+          "IFCWALL"
+        ],
+        "usePlanCut": true,
+        "planCutHeight": "1.0m",
+        "tips": [
+          "Use plan view to inspect clearance zones around objects",
+          "Check front and side access to fixtures",
+          "Zoom into bathrooms and equipment areas",
+          "Isolate relevant object categories for clarity"
+        ]
+      },
+      "findingTemplates": {
+        "pass": "Accessible area around the object appears adequate and unobstructed.",
+        "fail": "Accessible area is insufficient. {obstruction} intrudes into the required {clearance_direction} clearance zone.",
+        "uncertain": "Cannot fully verify accessible area. {reason}. Recommend {action}.",
+        "placeholders": ["obstruction", "clearance_direction", "reason", "action"]
+      },
+      "dimensionalRequirements": [
+        {
+          "parameter": "Accessible Clearance Around Object",
+          "typicalValue": "Configurable (depends on object type and rule settings)",
+          "referenceStandard": "Solibri Rule 248 parameter",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Clear Floor Space (ADA reference)",
+          "typicalValue": "30 inches x 48 inches (760mm x 1220mm) minimum",
+          "referenceStandard": "ADA Section 305",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Toilet Side Clearance (ADA reference)",
+          "typicalValue": "60 inches (1525mm) minimum width",
+          "referenceStandard": "ADA Section 604",
+          "visuallyMeasurable": true
+        },
+        {
+          "parameter": "Lavatory Clearance (ADA reference)",
+          "typicalValue": "30 inches x 48 inches approach space",
+          "referenceStandard": "ADA Section 606",
+          "visuallyMeasurable": true
+        }
+      ],
+      "tags": [
+        "accessibility",
+        "clearance",
+        "objects",
+        "fixtures",
+        "maneuvering",
+        "ADA"
+      ],
+      "enabled": true,
+      "notes": "The dedicated Solibri Rule 248 checks accessible areas around objects in specified directions (front, side, back) based on configurable parameters. Clearance requirements depend on object type and accessibility standards. ADA values are included as external references for interpretation and are not fixed Solibri defaults."
+    },
+    
+    {
+      "id": "VLM-QUAL-VISIBILITY-001",
+      "title": "250 Component Visibility",
+      "description": "Checks whether selected components are visible from defined viewpoints, ensuring that required elements can be seen for inspection, coordination, or design validation purposes.",
+      "category": "quality",
+      "severity": "moderate",
+      "source": {
+        "solibriId": "SOL-250",
+        "solibriTitle": "250 Component Visibility Rule",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/37117468167703-250-Component-Visibility-Rule",
+        "version": "v25.12.0+"
+      },
+      "visualSuitability": {
+        "isSuitable": true,
+        "confidence": 0.95,
+        "reasoning": "Visibility is inherently a visual problem. A VLM can directly assess whether components are occluded, obstructed, or clearly visible from a given viewpoint or camera position.",
+        "visualAspects": [
+          "Component presence in view is directly observable",
+          "Occlusion by walls, slabs, or other components is visible",
+          "Line-of-sight relationships can be inferred",
+          "Foreground/background relationships are clear",
+          "Partial vs full visibility can be distinguished"
+        ],
+        "limitations": [
+          "Exact viewpoint definition may depend on rule parameters",
+          "Hidden components behind transparent elements may be ambiguous",
+          "Occlusion may depend on camera position not represented in snapshot",
+          "Semantic importance of visibility may require metadata"
+        ]
+      },
+      "visualEvidence": {
+        "lookFor": [
+          "Target components in the scene",
+          "Obstructions between camera/viewpoint and component",
+          "Walls, slabs, or elements blocking line of sight",
+          "Partial vs full visibility of component geometry",
+          "Distance and angle affecting visibility"
+        ],
+        "passIndicators": [
+          "Component is clearly visible in the scene",
+          "No obstruction blocks line of sight",
+          "Component geometry is fully or sufficiently visible",
+          "Component can be visually inspected"
+        ],
+        "failIndicators": [
+          "Component is completely occluded",
+          "Line of sight is blocked by walls or other elements",
+          "Component is hidden behind other geometry",
+          "Only insignificant or no visible portion of component"
+        ],
+        "uncertainIndicators": [
+          "Component partially visible but insufficient for evaluation",
+          "Occlusion unclear due to camera angle",
+          "Need alternative viewpoint to confirm visibility",
+          "Transparency or rendering ambiguity"
+        ]
+      },
+      "evaluationCriteria": {
+        "pass": [
+          "Component is visible from the given viewpoint",
+          "No major obstruction blocks line of sight",
+          "Visibility is sufficient for inspection or validation"
+        ],
+        "fail": [
+          "Component is not visible due to obstruction",
+          "Line of sight is fully blocked",
+          "Component cannot be inspected visually"
+        ],
+        "uncertain": [
+          "Visibility depends on viewpoint configuration",
+          "Partial visibility insufficient for decision",
+          "Need alternative camera position or additional views"
+        ]
+      },
+      "navigationHints": {
+        "recommendedViews": ["ISO", "FRONT", "SIDE"],
+        "zoomLevel": "medium",
+        "isolateCategories": [
+          "IFCWALL",
+          "IFCSLAB",
+          "IFCSPACE",
+          "IFCBUILDINGELEMENTPROXY",
+          "IFCFURNISHINGELEMENT"
+        ],
+        "usePlanCut": false,
+        "tips": [
+          "Move camera to target component viewpoint",
+          "Check for occluding geometry between camera and object",
+          "Use multiple angles to confirm visibility",
+          "Hide interfering elements if necessary"
+        ]
+      },
+      "findingTemplates": {
+        "pass": "Component is visible and can be inspected from the defined viewpoint.",
+        "fail": "Component is not visible. {obstruction} blocks the line of sight.",
+        "uncertain": "Cannot fully verify component visibility. {reason}. Recommend {action}.",
+        "placeholders": ["obstruction", "reason", "action"]
+      },
+      "dimensionalRequirements": [],
+      "tags": [
+        "visibility",
+        "quality",
+        "inspection",
+        "coordination",
+        "viewpoint"
+      ],
+      "enabled": true,
+      "notes": "The dedicated Solibri Rule 250 evaluates whether components are visible from specified viewpoints based on rule configuration. It is not based on dimensional thresholds but on line-of-sight and occlusion logic. This rule is primarily used for quality assurance and inspection workflows."
+    },
+
     {
       "id": "VLM-SAFE-HEADROOM-001",
-      "title": "Headroom Clearance",
-      "description": "Verifies adequate vertical clearance along circulation paths, stairs, ramps, and doorways. Checks for overhead obstructions like beams, ductwork, or sloped ceilings that create hazards.",
+      "title": "252 Headroom Clearance",
+      "description": "Evaluates headroom clearance along accessible routes as part of accessible route compliance, focusing on vertical obstructions affecting circulation paths, stairs, ramps, and doorways.",
       "category": "safety",
       "severity": "moderate",
       "source": {
-        "solibriId": "SOL-252-SUBSET",
+        "solibriId": "SOL-252",
         "solibriTitle": "252 Accessible Route Compliance (Headroom Component)",
-        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500000754682-Rule-Templates",
+        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/37139620085911-252-Accessible-Route-Compliance",
         "version": "v25.12.0+"
       },
       "visualSuitability": {
@@ -624,128 +1416,7 @@
       "tags": ["safety", "headroom", "clearance", "circulation", "hazard"],
       "enabled": true,
       "notes": "80-inch minimum clearance required for accessible routes. Lower clearance allowed for specific conditions (e.g., door frames). Protruding objects above 80 inches not restricted."
-    },
-    {
-      "id": "VLM-EGRESS-WIDTH-001",
-      "title": "Escape Route and Exit Passageway Width",
-      "description": "Verifies that escape routes and exit passageways have adequate width for safe egress during emergencies. Checks corridor width, door width, and capacity along egress paths.",
-      "category": "egress",
-      "severity": "critical",
-      "source": {
-        "solibriId": "SOL-179-SUBSET",
-        "solibriTitle": "179 Escape Route Analysis (Width Component)",
-        "documentationUrl": "https://help.solibri.com/hc/en-us/articles/1500004738162-179-Escape-Route-Analysis",
-        "version": "v4.3+"
-      },
-      "visualSuitability": {
-        "isSuitable": true,
-        "confidence": 0.85,
-        "reasoning": "Exit passageway width is visually assessable from plan views. VLM can measure corridor widths, identify bottlenecks, and evaluate egress capacity along routes to exits.",
-        "visualAspects": [
-          "Corridor and passageway width visible",
-          "Exit doors and their widths observable",
-          "Bottlenecks and narrow points identifiable",
-          "Route continuity assessable",
-          "Obstruction detection possible"
-        ],
-        "limitations": [
-          "Occupant load calculation requires metadata",
-          "Travel distance measurement complex",
-          "Door operation type may need confirmation"
-        ]
-      },
-      "visualEvidence": {
-        "lookFor": [
-          "Exit passageway width",
-          "Exit door width",
-          "Corridor width along egress route",
-          "Bottlenecks or narrow sections",
-          "Obstructions in egress path",
-          "Multiple egress routes availability"
-        ],
-        "passIndicators": [
-          "Wide, clear egress paths visible",
-          "Exit doors appear adequately wide",
-          "No bottlenecks in passageways",
-          "Clear, unobstructed routes to exits",
-          "Multiple exit routes available"
-        ],
-        "failIndicators": [
-          "Narrow passageways along egress route",
-          "Insufficient exit door width",
-          "Bottleneck reducing capacity",
-          "Obstructions blocking egress path",
-          "Single point of egress only"
-        ],
-        "uncertainIndicators": [
-          "Cannot determine if width adequate for occupant load",
-          "Unclear which routes are designated egress",
-          "Need floor plan to trace full egress path",
-          "Door width unclear from current view"
-        ]
-      },
-      "evaluationCriteria": {
-        "pass": [
-          "Exit passageways appear wide enough for safe egress",
-          "Exit doors adequately sized",
-          "No significant bottlenecks observed",
-          "Clear, unobstructed egress paths"
-        ],
-        "fail": [
-          "Passageway width clearly insufficient",
-          "Exit door too narrow",
-          "Obvious bottleneck in egress path",
-          "Obstructions blocking route to exit"
-        ],
-        "uncertain": [
-          "Cannot assess width adequacy without occupant load data",
-          "Need to verify which route is designated egress",
-          "Measurements needed to confirm compliance"
-        ]
-      },
-      "navigationHints": {
-        "recommendedViews": ["TOP"],
-        "zoomLevel": "far",
-        "isolateCategories": ["IFCWALL", "IFCDOOR", "IFCSPACE", "IFCSLAB"],
-        "usePlanCut": true,
-        "planCutHeight": "1.2m",
-        "tips": [
-          "Use plan view to trace egress routes",
-          "Isolate walls and doors to see paths clearly",
-          "Check width at narrowest points",
-          "Verify exit door locations and widths",
-          "Look for obstructions in egress corridors"
-        ]
-      },
-      "findingTemplates": {
-        "pass": "Egress route width is adequate. Exit passageways and doors provide sufficient capacity for safe evacuation.",
-        "fail": "Insufficient egress width. {component} at {location} has width of {width}, below minimum required {required_width} for safe evacuation.",
-        "uncertain": "Cannot fully assess egress capacity. {limitation}. Occupant load data needed to verify compliance.",
-        "placeholders": ["component", "location", "width", "required_width", "limitation"]
-      },
-      "dimensionalRequirements": [
-        {
-          "parameter": "Minimum Exit Passageway Width",
-          "typicalValue": "44 inches (1118mm)",
-          "referenceStandard": "IBC 1020.2",
-          "visuallyMeasurable": true
-        },
-        {
-          "parameter": "Minimum Exit Door Width",
-          "typicalValue": "32 inches (815mm) clear",
-          "referenceStandard": "IBC 1010.1.1",
-          "visuallyMeasurable": true
-        },
-        {
-          "parameter": "Corridor Width (Egress)",
-          "typicalValue": "44 inches (1118mm) for <50 occupants",
-          "referenceStandard": "IBC 1020.2",
-          "visuallyMeasurable": true
-        }
-      ],
-      "tags": ["egress", "safety", "escape route", "fire safety", "exit", "IBC"],
-      "enabled": true,
-      "notes": "Egress width calculated based on occupant load. 0.2 inches per occupant for stairs, 0.15 inches for corridors/doors. Multiple exit routes typically required for occupant loads >50."
     }
+
   ]
 }
