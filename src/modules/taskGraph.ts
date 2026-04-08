@@ -91,6 +91,7 @@ export type CompactTaskGraphState = {
   activeTask?: {
     id: string;
     title: string;
+    description: string;
     status: TaskStatus;
     entityId?: string;
     entityClass?: string;
@@ -500,6 +501,7 @@ function buildCompactTaskGraphState(state: TaskGraphState): CompactTaskGraphStat
       ? {
           id: currentTask.id,
           title: currentTask.title,
+          description: currentTask.description,
           status: currentTask.status,
           entityId: currentTask.entityId,
           entityClass: currentTask.entityClass,
@@ -707,6 +709,7 @@ export function updateTaskGraphFromFollowUpResult(
     case "SET_PLAN_CUT":
     case "SET_STOREY_PLAN_CUT":
     case "TOP_VIEW":
+    case "ORBIT":
     case "ISOLATE_CATEGORY":
     case "ISOLATE_STOREY":
     case "HIDE_CATEGORY":

@@ -10,8 +10,8 @@
 
 import type { SnapshotArtifact } from "./snapshotCollector";
 import {
-  DEFAULT_REDUCED_TAVILY_MAX_CHARS,
   DEFAULT_TAVILY_MAX_CHARS,
+  getPrototypeRuntimeSettings,
 } from "../config/prototypeSettings";
 
 const DEFAULT_ALLOWED_DOMAINS = ["codes.iccsafe.org"];
@@ -64,7 +64,7 @@ export type VlmFollowUp =
   | { request: "SET_VIEW_PRESET"; params: { preset: ViewPreset } }
   | { request: "TOP_VIEW" } // keep backwards-compat
   | { request: "ISO_VIEW" } // keep backwards-compat
-  | { request: "ORBIT"; params: { degrees: number } }
+  | { request: "ORBIT"; params: { degrees?: number; yawDegrees?: number; pitchDegrees?: number; reason?: string } }
   | { request: "ZOOM_IN"; params?: { factor?: number } }
 
   // Scope tools (context)
@@ -143,6 +143,10 @@ export type VlmDecision = {
   };
 };
 
+export type VlmAdapterDecision = Omit<VlmDecision, "decisionId" | "timestampIso" | "meta"> & {
+  meta: Omit<VlmDecision["meta"], "promptHash"> & { promptHash?: string };
+};
+
 export type NavigationMetrics = {
   projectedAreaRatio?: number; // 0..1 visible content fraction (nav computes)
   occlusionRatio?: number; // 0..1 (nav computes)
@@ -165,7 +169,7 @@ export type VlmCheckInput = {
 
 export type VlmAdapter = {
   name: string;
-  check: (input: VlmCheckInput) => Promise<Omit<VlmDecision, "decisionId" | "timestampIso">>;
+  check: (input: VlmCheckInput) => Promise<VlmAdapterDecision>;
 };
 
 export function hashPrompt(s: string) {
@@ -202,7 +206,15 @@ function isFollowUp(x: any): x is VlmFollowUp {
       );
 
     case "ORBIT":
-      return x.params && typeof x.params.degrees === "number" && isFinite(x.params.degrees);
+      return (
+        x.params &&
+        typeof x.params === "object" &&
+        (x.params.degrees === undefined || (typeof x.params.degrees === "number" && isFinite(x.params.degrees))) &&
+        (x.params.yawDegrees === undefined || (typeof x.params.yawDegrees === "number" && isFinite(x.params.yawDegrees))) &&
+        (x.params.pitchDegrees === undefined || (typeof x.params.pitchDegrees === "number" && isFinite(x.params.pitchDegrees))) &&
+        (x.params.reason === undefined || typeof x.params.reason === "string") &&
+        (x.params.degrees !== undefined || x.params.yawDegrees !== undefined || x.params.pitchDegrees !== undefined)
+      );
 
     case "ZOOM_IN":
       return (
@@ -410,7 +422,7 @@ function normalizeInput(input: VlmCheckInput): VlmCheckInput {
 
 
 function finalizeDecision(
-  core: Omit<VlmDecision, "decisionId" | "timestampIso">,
+  core: VlmAdapterDecision,
   input: VlmCheckInput,
   provider: string
   ): VlmDecision {
@@ -752,7 +764,7 @@ export function createVlmChecker(
                 ruleText: args.ruleText,
                 sourceUrl: args.sourceUrl,
                 rawText: args.rawText,
-                maxChars: DEFAULT_REDUCED_TAVILY_MAX_CHARS,
+                maxChars: getPrototypeRuntimeSettings().reducedTavilyMaxChars,
               },
             });
 
@@ -765,13 +777,13 @@ export function createVlmChecker(
             }
 
             return {
-              reducedText: args.rawText.slice(0, DEFAULT_REDUCED_TAVILY_MAX_CHARS),
+              reducedText: args.rawText.slice(0, getPrototypeRuntimeSettings().reducedTavilyMaxChars),
               error: reduced.error,
             };
           }
 
           return {
-            reducedText: args.rawText.slice(0, DEFAULT_REDUCED_TAVILY_MAX_CHARS),
+            reducedText: args.rawText.slice(0, getPrototypeRuntimeSettings().reducedTavilyMaxChars),
             error: "No reducer provider configured; used truncated raw text.",
           };
         }

@@ -22,6 +22,7 @@ export function wrapPromptBase(input: WrapPromptInput): string {
     "- If evidenceViews.context.highlightAnnotations is present, use its legend as the authoritative explanation of overlay colors.\n" +
     "- If a top HUD/info tab is visible, treat its shown IFC class, object id, dimensions, and color legend as explicit snapshot reference evidence.\n" +
     "- Use the visible viewer grid as the primary dimensional reference whenever it is clearly visible: 1 primary cell = 1 m x 1 m, 1 major cell = 10 m x 10 m.\n" +
+    "- It is acceptable to estimate dimensions from pixel proportions against visible 1 m grid cells or HUD/object dimensions; state uncertainty if perspective makes the estimate unreliable.\n" +
     "- If a measurable requirement cannot be grounded from visible evidence + nav metrics, return UNCERTAIN.\n" +
     "- Return ONLY valid JSON (no markdown, no commentary, no extra keys).\n" +
     "\n" +
@@ -35,7 +36,9 @@ export function wrapPromptBase(input: WrapPromptInput): string {
     "7) If the grid alone is insufficient, use dimension annotations, IFC/property values, or request follow-up evidence to extract dimensions from relevant objects.\n" +
     "8) If the active entity is too small in frame, request HIGHLIGHT_IDS or ZOOM_IN so the focused target occupies a meaningful portion of the image before judging compliance.\n" +
     "9) If precise storey isolation hides the local floor or landing context needed for clearance measurement, prefer SET_STOREY_PLAN_CUT(activeStorey) as the fallback instead of broadening to multiple fully visible storeys.\n" +
-    "10) If not measurable/ambiguous after that, choose the single best followUp action to resolve the uncertainty for the active entity.\n" +
+    "10) If the active target is already highlighted/centered and zoom is sufficient or exhausted, use ORBIT as a late-stage multi-view confirmation before finalizing an uncertain verdict.\n" +
+    "10a) Do not request TOP_VIEW immediately after the first ORBIT for an entity. After the first ORBIT, choose another useful follow-up or a second ORBIT if needed; TOP_VIEW is allowed after that.\n" +
+    "11) If not measurable/ambiguous after that, choose the single best followUp action to resolve the uncertainty for the active entity.\n" +
     "\n" +
     "WEB / REFERENCE POLICY (for compliance clauses):\n" +
     "- If the taskPrompt provides an allowlist (e.g., AllowedSources/domains/links) AND the calling system supports browsing,\n" +
@@ -69,7 +72,8 @@ export function wrapPromptBase(input: WrapPromptInput): string {
     "Navigation & View Actions:\n" +
     "  ISO_VIEW          - Switch to isometric (3D overview). Use when you need an overall perspective.\n" +
     "  TOP_VIEW          - Switch to orthographic top-down view. Best for plan-based checks (clearances, door swings, layouts).\n" +
-    "  NEW_VIEW          - Orbit camera 20° around the model. Use when current angle is inconclusive.\n" +
+    "  NEW_VIEW          - Generic fallback for a different angle when no target-focused orbit is appropriate.\n" +
+    "  ORBIT             - Late-stage target-focused confirmation angle after highlight/zoom. params: { yawDegrees?: number, pitchDegrees?: number, reason?: string }; each angle must be <=90° in magnitude; max 3 ORBIT calls per entity. Never request a view that puts the camera below the target; keep the camera at target level or higher. From TOP_VIEW, prefer an iso-like shift such as { yawDegrees: 45, pitchDegrees: -30 } while keeping target and distance.\n" +
     "  ZOOM_IN           - Zoom towards camera target. params: { factor?: number (1.5 default) }. Use sparingly (max once).\n" +
     "  SET_VIEW_PRESET   - params: { preset: \"TOP\" | \"ISO\" }. Explicit preset switch.\n" +
     "\n" +
@@ -133,6 +137,7 @@ export function wrapPromptBase(input: WrapPromptInput): string {
      "- For occluders like slabs/ceilings, prefer HIDE_CATEGORY (e.g., IfcSlab, IfcCovering) instead of listing many ids.\n" +
      "- Zoom at most once. Prefer PLAN_CUT and HIDE_CATEGORY before repeated zoom.\n" +
      "- You are allowed and expected to actively manipulate the model to gather evidence and reduce uncertainty.\n" +
+     "- Follow-up hierarchy: WEB_FETCH for missing clause text; scope/isolation; TOP_VIEW/plan cut; HIGHLIGHT_IDS/ZOOM_IN; HIDE occluders; ORBIT only near the end for bounded multi-view confirmation; then finalize.\n" +
      "- followUp should be exactly one request that most efficiently resolves the missing evidence.\n" +
      "evidenceViews:\n" +
      evidenceViewsJson +

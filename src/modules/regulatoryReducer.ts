@@ -168,11 +168,27 @@ async function fetchJsonWithTimeout(
   timeoutMs: number
 ): Promise<{ ok: boolean; status: number; json: any }> {
   const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), timeoutMs);
+  const id = setTimeout(() => ctrl.abort(`Request timed out after ${timeoutMs}ms.`), timeoutMs);
   try {
     const resp = await fetch(url, { ...init, signal: ctrl.signal });
     const json = await resp.json().catch(() => null);
     return { ok: resp.ok, status: resp.status, json };
+  } catch (error: any) {
+    if (error?.name === "AbortError" || ctrl.signal.aborted) {
+      return {
+        ok: false,
+        status: 408,
+        json: {
+          error: {
+            message:
+              typeof ctrl.signal.reason === "string"
+                ? ctrl.signal.reason
+                : `Regulatory reducer request timed out after ${timeoutMs}ms.`,
+          },
+        },
+      };
+    }
+    throw error;
   } finally {
     clearTimeout(id);
   }
@@ -198,7 +214,7 @@ function compactReducedOutput(parsed: JsonShape, maxChars: number): string {
 
 export async function reduceRegulatoryTextWithOpenRouter(args: {
   apiKey: string;
-  model: "openai/gpt-4.o",
+  model: string;
   endpoint?: string;
   requestTimeoutMs?: number;
   appTitle?: string;
@@ -206,7 +222,7 @@ export async function reduceRegulatoryTextWithOpenRouter(args: {
   input: RegulatoryReductionInput;
 }): Promise<RegulatoryReductionResult> {
   const endpoint = args.endpoint ?? "https://openrouter.ai/api/v1/chat/completions";
-  const timeoutMs = Math.max(5_000, Math.min(120_000, args.requestTimeoutMs ?? 45_000));
+  const timeoutMs = Math.max(5_000, Math.min(180_000, args.requestTimeoutMs ?? 90_000));
   const { system, user } = buildReducerPrompt(args.input);
 
   const body = {

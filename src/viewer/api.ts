@@ -701,16 +701,19 @@ function getActiveGroupAny(): any | null {
   function buildCenteredTopPoseFromBox(box: THREE.Box3, currentPose: CameraPose): CameraPose | null {
     if (!box || box.isEmpty()) return null;
     const center = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
     const upAxis = getUpAxis();
     if (upAxis === "y") {
-      const height = Math.max(0.5, Math.abs(currentPose.eye.y - currentPose.target.y));
+      const horizontalSpan = Math.max(size.x, size.z, 0.5);
+      const height = Math.max(2.5, horizontalSpan * 2.4, Math.abs(currentPose.eye.y - currentPose.target.y));
       return {
         eye: { x: center.x, y: center.y + height, z: center.z },
         target: { x: center.x, y: center.y, z: center.z },
       };
     }
 
-    const height = Math.max(0.5, Math.abs(currentPose.eye.z - currentPose.target.z));
+    const horizontalSpan = Math.max(size.x, size.y, 0.5);
+    const height = Math.max(2.5, horizontalSpan * 2.4, Math.abs(currentPose.eye.z - currentPose.target.z));
     return {
       eye: { x: center.x, y: center.y, z: center.z + height },
       target: { x: center.x, y: center.y, z: center.z },

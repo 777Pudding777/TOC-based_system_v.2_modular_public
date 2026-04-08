@@ -55,6 +55,7 @@ export type GoToIsolateResult = {
 
 export type NavigationAgent = {
   navigateToSelection: (map: OBC.ModelIdMap, opts?: NavOptions) => Promise<NavMetrics>;
+  measureSelection: (map: OBC.ModelIdMap, opts?: Pick<NavOptions, "enableOcclusion" | "occlusionSamples" | "focusBox">) => Promise<NavMetrics>;
 
   // NEW: what your panel calls
   goToCurrentIsolateSelection: (opts?: NavOptions) => Promise<GoToIsolateResult>;
@@ -78,7 +79,7 @@ export function createNavigationAgent(params: {
   };
   toast?: ToastFn;
 }) : NavigationAgent {
-const { viewerApi, toast, getSceneObjects } = params;
+const { viewerApi, toast } = params;
 
 
   // --- utilities ---
@@ -167,10 +168,10 @@ const { viewerApi, toast, getSceneObjects } = params;
 
     // Build a set of all target objects (fast membership test)
     const targetSet = new Set<THREE.Object3D>();
-    for (const root of targetRoots) root.traverse((o) => targetSet.add(o));
+    for (const root of targetRoots) root.traverse((o: THREE.Object3D) => targetSet.add(o));
 
     // Raycast against the whole scene (not just target)
-    const sceneObjects = params.getSceneObjects?.() ?? [];
+    const sceneObjects = viewerApi.getSceneObjects?.() ?? [];
     if (!sceneObjects.length) return null;
 
     const raycaster = new THREE.Raycaster();
@@ -218,7 +219,6 @@ const { viewerApi, toast, getSceneObjects } = params;
 
   function orbitPoseAroundTarget(current: CameraPose, center: THREE.Vector3, radiansYaw: number): CameraPose {
     const eye = new THREE.Vector3(current.eye.x, current.eye.y, current.eye.z);
-    const tgt = new THREE.Vector3(current.target.x, current.target.y, current.target.z);
 
     // Keep target fixed at center (more stable than orbiting target point from previous view)
     const offset = eye.clone().sub(center);
@@ -355,6 +355,39 @@ const { viewerApi, toast, getSceneObjects } = params;
     };
   }
 
+  async function measureSelection(
+    map: any,
+    opts?: Pick<NavOptions, "enableOcclusion" | "occlusionSamples" | "focusBox">
+  ): Promise<NavMetrics> {
+    if (!viewerApi.hasModelLoaded()) {
+      return { targetAreaRatio: 0, occlusionRatio: null, steps: 0, success: false, reason: "no-model" };
+    }
+
+    const {
+      enableOcclusion = false,
+      occlusionSamples = 16,
+    } = opts ?? {};
+
+    const box = opts?.focusBox?.isBox3
+      ? opts.focusBox.clone()
+      : await viewerApi.getSelectionWorldBox(map);
+    if (!box) {
+      return { targetAreaRatio: 0, occlusionRatio: null, steps: 0, success: false, reason: "empty-selection-box" };
+    }
+
+    viewerApi.renderNow();
+    const area = computeTargetAreaRatio(box);
+    const occ = enableOcclusion ? await computeOcclusionRatio(box, map, occlusionSamples) : null;
+
+    return {
+      targetAreaRatio: area,
+      occlusionRatio: occ,
+      steps: 0,
+      success: true,
+      reason: "measured-current-view",
+    };
+  }
+
   async function goToCurrentIsolateSelection(opts?: NavOptions): Promise<GoToIsolateResult> {
     const sel = viewerApi.getCurrentIsolateSelection();
     if (!sel) return { ok: false, method: "navigateToSelection", reason: "no-isolate-selection" };
@@ -368,6 +401,6 @@ const { viewerApi, toast, getSceneObjects } = params;
     };
   }
 
-  return { navigateToSelection, goToCurrentIsolateSelection };
+  return { navigateToSelection, measureSelection, goToCurrentIsolateSelection };
 
 }

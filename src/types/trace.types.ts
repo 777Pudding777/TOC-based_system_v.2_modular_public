@@ -161,6 +161,56 @@ export interface InspectionMetrics {
 }
 
 /**
+ * Secondary judge result created after primary VLM checks and before report generation.
+ */
+export interface JudgeTaskVerdict {
+  /** Human-readable task label */
+  taskLabel: string;
+  /** Entity ID if the judged task maps to a specific model entity */
+  entityId?: string;
+  /** First inspection step included in this judge verdict */
+  stepStart?: number;
+  /** Last inspection step included in this judge verdict */
+  stepEnd?: number;
+  /** Judge verdict for this task/entity */
+  verdict: VlmVerdict;
+  /** Judge confidence for this task/entity */
+  confidence: number;
+  /** Evidence-grounded reasoning */
+  reasoning: string;
+  /** Snapshot IDs the judge relied on */
+  evidenceSnapshotIds: string[];
+}
+
+export interface JudgeReport {
+  /** Time the judge pass was created */
+  createdAtIso: string;
+  /** Provider used for the independent judge call */
+  provider: string;
+  /** Same model ID as the primary VLM configuration */
+  modelId: string;
+  /** Overall judge verdict */
+  verdict: VlmVerdict;
+  /** Overall judge confidence */
+  confidence: number;
+  /** Evidence-grounded judge rationale */
+  rationale: string;
+  /** Per-task/per-entity verdicts when identifiable */
+  taskVerdicts: JudgeTaskVerdict[];
+  /** Places the user can inspect manually to finish unresolved checks */
+  suggestionsForUser: string[];
+  /** Debug review of primary VLM decisions and possible improvements */
+  debuggingAndSuggestions: {
+    primaryDecisionAssessment: string;
+    possibleMistakes: string[];
+    capabilityNotes: string[];
+    improvementSuggestions: string[];
+  };
+  /** Non-fatal judge error if the secondary call failed */
+  error?: string;
+}
+
+/**
  * Scene state at a point in time
  */
 export interface SceneState {
@@ -189,7 +239,15 @@ export interface SceneState {
   /** Highlighted element IDs */
   highlightedIds?: string[];
   /** Plan cut state */
-  planCut?: { height?: number; absoluteHeight?: number; thickness?: number; mode?: string };
+  planCut?: {
+    enabled?: boolean;
+    height?: number;
+    absoluteHeight?: number;
+    thickness?: number;
+    mode?: string;
+    source?: string;
+    storeyId?: string;
+  };
 }
 
 /**
@@ -265,6 +323,8 @@ export interface ConversationTrace {
   errorMessage?: string;
   /** Regulatory/web evidence injected into VLM context */
   webEvidence?: WebEvidenceRecord[];
+  /** Independent secondary judge pass over the pre-report evidence */
+  judgeReport?: JudgeReport;
 }
 
 /**

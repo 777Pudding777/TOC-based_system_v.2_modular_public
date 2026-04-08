@@ -199,7 +199,9 @@ try {
   _setActiveIfcTypeIndex(index);
   console.log("[IFC] type index built", Object.keys(index).slice(0, 10), "…");
 } catch (e) {
-  console.warn("[IFC] type index not available in this build", e);
+  console.info("[IFC] type index not available in this build; category isolation may be limited.", {
+    reason: e instanceof Error ? e.message : String(e),
+  });
   _setActiveIfcTypeIndex(null);
 }
 

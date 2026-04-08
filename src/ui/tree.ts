@@ -81,6 +81,11 @@ export function mountTree(params: {
     header.append(title, resetBtn);
     treeRoot.appendChild(header);
 
+    const tip = document.createElement("div");
+    tip.className = "tree-tip";
+    tip.textContent = "Tip: Ctrl+Click a storey in the tree to isolate it.";
+    treeRoot.appendChild(tip);
+
     const classifier = ctx.classifier;
 
     const levels = classifier.list.get("Levels");

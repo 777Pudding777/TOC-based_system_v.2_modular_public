@@ -171,12 +171,28 @@ async function fetchJsonWithTimeout(
   timeoutMs: number
 ): Promise<{ ok: boolean; status: number; json: any }> {
   const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), timeoutMs);
+  const id = setTimeout(() => ctrl.abort(`Request timed out after ${timeoutMs}ms.`), timeoutMs);
 
   try {
     const resp = await fetch(url, { ...init, signal: ctrl.signal });
     const json = await resp.json().catch(() => null);
     return { ok: resp.ok, status: resp.status, json };
+  } catch (error: any) {
+    if (error?.name === "AbortError" || ctrl.signal.aborted) {
+      return {
+        ok: false,
+        status: 408,
+        json: {
+          error: {
+            message:
+              typeof ctrl.signal.reason === "string"
+                ? ctrl.signal.reason
+                : `OpenAI request timed out after ${timeoutMs}ms.`,
+          },
+        },
+      };
+    }
+    throw error;
   } finally {
     clearTimeout(id);
   }
@@ -185,7 +201,7 @@ async function fetchJsonWithTimeout(
 export function createOpenAiVlmAdapter(cfg: OpenAiAdapterConfig): VlmAdapter {
   const endpoint = cfg.endpoint ?? "https://api.openai.com/v1/responses";
   const detail = cfg.imageDetail ?? "high";
-  const timeoutMs = Math.max(5_000, Math.min(120_000, cfg.requestTimeoutMs ?? 45_000));
+  const timeoutMs = Math.max(5_000, Math.min(180_000, cfg.requestTimeoutMs ?? 90_000));
 
   return {
     name: "openai",

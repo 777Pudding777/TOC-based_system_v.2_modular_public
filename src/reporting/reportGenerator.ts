@@ -6,7 +6,30 @@
  * @module reportGenerator
  */
 
-import type { ConversationTrace, StressedFinding, InspectionMetrics, WebEvidenceRecord } from "../types/trace.types";
+import type { ConversationTrace, InspectionMetrics, JudgeTaskVerdict, VlmResponseTrace } from "../types/trace.types";
+import {
+  DEFAULT_MAX_COMPLIANCE_STEPS,
+  DEFAULT_MAX_SNAPSHOTS_PER_REQUEST,
+  DEFAULT_PROTOTYPE_RUNTIME_SETTINGS,
+  DEFAULT_REDUCED_TAVILY_MAX_CHARS,
+  DEFAULT_TAVILY_MAX_CHARS,
+  DOOR_CLEARANCE_DEFAULTS,
+  ENTITY_REPEATED_WORKFLOW_TERMINATION_STEPS,
+  ENTITY_UNCERTAIN_TERMINATION_CONFIDENCE,
+  ENTITY_UNCERTAIN_TERMINATION_STEPS,
+  getPrototypeRuntimeSettings,
+  HIGHLIGHT_ANNOTATION_DEFAULTS,
+  HIGHLIGHT_NAVIGATION_DEFAULTS,
+  HIGHLIGHT_TARGET_AREA_RATIO,
+  MAX_ORBIT_DEGREES_PER_AXIS,
+  MAX_ORBIT_FOLLOW_UPS_PER_ENTITY,
+  ORBIT_MAX_HIGHLIGHT_OCCLUSION_RATIO,
+  RAMP_NAVIGATION_DEFAULTS,
+  REPEATED_FOLLOW_UPS_BEFORE_ESCALATION,
+  TOP_VIEW_TARGET_AREA_RATIO,
+  ZOOM_IN_EXHAUSTION_AREA_FACTOR,
+} from "../config/prototypeSettings";
+import { findModelById } from "../config/openRouterModels";
 /**
  * Report generation options
  */
@@ -64,6 +87,14 @@ function formatTokenCount(tokens: number | undefined): string {
   return safe.toLocaleString("en-US");
 }
 
+function toAnchorId(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .replace(/-{2,}/g, "-");
+}
+
 
 /**
  * Get verdict badge color
@@ -114,11 +145,112 @@ function generateCss(): string {
       color: #1f2937;
       background: #f3f4f6;
       padding: 20px;
+      scroll-behavior: smooth;
+    }
+
+    .page-layout {
+      max-width: 1500px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: 240px minmax(0, 1fr) 110px;
+      gap: 24px;
+      align-items: start;
+    }
+
+    .report-nav {
+      position: sticky;
+      top: 20px;
+    }
+
+    .report-nav-panel {
+      background: transparent;
+      border-radius: 0;
+      box-shadow: none;
+      border: none;
+      padding: 8px 0;
+      max-height: calc(100vh - 40px);
+      overflow: auto;
+    }
+
+    .report-nav-title {
+      font-size: 13px;
+      font-weight: 800;
+      color: #1e3a8a;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      margin-bottom: 12px;
+    }
+
+    .report-nav-group {
+      margin-top: 18px;
+    }
+
+    .report-nav-group:first-of-type {
+      margin-top: 0;
+    }
+
+    .report-nav-group-label {
+      font-size: 12px;
+      font-weight: 700;
+      color: #1e3a8a;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    .report-nav-link {
+      display: block;
+      text-decoration: none;
+      color: #1e3a8a;
+      font-size: 14px;
+      padding: 8px 0;
+      border-radius: 8px;
+      transition: color 0.2s ease;
+      word-break: break-word;
+    }
+
+    .report-nav-link:hover {
+      color: #3b82f6;
+    }
+
+    .report-actions {
+      position: sticky;
+      top: 20px;
+      display: flex;
+      justify-content: flex-end;
+    }
+
+    .report-action-button {
+      display: inline-flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      min-width: 72px;
+      padding: 12px 10px;
+      border: 1px solid #cbd5e1;
+      border-radius: 12px;
+      background: #fff;
+      color: #1e3a8a;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+      box-shadow: 0 4px 6px -1px rgba(0,0,0,0.08), 0 2px 4px -2px rgba(0,0,0,0.08);
+      transition: color 0.2s ease, border-color 0.2s ease, background 0.2s ease;
+    }
+
+    .report-action-button:hover {
+      color: #3b82f6;
+      border-color: #93c5fd;
+      background: #eff6ff;
+    }
+
+    .report-action-icon {
+      font-size: 18px;
+      line-height: 1;
     }
 
     .container {
-      max-width: 1200px;
-      margin: 0 auto;
+      width: 100%;
       background: #fff;
       border-radius: 12px;
       box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -2px rgba(0,0,0,0.1);
@@ -144,6 +276,7 @@ function generateCss(): string {
     .section {
       padding: 24px 32px;
       border-bottom: 1px solid #e5e7eb;
+      scroll-margin-top: 24px;
     }
 
     .section:last-child {
@@ -239,6 +372,124 @@ function generateCss(): string {
       font-size: 12px;
       color: #6b7280;
       margin-top: 4px;
+    }
+
+    .summary-layout {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) minmax(280px, 420px);
+      gap: 24px;
+      align-items: start;
+    }
+
+    .summary-kpis {
+      display: flex;
+      align-items: center;
+      gap: 24px;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+    }
+
+    .verdict-stats {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+    }
+
+    .verdict-stat {
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      padding: 14px;
+      background: #f9fafb;
+      text-align: center;
+    }
+
+    .verdict-stat .count {
+      font-size: 24px;
+      font-weight: 800;
+      color: #111827;
+    }
+
+    .verdict-stat .label {
+      font-size: 12px;
+      color: #6b7280;
+      margin-top: 4px;
+      text-transform: uppercase;
+      font-weight: 700;
+    }
+
+    .verdict-stat.pass { border-top: 4px solid #22c55e; }
+    .verdict-stat.fail { border-top: 4px solid #ef4444; }
+    .verdict-stat.uncertain { border-top: 4px solid #f59e0b; }
+
+    .verdict-stats-title {
+      font-size: 14px;
+      font-weight: 700;
+      color: #1e3a8a;
+      margin-bottom: 10px;
+      text-align: center;
+    }
+
+    .pending-card {
+      background: #f3f4f6;
+      border: 1px dashed #9ca3af;
+      color: #4b5563;
+    }
+
+    .pending-card .title {
+      color: #4b5563;
+    }
+
+    .appendix-subsection {
+      margin-top: 22px;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      background: #fff;
+      overflow: hidden;
+    }
+
+    .appendix-subsection:first-of-type {
+      margin-top: 0;
+    }
+
+    .appendix-subsection summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 14px 16px;
+      font-size: 16px;
+      font-weight: 700;
+      color: #1e3a8a;
+      background: #f9fafb;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      user-select: none;
+    }
+
+    .appendix-subsection summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .appendix-subsection summary::before {
+      content: ">";
+      font-size: 12px;
+      color: #6b7280;
+      transition: transform 0.2s ease;
+    }
+
+    .appendix-subsection[open] summary::before {
+      transform: rotate(90deg);
+    }
+
+    .appendix-subsection-content {
+      padding: 16px;
+    }
+
+    .entity-snapshots {
+      margin: 14px 0 18px;
+    }
+
+    .entity-snapshots h3 {
+      color: #1e3a8a;
     }
 
     .finding-card {
@@ -494,6 +745,43 @@ function generateCss(): string {
       margin-bottom: 12px;
     }
 
+    .settings-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+      margin-bottom: 0;
+    }
+
+    .settings-entry {
+      min-width: 0;
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 8px;
+      padding: 10px 12px;
+    }
+
+    .settings-key {
+      display: block;
+      color: #4b5563;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      margin-bottom: 6px;
+    }
+
+    .settings-value {
+      display: block;
+      color: #111827;
+      font-size: 12px;
+      line-height: 1.45;
+      overflow-wrap: anywhere;
+      word-break: break-word;
+      white-space: pre-wrap;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+
     .appendix-text {
       white-space: pre-wrap;
       word-break: break-word;
@@ -510,16 +798,136 @@ function generateCss(): string {
     }
 
     @media print {
+      @page {
+        size: A4;
+        margin: 12mm;
+      }
+
       body {
         background: #fff;
         padding: 0;
+        font-size: 11pt;
+      }
+      .page-layout {
+        display: block;
+      }
+      .report-nav {
+        display: none;
+      }
+      .report-actions {
+        display: none;
       }
       .container {
         box-shadow: none;
       }
+      .header {
+        padding: 18px 24px;
+      }
+      .section {
+        padding: 14px 20px;
+      }
+      .section,
+      .rule-card,
+      .appendix-item,
+      .step-snapshot-card,
+      .snapshot-card {
+        break-inside: avoid;
+        page-break-inside: avoid;
+      }
+      .rule-card,
+      .appendix-item {
+        margin-bottom: 10px;
+      }
+      .step-header {
+        margin-bottom: 4px;
+      }
+      .step-item {
+        padding-bottom: 10px;
+        break-inside: auto;
+        page-break-inside: auto;
+      }
+      .step-content {
+        display: grid;
+        grid-template-columns: minmax(320px, 46%) minmax(0, 1fr);
+        gap: 8px 14px;
+        align-items: start;
+        padding: 10px;
+        background: #fff;
+        border: 1px solid #e5e7eb;
+        break-inside: auto;
+        page-break-inside: auto;
+      }
+      .step-content .rationale {
+        grid-column: 2;
+        margin-bottom: 0;
+        font-size: 10.5pt;
+        line-height: 1.4;
+      }
+      .step-content .meta {
+        grid-column: 2;
+        font-size: 10px;
+      }
+      .step-snapshots {
+        grid-column: 1;
+        grid-row: 1 / span 2;
+        margin-bottom: 0;
+      }
+      .step-snapshots-grid {
+        grid-template-columns: 1fr;
+      }
+      .step-snapshot-card img {
+        height: auto;
+        max-height: 560px;
+        object-fit: contain;
+        background: #fff;
+      }
+      .step-snapshot-placeholder {
+        height: 320px;
+      }
+      .step-snapshot-card figcaption {
+        padding: 6px 8px;
+        font-size: 10px;
+      }
+      .step-prompt {
+        grid-column: 1 / -1;
+        margin-top: 0;
+      }
+      .step-prompt:not([open]) {
+        display: none;
+      }
+      .step-prompt summary {
+        padding: 6px 8px;
+        font-size: 11px;
+      }
+      .step-prompt pre {
+        max-height: none;
+        overflow: visible;
+        font-size: 10px;
+        line-height: 1.35;
+      }
       .snapshot-card img {
         height: auto;
         max-height: 200px;
+      }
+    }
+
+    @media (max-width: 800px) {
+      .page-layout {
+        grid-template-columns: 1fr;
+      }
+      .report-nav {
+        position: static;
+      }
+      .report-actions {
+        position: static;
+        justify-content: flex-start;
+      }
+      .report-nav-panel {
+        max-height: none;
+      }
+      .summary-layout,
+      .verdict-stats {
+        grid-template-columns: 1fr;
       }
     }
   `;
@@ -528,40 +936,279 @@ function generateCss(): string {
 /**
  * Generate summary section
  */
+function prettifyModelId(modelId: string): string {
+  const tail = modelId.includes("/") ? modelId.split("/").pop() ?? modelId : modelId;
+  return tail
+    .split(/[-_]+/)
+    .filter(Boolean)
+    .map((part) => (/^\d+(\.\d+)*$/.test(part) ? part : part.charAt(0).toUpperCase() + part.slice(1)))
+    .join(" ");
+}
+
+function getFriendlyVlmName(trace: ConversationTrace): string {
+  const judgeModelId = trace.judgeReport?.modelId?.trim();
+  const responseModelId = trace.responses.find((response) => response.decision.meta?.modelId)?.decision.meta.modelId?.trim();
+  const promptModelId = trace.prompts.find((prompt) => prompt.modelId)?.modelId?.trim();
+  const modelId = judgeModelId || responseModelId || promptModelId || "";
+  const adapterName = trace.model.name?.trim() || "";
+
+  if (modelId) {
+    const openRouterMatch = findModelById(modelId);
+    if (openRouterMatch?.label) return openRouterMatch.label;
+
+    const normalized = modelId.toLowerCase();
+    if (normalized.includes("claude")) return "Claude";
+    if (normalized.includes("gpt") || normalized.includes("chatgpt")) return "ChatGPT";
+    if (normalized.includes("gemini")) return "Gemini";
+    if (normalized.includes("grok")) return "Grok";
+    if (normalized.includes("kimi")) return "Kimi";
+    if (normalized.includes("qwen")) return "Qwen";
+    if (normalized.includes("nova")) return "Nova";
+    if (normalized.includes("llama")) return "Llama";
+    return prettifyModelId(modelId);
+  }
+
+  if (adapterName && !["openrouter", "openai", "mock"].includes(adapterName.toLowerCase())) {
+    return adapterName;
+  }
+
+  return trace.model.provider || "Unknown VLM";
+}
+
+function getEntityVerdictStats(trace: ConversationTrace): {
+  total: number;
+  checked: number;
+  pass: number;
+  fail: number;
+  uncertain: number;
+} {
+  const summary = buildEntitySummary(trace);
+  const checked = summary.completed.length;
+  const total = summary.remainingCount === null ? checked : checked + summary.remainingCount;
+
+  return summary.completed.reduce(
+    (acc, item) => {
+      if (item.verdict === "PASS") acc.pass++;
+      else if (item.verdict === "FAIL") acc.fail++;
+      else acc.uncertain++;
+      return acc;
+    },
+    { total, checked, pass: 0, fail: 0, uncertain: 0 }
+  );
+}
+
+function buildReportNavigation(trace: ConversationTrace): string {
+  const primaryLinks = [
+    { href: "#report-top", label: "Report Header" },
+    { href: "#rule-information", label: "Rule Information" },
+    { href: "#inspection-summary", label: "Inspection Summary" },
+    ...(trace.metrics ? [{ href: "#evaluation-metrics", label: "Evaluation Metrics" }] : []),
+    { href: "#entity-summary", label: "Entity Summary" },
+    { href: "#appendix", label: "Appendix" },
+  ];
+
+  const traceLinks = buildEntityTraceGroups(trace).map((group, index) => ({
+    href: `#trace-${toAnchorId(group.entityId ?? `general-${index + 1}`)}`,
+    label: group.entityId ? `Entity ${group.entityId}` : "General Trace",
+  }));
+
+  return `
+    <aside class="report-nav" aria-label="Report navigation">
+      <div class="report-nav-panel">
+        <div class="report-nav-title">Navigation</div>
+        <div class="report-nav-group">
+          ${primaryLinks
+            .map((link) => `<a class="report-nav-link" href="${link.href}">${escapeHtml(link.label)}</a>`)
+            .join("")}
+        </div>
+        ${traceLinks.length
+          ? `
+            <div class="report-nav-group">
+              <div class="report-nav-group-label">Entity Traces</div>
+              ${traceLinks
+                .map((link) => `<a class="report-nav-link" href="${link.href}">${escapeHtml(link.label)}</a>`)
+                .join("")}
+            </div>
+          `
+          : ""}
+      </div>
+    </aside>
+  `;
+}
+
+function buildReportActions(): string {
+  return `
+    <aside class="report-actions" aria-label="Report actions">
+      <button class="report-action-button" type="button" onclick="window.print()" title="Download report as PDF">
+        <span>PDF</span>
+        <span class="report-action-icon" aria-hidden="true">&#8681;</span>
+      </button>
+    </aside>
+  `;
+}
+
 function generateSummarySection(trace: ConversationTrace): string {
   const verdictColor = getVerdictColor(trace.finalVerdict ?? "UNCERTAIN");
+  const stats = getEntityVerdictStats(trace);
+  const denominator = stats.total || stats.checked || trace.responses.length || 0;
   // Severity color used in rule section, not summary
   void getSeverityColor(trace.rule.severity);
 
   return `
-    <div class="section">
+    <div class="section" id="inspection-summary">
       <h2> Inspection Summary</h2>
-      <div style="display: flex; align-items: center; gap: 24px; margin-bottom: 16px;">
+      <div class="summary-layout">
         <div>
-          <span style="color: #6b7280; font-size: 14px;">Final Verdict</span>
-          <div style="margin-top: 4px;">
-            <span class="badge verdict-badge" style="background: ${verdictColor};">
-              ${trace.finalVerdict ?? "PENDING"}
-            </span>
+          <div class="summary-kpis">
+            <div>
+              <span style="color: #6b7280; font-size: 14px;">Final Verdict</span>
+              <div style="margin-top: 4px;">
+                <span class="badge verdict-badge" style="background: ${verdictColor};">
+                  ${trace.finalVerdict ?? "PENDING"}
+                </span>
+              </div>
+            </div>
+            <div>
+              <span style="color: #6b7280; font-size: 14px;">Confidence</span>
+              <div style="font-size: 24px; font-weight: 700; color: #1e3a8a;">
+                ${trace.finalConfidence != null ? formatConfidence(trace.finalConfidence) : "N/A"}
+              </div>
+            </div>
+            <div>
+              <span style="color: #6b7280; font-size: 14px;">Status</span>
+              <div style="margin-top: 4px;">
+                <span class="badge" style="background: ${trace.status === "completed" ? "#22c55e" : trace.status === "failed" ? "#ef4444" : "#f59e0b"}; color: #fff;">
+                  ${trace.status.toUpperCase()}
+                </span>
+              </div>
+            </div>
           </div>
         </div>
         <div>
-          <span style="color: #6b7280; font-size: 14px;">Confidence</span>
-          <div style="font-size: 24px; font-weight: 700; color: #1e3a8a;">
-            ${trace.finalConfidence ? formatConfidence(trace.finalConfidence) : "N/A"}
-          </div>
-        </div>
-        <div>
-          <span style="color: #6b7280; font-size: 14px;">Status</span>
-          <div style="margin-top: 4px;">
-            <span class="badge" style="background: ${trace.status === "completed" ? "#22c55e" : trace.status === "failed" ? "#ef4444" : "#f59e0b"}; color: #fff;">
-              ${trace.status.toUpperCase()}
-            </span>
+          <div class="verdict-stats-title">Total checked: ${stats.checked}/${denominator} entities</div>
+          <div class="verdict-stats" aria-label="Entity verdict counts">
+            <div class="verdict-stat pass">
+              <div class="count">${stats.pass}/${denominator}</div>
+              <div class="label">Passed</div>
+            </div>
+            <div class="verdict-stat fail">
+              <div class="count">${stats.fail}/${denominator}</div>
+              <div class="label">Failed</div>
+            </div>
+            <div class="verdict-stat uncertain">
+              <div class="count">${stats.uncertain}/${denominator}</div>
+              <div class="label">Uncertain</div>
+            </div>
           </div>
         </div>
       </div>
-      ${trace.finalRationale ? `<p style="color: #374151;">${escapeHtml(trace.finalRationale)}</p>` : ""}
     </div>
+  `;
+}
+
+function renderListItems(items: string[]): string {
+  if (!items.length) return `<p style="color: #6b7280;">No items recorded.</p>`;
+  return `
+    <ul style="margin-left: 18px; color: #374151;">
+      ${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}
+    </ul>
+  `;
+}
+
+function renderAppendixSubsection(title: string, content: string): string {
+  return `
+    <details class="appendix-subsection">
+      <summary>${escapeHtml(title)}</summary>
+      <div class="appendix-subsection-content">
+        ${content}
+      </div>
+    </details>
+  `;
+}
+
+function stepsOverlap(aStart?: number, aEnd?: number, bStart?: number, bEnd?: number): boolean {
+  if (aStart == null || aEnd == null || bStart == null || bEnd == null) return false;
+  return aStart <= bEnd && bStart <= aEnd;
+}
+
+function renderJudgeVerdictCard(args: {
+  trace: ConversationTrace;
+  entityId: string | null;
+  stepStart?: number;
+  stepEnd?: number;
+}): string {
+  const judge = args.trace.judgeReport;
+  if (!judge) {
+    return `
+      <div class="rule-card" style="margin-bottom: 16px;">
+        <div class="title">Primary VLM Summary</div>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px;">
+          <span class="badge" style="background:${getVerdictColor(args.trace.finalVerdict ?? "UNCERTAIN")};color:#fff;">${escapeHtml(args.trace.finalVerdict ?? "PENDING")}</span>
+          <span style="color:#4b5563;font-size:14px;">Confidence: ${args.trace.finalConfidence != null ? formatConfidence(args.trace.finalConfidence) : "N/A"}</span>
+        </div>
+        ${args.trace.finalRationale ? `<p style="color:#374151;">${escapeHtml(args.trace.finalRationale)}</p>` : ""}
+      </div>
+    `;
+  }
+
+  const matchingTasks = judge.taskVerdicts.filter((task) => {
+    if (args.entityId && task.entityId === args.entityId) return true;
+    if (!args.entityId && !task.entityId) return true;
+    return stepsOverlap(task.stepStart, task.stepEnd, args.stepStart, args.stepEnd);
+  });
+  const tasks = matchingTasks.length
+    ? matchingTasks
+    : judge.taskVerdicts.length <= 1
+      ? judge.taskVerdicts
+      : [];
+
+  const renderTask = (task: JudgeTaskVerdict) => `
+    <div class="rule-card" style="margin-bottom: 12px;">
+      <div class="title">${escapeHtml(task.taskLabel)}</div>
+      ${task.entityId ? `<div class="description">Entity: ${escapeHtml(task.entityId)}</div>` : ""}
+      ${task.stepStart != null && task.stepEnd != null ? `<div class="description">Judged steps: ${task.stepStart}${task.stepEnd !== task.stepStart ? `-${task.stepEnd}` : ""}</div>` : ""}
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px;">
+        <span class="badge" style="background:${getVerdictColor(task.verdict)};color:#fff;">${escapeHtml(task.verdict)}</span>
+        <span style="color:#4b5563;font-size:14px;">Judge confidence: ${formatConfidence(task.confidence)}</span>
+      </div>
+      <p style="color:#374151;">${escapeHtml(task.reasoning)}</p>
+      ${task.evidenceSnapshotIds.length ? `<p style="margin-top:8px;color:#6b7280;font-size:12px;">Evidence snapshots: ${task.evidenceSnapshotIds.map(escapeHtml).join(", ")}</p>` : ""}
+    </div>
+  `;
+
+  if (tasks.length) return tasks.map(renderTask).join("");
+
+  return `
+    <div class="rule-card" style="margin-bottom: 16px;">
+      <div class="title">${args.entityId ? `Judge Verdict for Entity ${escapeHtml(args.entityId)}` : "Judge Verdict"}</div>
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px;">
+        <span class="badge verdict-badge" style="background:${getVerdictColor(judge.verdict)};">${escapeHtml(judge.verdict)}</span>
+        <span style="color:#4b5563;font-size:14px;">Judge confidence: ${formatConfidence(judge.confidence)}</span>
+        <span style="color:#6b7280;font-size:12px;">${escapeHtml(judge.provider)} / ${escapeHtml(judge.modelId)}</span>
+      </div>
+      ${judge.error ? `<p style="color:#b91c1c;margin-bottom:8px;"><strong>Judge warning:</strong> ${escapeHtml(judge.error)}</p>` : ""}
+      <p style="color:#374151;">${escapeHtml(judge.rationale)}</p>
+    </div>
+  `;
+}
+
+function generateJudgeAppendixSection(trace: ConversationTrace): string {
+  const judge = trace.judgeReport;
+  if (!judge) {
+    return `
+      ${renderAppendixSubsection("Suggestions for the User", `<p style="color: #6b7280;">No judge suggestions were recorded for this run.</p>`)}
+      ${renderAppendixSubsection("Possible Mistakes and Debugging suggestions", `<p style="color: #6b7280;">No judge debugging suggestions were recorded for this run.</p>`)}
+    `;
+  }
+
+  return `
+    ${renderAppendixSubsection("Suggestions for the User", renderListItems(judge.suggestionsForUser))}
+    ${renderAppendixSubsection("Possible Mistakes and Debugging suggestions", `
+      <p style="color:#374151;margin-bottom:10px;">${escapeHtml(judge.debuggingAndSuggestions.primaryDecisionAssessment)}</p>
+      <div style="margin-bottom:10px;"><strong>Possible mistakes:</strong>${renderListItems(judge.debuggingAndSuggestions.possibleMistakes)}</div>
+      <div style="margin-bottom:10px;"><strong>Capability notes:</strong>${renderListItems(judge.debuggingAndSuggestions.capabilityNotes)}</div>
+      <div><strong>Improvement suggestions:</strong>${renderListItems(judge.debuggingAndSuggestions.improvementSuggestions)}</div>
+    `)}
   `;
 }
 
@@ -572,7 +1219,7 @@ function generateRuleSection(trace: ConversationTrace): string {
   const severityColor = getSeverityColor(trace.rule.severity);
 
   return `
-    <div class="section">
+    <div class="section" id="rule-information">
       <h2> Rule Information</h2>
       <div class="rule-card">
         <div class="title">${escapeHtml(trace.rule.title)}</div>
@@ -596,97 +1243,37 @@ function generateMetricsSection(metrics: InspectionMetrics | undefined): string 
   if (!metrics) return "";
 
   return `
-    <div class="section">
+    <div class="section" id="evaluation-metrics">
       <h2> Evaluation Metrics</h2>
       <div class="metrics-grid">
         <div class="metric-card">
-          <div class="value">${metrics.totalSnapshots}</div>
-          <div class="label">Snapshots</div>
-        </div>
-        <div class="metric-card">
           <div class="value">${metrics.totalVlmCalls}</div>
           <div class="label">VLM Calls</div>
-        </div>
-        <div class="metric-card">
-          <div class="value">${formatTokenCount(metrics.complianceTokensUsed)}</div>
-          <div class="label">Compliance Tokens Used</div>
-        </div>
-        <div class="metric-card">
-          <div class="value">${metrics.totalNavigationSteps}</div>
-          <div class="label">Navigation Steps</div>
         </div>
         <div class="metric-card">
           <div class="value">${formatDuration(metrics.totalDurationMs)}</div>
           <div class="label">Total Duration</div>
         </div>
         <div class="metric-card">
-          <div class="value">${formatDuration(metrics.avgVlmResponseTimeMs)}</div>
-          <div class="label">Avg Response Time</div>
+          <div class="value">${formatTokenCount(metrics.complianceTokensUsed)}</div>
+          <div class="label">Compliance Tokens Used</div>
+        </div>
+        <div class="metric-card">
+          <div class="value">${metrics.totalSnapshots}</div>
+          <div class="label">Snapshots</div>
         </div>
         <div class="metric-card">
           <div class="value">${formatConfidence(metrics.avgConfidence)}</div>
           <div class="label">Avg Confidence</div>
         </div>
-        <div class="metric-card">
-          <div class="value">${metrics.uncertainSteps}</div>
-          <div class="label">Uncertain Steps</div>
-        </div>
       </div>
     </div>
   `;
 }
 
-/**
- * Generate findings section
- */
-function generateFindingsSection(findings: StressedFinding[]): string {
-  if (findings.length === 0) {
-    return `
-      <div class="section">
-        <h2> Stressed Findings</h2>
-        <p style="color: #6b7280;">No specific findings recorded.</p>
-      </div>
-    `;
-  }
-
-  const findingsHtml = findings
-    .map(
-      (f) => `
-      <div class="finding-card ${f.type.toLowerCase()}">
-        <div class="message">
-          <span class="badge" style="background: ${getVerdictColor(f.type === "WARNING" ? "UNCERTAIN" : f.type)}; color: #fff; margin-right: 8px;">
-            ${f.type}
-          </span>
-          ${escapeHtml(f.message)}
-        </div>
-        <div class="details">${escapeHtml(f.details)}</div>
-        <div style="margin-top: 8px; font-size: 12px; color: #6b7280;">
-          Confidence: ${formatConfidence(f.confidence)} | Step ${f.step}
-        </div>
-      </div>
-    `
-    )
-    .join("");
-
-  return `
-    <div class="section">
-      <h2> Stressed Findings</h2>
-      ${findingsHtml}
-    </div>
-  `;
-}
-
-/**
- * Generate snapshots section
- */
-function generateSnapshotsSection(trace: ConversationTrace, embedImages: boolean): string {
+function renderSnapshotsGrid(trace: ConversationTrace, embedImages: boolean): string {
   if (trace.snapshots.length === 0) {
-    return `
-      <div class="section">
-        <h2> Snapshots</h2>
-        <p style="color: #6b7280;">No snapshots captured.</p>
-      </div>
-    `;
+    return `<p style="color: #6b7280;">No snapshots captured.</p>`;
   }
 
   const snapshotsHtml = trace.snapshots
@@ -704,10 +1291,62 @@ function generateSnapshotsSection(trace: ConversationTrace, embedImages: boolean
     .join("");
 
   return `
-    <div class="section">
-      <h2> Snapshots (${trace.snapshots.length})</h2>
+    <div class="snapshot-grid">
+      ${snapshotsHtml}
+    </div>
+  `;
+}
+
+function renderEntitySnapshots(
+  trace: ConversationTrace,
+  group: EntityTraceGroup,
+  snapshotsById: Map<string, ConversationTrace["snapshots"][number]>,
+  promptByStep: Map<number, ConversationTrace["prompts"][number]>,
+  snapshotIdByStep: Map<number, string>
+): string {
+  const snapshotIds = new Set<string>();
+
+  for (const response of group.responses) {
+    const currentStepSnapshotId =
+      snapshotIdByStep.get(response.step) ??
+      trace.snapshots.find((snapshot) => snapshot.reason.includes(`compliance_step_${response.step}_`))?.snapshotId;
+    if (currentStepSnapshotId) snapshotIds.add(currentStepSnapshotId);
+    for (const snapshotId of promptByStep.get(response.step)?.snapshotIds ?? []) {
+      snapshotIds.add(snapshotId);
+    }
+  }
+
+  for (const task of trace.judgeReport?.taskVerdicts ?? []) {
+    const matchesEntity = group.entityId && task.entityId === group.entityId;
+    const matchesSteps = stepsOverlap(task.stepStart, task.stepEnd, group.stepStart, group.stepEnd);
+    if (matchesEntity || matchesSteps) {
+      task.evidenceSnapshotIds.forEach((snapshotId) => snapshotIds.add(snapshotId));
+    }
+  }
+
+  const snapshots = Array.from(snapshotIds)
+    .map((snapshotId) => snapshotsById.get(snapshotId))
+    .filter((snapshot): snapshot is ConversationTrace["snapshots"][number] => Boolean(snapshot));
+
+  if (!snapshots.length) return "";
+
+  return `
+    <div class="entity-snapshots">
+      <h3>Snapshots for this Entity</h3>
       <div class="snapshot-grid">
-        ${snapshotsHtml}
+        ${snapshots
+          .map(
+            (snapshot) => `
+          <div class="snapshot-card">
+            ${snapshot.imageBase64 ? `<img src="data:image/png;base64,${snapshot.imageBase64}" alt="Snapshot ${snapshot.snapshotId}" />` : `<div style="height: 200px; background: #1f2937; display: flex; align-items: center; justify-content: center; color: #6b7280;">Image not embedded</div>`}
+            <div class="info">
+              <div class="reason">${escapeHtml(snapshot.reason)}</div>
+              <div class="time">${escapeHtml(snapshot.snapshotId)} | ${new Date(snapshot.timestamp).toLocaleString()}</div>
+            </div>
+          </div>
+        `
+          )
+          .join("")}
       </div>
     </div>
   `;
@@ -800,13 +1439,25 @@ function buildEntitySummary(trace: ConversationTrace): {
 
 function generateEntitySummarySection(trace: ConversationTrace): string {
   const summary = buildEntitySummary(trace);
+  const pendingCard = summary.remainingCount !== null && summary.remainingCount > 0
+    ? `
+      <div class="rule-card pending-card" style="margin-bottom: 12px;">
+        <div class="title">${summary.remainingCount} more entit${summary.remainingCount === 1 ? "y needs" : "ies need"} check</div>
+        <div class="description" style="margin-bottom: 8px;">These entities were still pending when the report was generated.</div>
+        <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+          <span class="badge" style="background:#9ca3af;color:#fff;">NEEDS CHECK</span>
+          <span style="color:#4b5563;font-size:14px;">Remaining: ${summary.remainingCount}</span>
+        </div>
+      </div>
+    `
+    : "";
 
   if (!summary.completed.length) {
     return `
-      <div class="section">
+      <div class="section" id="entity-summary">
         <h2> Entity Summary</h2>
         <p style="color: #6b7280;">No entity tasks were completed in this run.</p>
-        ${summary.remainingCount !== null ? `<p style="margin-top: 12px; color: #4b5563;">${summary.remainingCount} more entit${summary.remainingCount === 1 ? "y needs" : "ies need"} check.</p>` : ""}
+        ${pendingCard}
       </div>
     `;
   }
@@ -827,22 +1478,155 @@ function generateEntitySummarySection(trace: ConversationTrace): string {
     .join("");
 
   return `
-    <div class="section">
+    <div class="section" id="entity-summary">
       <h2> Entity Summary</h2>
       ${cardsHtml}
-      ${summary.remainingCount !== null ? `<p style="margin-top: 8px; color: #4b5563;">${summary.remainingCount} more entit${summary.remainingCount === 1 ? "y needs" : "ies need"} check.</p>` : ""}
+      ${pendingCard}
+    </div>
+  `;
+}
+
+type EntityTraceGroup = {
+  entityId: string | null;
+  taskLabel: string;
+  stepStart: number;
+  stepEnd: number;
+  responses: VlmResponseTrace[];
+};
+
+function buildEntityTraceGroups(trace: ConversationTrace): EntityTraceGroup[] {
+  const promptByStep = new Map(trace.prompts.map((prompt) => [prompt.step, prompt]));
+  const groupsByKey = new Map<string, EntityTraceGroup>();
+
+  for (const response of trace.responses) {
+    const promptText = promptByStep.get(response.step)?.promptText ?? "";
+    const parsedEntityId = parseChecklistValue(promptText, "activeEntity");
+    const entityId = parsedEntityId && parsedEntityId !== "none" ? parsedEntityId : null;
+    const key = entityId ?? "__unassigned__";
+    const activeTaskRaw = parseChecklistValue(promptText, "activeTask") ?? "entity.review|in_progress";
+    const taskId = activeTaskRaw.split("|")[0] ?? "entity.review";
+    const taskLabel = taskId.replace(/^entity\./, "").replace(/_/g, " ");
+    const existing = groupsByKey.get(key);
+
+    if (existing) {
+      existing.stepEnd = response.step;
+      existing.responses.push(response);
+    } else {
+      groupsByKey.set(key, {
+        entityId,
+        taskLabel,
+        stepStart: response.step,
+        stepEnd: response.step,
+        responses: [response],
+      });
+    }
+  }
+
+  return Array.from(groupsByKey.values());
+}
+
+function renderTraceStepItem(
+  trace: ConversationTrace,
+  response: VlmResponseTrace,
+  snapshotsById: Map<string, ConversationTrace["snapshots"][number]>,
+  promptByStep: Map<number, ConversationTrace["prompts"][number]>,
+  snapshotIdByStep: Map<number, string>
+): string {
+  const prompt = promptByStep.get(response.step);
+  const promptSnapshotIds = prompt?.snapshotIds ?? [];
+  const currentStepSnapshotId =
+    snapshotIdByStep.get(response.step) ??
+    trace.snapshots.find((snapshot) => snapshot.reason.includes(`compliance_step_${response.step}_`))?.snapshotId;
+  const fallbackSnapshotId = currentStepSnapshotId ?? trace.snapshots[response.step - 1]?.snapshotId;
+  const primarySnapshotId = fallbackSnapshotId ?? promptSnapshotIds[promptSnapshotIds.length - 1];
+  const primarySnapshot = primarySnapshotId ? snapshotsById.get(primarySnapshotId) : undefined;
+  const additionalSnapshotIds = promptSnapshotIds.filter((snapshotId) => snapshotId !== primarySnapshotId);
+  const additionalSnapshotCount = additionalSnapshotIds.length;
+
+  const snapshotsHtml = primarySnapshot
+    ? `
+    <div class="step-snapshots">
+      <div class="step-snapshots-title">Visual evidence</div>
+      ${additionalSnapshotCount > 0
+        ? `<div class="step-snapshots-note">This VLM decision also cited ${additionalSnapshotCount} additional snapshot${additionalSnapshotCount === 1 ? "" : "s"}: ${additionalSnapshotIds.map(escapeHtml).join(", ")}.</div>`
+        : ""}
+      <div class="step-snapshots-grid">
+        <figure class="step-snapshot-card">
+          ${primarySnapshot.imageBase64
+            ? `<img src="data:image/png;base64,${primarySnapshot.imageBase64}" alt="Snapshot ${primarySnapshot.snapshotId}" />`
+            : `<div class="step-snapshot-placeholder">Image not embedded</div>`}
+          <figcaption>
+            <span class="snapshot-id">${escapeHtml(primarySnapshot.snapshotId)}</span>
+            <span>${escapeHtml(primarySnapshot.reason)}</span>
+          </figcaption>
+        </figure>
+      </div>
+    </div>
+  `
+    : "";
+
+  const promptHtml = prompt?.promptText
+    ? `
+    <details class="step-prompt">
+      <summary>Prompt Text</summary>
+      ${prompt.promptSource
+        ? `<div style="padding: 0 12px 10px; color: #6b7280; font-size: 12px;">
+        Source: ${escapeHtml(prompt.promptSource === "rule_library" ? "Rule Library" : "Custom User Prompt")}
+        ${prompt.promptSourceLabel ? ` | Label: ${escapeHtml(prompt.promptSourceLabel)}` : ""}
+      </div>`
+        : ""}
+      ${Array.isArray(prompt.webSourcesUsed) && prompt.webSourcesUsed.length > 0
+        ? `<div style="padding: 0 12px 10px; color: #4b5563; font-size: 12px;">
+        Web sources used:
+        <ul style="margin: 6px 0 0 18px; padding: 0;">
+          ${prompt.webSourcesUsed
+            .map(
+              (src) =>
+                `<li>${escapeHtml(src.sourceType)} | ${escapeHtml(src.url)}${src.via ? ` | ${escapeHtml(src.via)}` : ""}</li>`
+            )
+            .join("")}
+        </ul>
+      </div>`
+        : ""}
+      <pre>${escapeHtml(prompt.promptText)}</pre>
+    </details>
+  `
+    : "";
+
+  return `
+    <div class="step-item ${response.decision.verdict.toLowerCase()}">
+      <div class="step-header">
+        <span class="step-number">Step ${response.step}</span>
+        <span class="badge" style="background: ${getVerdictColor(response.decision.verdict)}; color: #fff;">
+          ${response.decision.verdict}
+        </span>
+        <span style="color: #6b7280; font-size: 12px;">
+          ${formatConfidence(response.decision.confidence)} confidence
+        </span>
+      </div>
+      <div class="step-content">
+        <div class="rationale">${escapeHtml(response.decision.rationale)}</div>
+        ${snapshotsHtml}
+        ${promptHtml}
+        <div class="meta">
+          Response time: ${formatDuration(response.responseTimeMs)} |
+          ${new Date(response.timestamp).toLocaleString()}
+          ${response.decision.followUp ? ` | Next: ${response.decision.followUp.request}` : ""}
+        </div>
+      </div>
     </div>
   `;
 }
 
 /**
- * Generate step-by-step trace section
+ * Generate entity-scoped step-by-step trace sections.
  */
 function generateTraceSection(trace: ConversationTrace): string {
   if (trace.responses.length === 0) {
     return `
-      <div class="section">
+      <div class="section" id="trace-general">
         <h2> Step-by-Step Trace</h2>
+        ${renderJudgeVerdictCard({ trace, entityId: null })}
         <p style="color: #6b7280;">No steps recorded.</p>
       </div>
     `;
@@ -850,129 +1634,34 @@ function generateTraceSection(trace: ConversationTrace): string {
 
   const snapshotsById = new Map(trace.snapshots.map((snapshot) => [snapshot.snapshotId, snapshot]));
   const promptByStep = new Map(trace.prompts.map((prompt) => [prompt.step, prompt]));
+  const snapshotIdByStep = new Map(
+    trace.sceneStates
+      .filter((state) => state.step != null && Boolean(state.snapshotId))
+      .map((state) => [state.step as number, state.snapshotId as string])
+  );
 
-  const stepsHtml = trace.responses
-    .map(
-      (r) => {
-        const prompt = promptByStep.get(r.step);
-        const promptSnapshotIds = prompt?.snapshotIds ?? [];
-        const fallbackSnapshotId = trace.snapshots[r.step - 1]?.snapshotId;
-        const primarySnapshotId = promptSnapshotIds.length > 0
-          ? promptSnapshotIds[promptSnapshotIds.length - 1]
-          : fallbackSnapshotId;
-        const primarySnapshot = primarySnapshotId ? snapshotsById.get(primarySnapshotId) : undefined;
-        const additionalSnapshotCount = promptSnapshotIds.length > 1 ? promptSnapshotIds.length - 1 : 0;
+  return buildEntityTraceGroups(trace)
+    .map((group, index) => {
+      const stepsHtml = group.responses
+        .map((response) => renderTraceStepItem(trace, response, snapshotsById, promptByStep, snapshotIdByStep))
+        .join("");
+      const title = group.entityId
+        ? `Entity ${escapeHtml(group.entityId)} - Step-by-Step Trace`
+        : "Step-by-Step Trace";
 
-        const snapshotsHtml = primarySnapshot
-          ? `
-          <div class="step-snapshots">
-            <div class="step-snapshots-title">Visual evidence</div>
-            ${additionalSnapshotCount > 0
-              ? `<div class="step-snapshots-note">This VLM decision also included ${additionalSnapshotCount} snapshot${additionalSnapshotCount === 1 ? "" : "s"} from previous steps as additional evidence.</div>`
-              : ""}
-            <div class="step-snapshots-grid">
-              <figure class="step-snapshot-card">
-                ${primarySnapshot.imageBase64
-                  ? `<img src="data:image/png;base64,${primarySnapshot.imageBase64}" alt="Snapshot ${primarySnapshot.snapshotId}" />`
-                  : `<div class="step-snapshot-placeholder">Image not embedded</div>`}
-                <figcaption>
-                  <span class="snapshot-id">${escapeHtml(primarySnapshot.snapshotId)}</span>
-                  <span>${escapeHtml(primarySnapshot.reason)}</span>
-                </figcaption>
-              </figure>
-            </div>
-          </div>
-        `
-          : "";
-
-        const promptHtml = prompt?.promptText
-          ? `
-          <details class="step-prompt">
-            <summary>Prompt Text</summary>
-            ${prompt.promptSource
-              ? `<div style="padding: 0 12px 10px; color: #6b7280; font-size: 12px;">
-              Source: ${escapeHtml(prompt.promptSource === "rule_library" ? "Rule Library" : "Custom User Prompt")}
-              ${prompt.promptSourceLabel ? ` | Label: ${escapeHtml(prompt.promptSourceLabel)}` : ""}
-            </div>`
-              : ""}
-            ${Array.isArray(prompt.webSourcesUsed) && prompt.webSourcesUsed.length > 0
-              ? `<div style="padding: 0 12px 10px; color: #4b5563; font-size: 12px;">
-              Web sources used:
-              <ul style="margin: 6px 0 0 18px; padding: 0;">
-                ${prompt.webSourcesUsed
-                  .map(
-                    (src) =>
-                      `<li>${escapeHtml(src.sourceType)} | ${escapeHtml(src.url)}${src.via ? ` | ${escapeHtml(src.via)}` : ""}</li>`
-                  )
-                  .join("")}
-              </ul>
-            </div>`
-              : ""}
-            <pre>${escapeHtml(prompt.promptText)}</pre>
-          </details>
-        `
-          : "";
-
-        return `
-      <div class="step-item ${r.decision.verdict.toLowerCase()}">
-        <div class="step-header">
-          <span class="step-number">Step ${r.step}</span>
-          <span class="badge" style="background: ${getVerdictColor(r.decision.verdict)}; color: #fff;">
-            ${r.decision.verdict}
-          </span>
-          <span style="color: #6b7280; font-size: 12px;">
-            ${formatConfidence(r.decision.confidence)} confidence
-          </span>
-        </div>
-        <div class="step-content">
-          <div class="rationale">${escapeHtml(r.decision.rationale)}</div>
-          ${snapshotsHtml}
-          ${promptHtml}
-          <div class="meta">
-            Response time: ${formatDuration(r.responseTimeMs)} | 
-            ${new Date(r.timestamp).toLocaleString()}
-            ${r.decision.followUp ? ` | Next: ${r.decision.followUp.request}` : ""}
+      return `
+        <div class="section" id="trace-${toAnchorId(group.entityId ?? `general-${index + 1}`)}">
+          <h2> ${title}</h2>
+          ${group.entityId ? `<p style="color:#6b7280;margin-bottom:12px;">Primary task: ${escapeHtml(group.taskLabel)} | Steps ${group.stepStart}${group.stepEnd !== group.stepStart ? `-${group.stepEnd}` : ""}</p>` : ""}
+          ${renderJudgeVerdictCard({ trace, entityId: group.entityId, stepStart: group.stepStart, stepEnd: group.stepEnd })}
+          ${renderEntitySnapshots(trace, group, snapshotsById, promptByStep, snapshotIdByStep)}
+          <div class="step-timeline">
+            ${stepsHtml}
           </div>
         </div>
-      </div>
-    `;
-      }
-    )
+      `;
+    })
     .join("");
-
-  return `
-    <div class="section">
-      <h2> Step-by-Step Trace</h2>
-      <div class="step-timeline">
-        ${stepsHtml}
-      </div>
-    </div>
-  `;
-}
-
-/**
- * Generate model info section
- */
-function generateModelSection(trace: ConversationTrace): string {
-  return `
-    <div class="section">
-      <h2> Model Information</h2>
-      <div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px;">
-        <div>
-          <span style="color: #6b7280; font-size: 12px;">Provider</span>
-          <div style="font-weight: 500;">${escapeHtml(trace.model.provider)}</div>
-        </div>
-        <div>
-          <span style="color: #6b7280; font-size: 12px;">Model</span>
-          <div style="font-weight: 500;">${escapeHtml(trace.model.name)}</div>
-        </div>
-        <div>
-          <span style="color: #6b7280; font-size: 12px;">Model ID</span>
-          <div style="font-weight: 500;">${escapeHtml(trace.model.id)}</div>
-        </div>
-      </div>
-    </div>
-  `;
 }
 
 /**
@@ -1013,12 +1702,7 @@ function generateWebEvidenceAppendix(trace: ConversationTrace): string {
   const entries = Array.from(byKey.values());
 
   if (entries.length === 0) {
-    return `
-      <div class="section">
-        <h2> Appendix: Regulatory / Web Evidence</h2>
-        <p style="color: #6b7280;">No web evidence was recorded for this run.</p>
-      </div>
-    `;
+    return renderAppendixSubsection("Web Evidence", `<p style="color: #6b7280;">No web evidence was recorded for this run.</p>`);
   }
 
   const itemsHtml = entries
@@ -1051,13 +1735,88 @@ function generateWebEvidenceAppendix(trace: ConversationTrace): string {
     )
     .join("");
 
-  return `
-    <div class="section">
-      <h2> Appendix: Regulatory / Web Evidence</h2>
+  return renderAppendixSubsection("Web Evidence", `
       <p style="color: #4b5563; margin-bottom: 16px;">
         The following regulatory/web evidence was retrieved during the inspection and injected into the VLM context.
       </p>
       ${itemsHtml}
+    `);
+}
+
+function formatSettingValue(value: unknown): string {
+  if (value == null) return "N/A";
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "string") return String(value);
+  return JSON.stringify(value, null, 2);
+}
+
+function renderSettingsTable(settings: object): string {
+  return `
+    <div class="settings-grid">
+      ${Object.entries(settings)
+        .map(
+          ([key, value]) => `
+        <div class="settings-entry">
+          <span class="settings-key">${escapeHtml(key)}</span>
+          <span class="settings-value">${escapeHtml(formatSettingValue(value))}</span>
+        </div>
+      `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function generatePrototypeSettingsAppendix(): string {
+  const runtimeSettings = getPrototypeRuntimeSettings();
+
+  return renderAppendixSubsection("Prototype Settings Values", `
+    <div class="appendix-item">
+      <h3>Runtime Settings</h3>
+      ${renderSettingsTable(runtimeSettings)}
+    </div>
+    <div class="appendix-item">
+      <h3>Default Runtime Settings</h3>
+      ${renderSettingsTable(DEFAULT_PROTOTYPE_RUNTIME_SETTINGS)}
+    </div>
+    <div class="appendix-item">
+      <h3>Static Prototype Constants</h3>
+      ${renderSettingsTable({
+        DEFAULT_MAX_COMPLIANCE_STEPS,
+        REPEATED_FOLLOW_UPS_BEFORE_ESCALATION,
+        ENTITY_UNCERTAIN_TERMINATION_STEPS,
+        ENTITY_UNCERTAIN_TERMINATION_CONFIDENCE,
+        ENTITY_REPEATED_WORKFLOW_TERMINATION_STEPS,
+        DEFAULT_MAX_SNAPSHOTS_PER_REQUEST,
+        DEFAULT_TAVILY_MAX_CHARS,
+        DEFAULT_REDUCED_TAVILY_MAX_CHARS,
+        HIGHLIGHT_TARGET_AREA_RATIO,
+        ZOOM_IN_EXHAUSTION_AREA_FACTOR,
+        TOP_VIEW_TARGET_AREA_RATIO,
+        MAX_ORBIT_FOLLOW_UPS_PER_ENTITY,
+        MAX_ORBIT_DEGREES_PER_AXIS,
+        ORBIT_MAX_HIGHLIGHT_OCCLUSION_RATIO,
+      })}
+    </div>
+    <div class="appendix-item">
+      <h3>Navigation and Visual Defaults</h3>
+      ${renderSettingsTable({
+        HIGHLIGHT_ANNOTATION_DEFAULTS,
+        HIGHLIGHT_NAVIGATION_DEFAULTS,
+        RAMP_NAVIGATION_DEFAULTS,
+        DOOR_CLEARANCE_DEFAULTS,
+      })}
+    </div>
+  `);
+}
+
+function generateAppendixSection(trace: ConversationTrace, embedImages: boolean): string {
+  return `
+    <div class="section" id="appendix">
+      <h2> Appendix</h2>
+      ${renderAppendixSubsection("All Snapshots", renderSnapshotsGrid(trace, embedImages))}
+      ${generateJudgeAppendixSection(trace)}
+      ${generateWebEvidenceAppendix(trace)}
+      ${generatePrototypeSettingsAppendix()}
     </div>
   `;
 }
@@ -1068,8 +1827,10 @@ function generateWebEvidenceAppendix(trace: ConversationTrace): string {
 export function generateHtmlReport(trace: ConversationTrace, options: ReportOptions = {}): string {
   const { embedImages = true, title } = options;
 
-  const reportTitle = title ?? `Compliance Report: ${trace.rule.title}`;
+  const reportTitle = title ?? `Compliance Report: ${trace.rule.title} with ${getFriendlyVlmName(trace)}`;
   const generatedAt = new Date().toISOString();
+  const reportNavigation = buildReportNavigation(trace);
+  const reportActions = buildReportActions();
 
   return `
 <!DOCTYPE html>
@@ -1081,30 +1842,31 @@ export function generateHtmlReport(trace: ConversationTrace, options: ReportOpti
   <style>${generateCss()}</style>
 </head>
 <body>
-  <div class="container">
-    <div class="header">
-      <h1>${escapeHtml(reportTitle)}</h1>
-      <div class="meta">
-        Generated: ${new Date(generatedAt).toLocaleString()} | 
-        Run ID: ${trace.runId.slice(0, 8)} | 
-        Duration: ${trace.startedAt && trace.completedAt ? formatDuration(new Date(trace.completedAt).getTime() - new Date(trace.startedAt).getTime()) : "N/A"}
+  <div class="page-layout">
+    ${reportNavigation}
+    <div class="container">
+      <div class="header" id="report-top">
+        <h1>${escapeHtml(reportTitle)}</h1>
+        <div class="meta">
+          Generated: ${new Date(generatedAt).toLocaleString()} | 
+          Run ID: ${trace.runId.slice(0, 8)} | 
+          Duration: ${trace.startedAt && trace.completedAt ? formatDuration(new Date(trace.completedAt).getTime() - new Date(trace.startedAt).getTime()) : "N/A"}
+        </div>
+      </div>
+
+      ${generateRuleSection(trace)}
+      ${generateSummarySection(trace)}
+      ${generateMetricsSection(trace.metrics)}
+      ${generateEntitySummarySection(trace)}
+      ${generateTraceSection(trace)}
+      ${generateAppendixSection(trace, embedImages)}
+
+      <div class="footer">
+        <p>IFC/BIM Visual Compliance Checker | Report Version 1.0.0</p>
+        <p>This report was automatically generated by the VLM-based compliance checking system.</p>
       </div>
     </div>
-
-    ${generateSummarySection(trace)}
-    ${generateRuleSection(trace)}
-    ${generateMetricsSection(trace.metrics)}
-    ${generateFindingsSection(trace.stressedFindings)}
-    ${generateSnapshotsSection(trace, embedImages)}
-    ${generateEntitySummarySection(trace)}
-    ${generateTraceSection(trace)}
-    ${generateModelSection(trace)}
-    ${generateWebEvidenceAppendix(trace)}
-
-    <div class="footer">
-      <p>IFC/BIM Visual Compliance Checker | Report Version 1.0.0</p>
-      <p>This report was automatically generated by the VLM-based compliance checking system.</p>
-    </div>
+    ${reportActions}
   </div>
 </body>
 </html>

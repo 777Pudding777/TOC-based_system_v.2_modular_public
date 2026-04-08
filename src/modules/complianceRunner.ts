@@ -2,17 +2,17 @@
 // Orchestrates "one rule per project": reset state, (optional) deterministic start,
 // capture snapshot(s), call VLM checker, store decisions, and optionally do follow-ups.
 
-import type { WebEvidenceRecord } from "../types/trace.types";
 import {
-  DEFAULT_MAX_COMPLIANCE_STEPS,
   ENTITY_REPEATED_WORKFLOW_TERMINATION_STEPS,
-  ENTITY_UNCERTAIN_TERMINATION_CONFIDENCE,
-  ENTITY_UNCERTAIN_TERMINATION_STEPS,
   HIGHLIGHT_NAVIGATION_DEFAULTS,
   HIGHLIGHT_TARGET_AREA_RATIO,
+  MAX_ORBIT_DEGREES_PER_AXIS,
+  MAX_ORBIT_FOLLOW_UPS_PER_ENTITY,
   RAMP_NAVIGATION_DEFAULTS,
   REPEATED_FOLLOW_UPS_BEFORE_ESCALATION,
+  TOP_VIEW_TARGET_AREA_RATIO,
   ZOOM_IN_EXHAUSTION_AREA_FACTOR,
+  getPrototypeRuntimeSettings,
 } from "../config/prototypeSettings";
 import type { CameraPose, StartPosePreset, ViewerGridReference } from "../viewer/api";
 import type { SnapshotArtifact } from "./snapshotCollector";
@@ -44,6 +44,7 @@ type EntityEvidenceStat = {
   steps: number;
   uncertainSteps: number;
   repeatedWorkflowStreak: number;
+  orbitFollowUps: number;
   lastWorkflowSignature?: string;
   topMeasurementReady?: boolean;
   contextConfirmReady?: boolean;
@@ -93,7 +94,16 @@ type EvidenceContext = {
   lastActionReason?: string | null;
   availableStoreys?: string[];
   availableSpaces?: string[];
-  planCut?: { enabled: boolean; planes?: number };
+  planCut?: {
+    enabled: boolean;
+    planes?: number;
+    height?: number;
+    absoluteHeight?: number;
+    thickness?: number;
+    mode?: string;
+    source?: string;
+    storeyId?: string;
+  };
   viewerGrid?: ViewerGridReference;
   highlightAnnotations?: Record<string, unknown>;
   floorContext?: {
@@ -101,6 +111,12 @@ type EvidenceContext = {
     visibleFloorCategories: string[];
     recommendedAction?: "SET_STOREY_PLAN_CUT";
     reason?: string;
+  };
+  followUpBudget?: {
+    orbitCallsForActiveEntity: number;
+    maxOrbitCallsPerEntity: number;
+    orbitRemainingForActiveEntity: number;
+    orbitMaxHighlightOcclusionRatio: number;
   };
   taskGraph?: {
     profile: CompactTaskGraphState["profile"];
@@ -149,6 +165,7 @@ export type ComplianceStartParams = {
   maxSteps?: number;          // safeguard
   minConfidence?: number;     // stop condition
   evidenceWindow?: number;    // multi-view aggregation (forward-compatible)
+  shouldStop?: () => "continue" | "stop" | "skip";
   onStep?: (step: number, decision: VlmDecision) => void;  // live progress callback
   onProgress?: (update: {
     stage: "starting" | "seeded" | "captured" | "decision" | "followup" | "finished";
@@ -158,6 +175,8 @@ export type ComplianceStartParams = {
     lastActionReason?: string | null;
     verdict?: VlmDecision["verdict"];
     confidence?: number;
+    thinking?: string;
+    followUpSummary?: string;
   }) => void;
 };
 
@@ -188,6 +207,7 @@ export function createComplianceRunner(params: {
     getDoorClearanceFocusBox?: (ids?: string[]) => Promise<any>;
     listCategoryObjectIds?: (category: string, limit?: number) => Promise<string[]>;
     hideSelected?: () => Promise<void>;
+    getSelectionWorldBox?: (map: any) => Promise<any>;
 
     getActiveScope?: () => Promise<{ storeyId?: string; spaceId?: string }>;
     getIsolatedCategories?: () => Promise<string[]>;
@@ -243,6 +263,13 @@ evidenceViews: {
       reason: string;
     }>;
     goToCurrentIsolateSelection?: (opts?: any) => Promise<any>;
+    measureSelection?: (map: any, opts?: any) => Promise<{
+      targetAreaRatio: number;
+      occlusionRatio: number | null;
+      steps: number;
+      success: boolean;
+      reason: string;
+    }>;
   };
 
   toast?: ToastFn;
@@ -258,6 +285,7 @@ evidenceViews: {
   let lastViewPreset: StartPosePreset | null = null;
   let currentTaskGraph: ReturnType<typeof createTaskGraph> | null = null;
   let navigationBookmarks: NavigationBookmark[] = [];
+  let entityEvidenceStats = new Map<string, EntityEvidenceStat>();
 
   // one-rule-per-project: single active run id
   let activeRunId: string | null = null;
@@ -429,6 +457,101 @@ function rememberNavigationBookmark(bookmark: NavigationBookmark) {
   }
 }
 
+async function reapplyPersistentHighlight(style: "primary" | "warn" = "primary") {
+  if (!lastHighlightedIds.length || !viewerApi.highlightIds) return;
+  await viewerApi.highlightIds(lastHighlightedIds, style);
+}
+
+async function rememberPersistentHighlight(ids: string[], style: "primary" | "warn" = "primary") {
+  if (!ids.length || !viewerApi.highlightIds) return;
+  const nextFocusIds = Array.from(new Set(ids.filter(Boolean)));
+  lastHighlightedIds = nextFocusIds;
+  lastSelectedId = nextFocusIds[0] ?? lastSelectedId ?? null;
+  await viewerApi.highlightIds(lastHighlightedIds, style);
+}
+
+function getActiveHighlightFocusIds(): string[] {
+  if (lastSelectedId && lastHighlightedIds.includes(lastSelectedId)) return [lastSelectedId];
+  return lastHighlightedIds.slice(0, 1);
+}
+
+async function activateEntityFocus(
+  entityId: string,
+  opts?: {
+    previousEntityId?: string | null;
+    reasonPrefix?: string;
+    highlightIds?: string[];
+  }
+) {
+  if (!entityId || !viewerApi.highlightIds) return undefined;
+  const switchingEntity = Boolean(opts?.previousEntityId && opts.previousEntityId !== entityId);
+  const firstActivation = !lastSelectedId && !lastHighlightedIds.length;
+  const needsHardwiredCenter =
+    firstActivation ||
+    switchingEntity ||
+    lastSelectedId !== entityId ||
+    !lastHighlightedIds.includes(entityId);
+
+  await rememberPersistentHighlight(opts?.highlightIds?.length ? opts.highlightIds : [entityId], "primary");
+  lastSelectedId = entityId;
+
+  if (!needsHardwiredCenter) return undefined;
+
+  const currentPose = await viewerApi.getCameraPose();
+  const map = buildModelIdMapFromObjectIds([entityId]);
+  if (!Object.keys(map).length) return undefined;
+  const focus = currentTaskGraph ? getTaskGraphFocus(currentTaskGraph) : null;
+  const activeClass =
+    (focus?.activeEntityId ? currentTaskGraph?.entities.byId[focus.activeEntityId]?.entityClass : undefined) ??
+    currentTaskGraph?.intent.primaryClass;
+  const isDoorTarget = typeof activeClass === "string" && activeClass.toUpperCase().includes("IFCDOOR");
+  const focusBox = isDoorTarget && viewerApi.getDoorClearanceFocusBox
+    ? await viewerApi.getDoorClearanceFocusBox([entityId])
+    : await viewerApi.getSelectionWorldBox?.(map as any);
+  if (
+    !focusBox ||
+    typeof focusBox !== "object" ||
+    focusBox.isEmpty?.() ||
+    !focusBox.min ||
+    !focusBox.max
+  ) {
+    return undefined;
+  }
+  const center = {
+    x: (focusBox.min.x + focusBox.max.x) / 2,
+    y: (focusBox.min.y + focusBox.max.y) / 2,
+    z: (focusBox.min.z + focusBox.max.z) / 2,
+  };
+  const delta = {
+    x: center.x - currentPose.target.x,
+    y: center.y - currentPose.target.y,
+    z: center.z - currentPose.target.z,
+  };
+  const almostZero =
+    Math.abs(delta.x) < 1e-6 &&
+    Math.abs(delta.y) < 1e-6 &&
+    Math.abs(delta.z) < 1e-6;
+  if (!almostZero) {
+    await viewerApi.setCameraPose(
+      {
+        eye: {
+          x: currentPose.eye.x + delta.x,
+          y: currentPose.eye.y + delta.y,
+          z: currentPose.eye.z + delta.z,
+        },
+        target: { x: center.x, y: center.y, z: center.z },
+      },
+      true
+    );
+  }
+  return {
+    convergenceScore: 1,
+    success: true,
+    reason: `${opts?.reasonPrefix ?? (switchingEntity ? "entity-transition" : "entity-focus")}:center-only`,
+    zoomPotentialExhausted: false,
+  } satisfies NavMetrics;
+}
+
 function summarizeNavigationHistory() {
   const recent = navigationBookmarks.slice(-6).reverse().map((bookmark) => ({
     bookmarkId: bookmark.id,
@@ -521,12 +644,10 @@ async function restoreNavigationBookmark(params?: { step?: number; snapshotId?: 
   }
 
   if (target.highlightedIds.length && viewerApi.highlightIds) {
-    await viewerApi.highlightIds(target.highlightedIds, "primary");
-    lastHighlightedIds = [...target.highlightedIds];
-    lastSelectedId = target.selectedId ?? target.highlightedIds[0] ?? null;
-  } else {
-    lastHighlightedIds = [];
-    lastSelectedId = null;
+    await rememberPersistentHighlight(target.highlightedIds, "primary");
+    lastSelectedId = target.selectedId ?? target.highlightedIds[0] ?? lastSelectedId;
+  } else if (lastHighlightedIds.length) {
+    await reapplyPersistentHighlight();
   }
 
   lastHiddenIds = [...target.hiddenIds];
@@ -546,11 +667,10 @@ async function advanceToNextEntity(taskGraph: ReturnType<typeof createTaskGraph>
     await restoreNavigationBookmark({ bookmarkId: reusableBookmark.id });
   }
 
-  if (viewerApi.highlightIds) {
-    await viewerApi.highlightIds([nextFocus.activeEntityId], "primary");
-    lastHighlightedIds = [nextFocus.activeEntityId];
-    lastSelectedId = nextFocus.activeEntityId;
-  }
+  await activateEntityFocus(nextFocus.activeEntityId, {
+    previousEntityId: fromEntityId,
+    reasonPrefix: "entity-transition",
+  });
 
   if (nextEntity?.storeyId) {
     lastScope = { storeyId: nextEntity.storeyId };
@@ -640,6 +760,57 @@ function followUpKey(fu: VlmFollowUp | undefined): string | null {
   return `${fu.request}|${stableJson((fu as any).params ?? null)}`;
 }
 
+function clampOrbitDegrees(value: unknown, fallback: number): number {
+  const raw = typeof value === "number" && isFinite(value) ? value : fallback;
+  return Math.max(-MAX_ORBIT_DEGREES_PER_AXIS, Math.min(MAX_ORBIT_DEGREES_PER_AXIS, raw));
+}
+
+function normalizeOrbitParams(params: Extract<VlmFollowUp, { request: "ORBIT" }>["params"] | undefined, topLike: boolean) {
+  const fallbackYaw = topLike ? 45 : 20;
+  const fallbackPitch = topLike ? -30 : 0;
+  const yawSource = params?.yawDegrees ?? params?.degrees;
+  const pitchSource = params?.pitchDegrees;
+  return {
+    yawDegrees: clampOrbitDegrees(yawSource, fallbackYaw),
+    pitchDegrees: clampOrbitDegrees(pitchSource, fallbackPitch),
+  };
+}
+
+function buildOrbitPose(current: CameraPose, yawDegrees: number, pitchDegrees: number): CameraPose {
+  const tx = current.target.x;
+  const ty = current.target.y;
+  const tz = current.target.z;
+  const vx = current.eye.x - tx;
+  const vy = current.eye.y - ty;
+  const vz = current.eye.z - tz;
+  const radius = Math.hypot(vx, vy, vz);
+
+  if (!Number.isFinite(radius) || radius <= 1e-6) return current;
+
+  const horizontal = Math.hypot(vx, vz);
+  const yaw = horizontal > 1e-6 ? Math.atan2(vz, vx) : Math.PI / 4;
+  const elevation = Math.asin(Math.max(-1, Math.min(1, vy / radius)));
+  // Keep the orbit camera at or above the target level so confirmation views
+  // never end up looking from underneath the inspected object.
+  const minElevation = 0;
+  const maxElevation = (89 * Math.PI) / 180;
+  const nextYaw = yaw + (yawDegrees * Math.PI) / 180;
+  const nextElevation = Math.max(
+    minElevation,
+    Math.min(maxElevation, elevation + (pitchDegrees * Math.PI) / 180)
+  );
+  const nextHorizontal = radius * Math.cos(nextElevation);
+
+  return {
+    eye: {
+      x: tx + nextHorizontal * Math.cos(nextYaw),
+      y: ty + radius * Math.sin(nextElevation),
+      z: tz + nextHorizontal * Math.sin(nextYaw),
+    },
+    target: current.target,
+  };
+}
+
 function escalateFollowUp(fu: VlmFollowUp | undefined): VlmFollowUp | undefined {
   if (!fu) return fu;
 
@@ -652,6 +823,9 @@ function escalateFollowUp(fu: VlmFollowUp | undefined): VlmFollowUp | undefined 
       return { request: "ISOLATE_CATEGORY", params: { category: "IfcDoor" } };
     //case "ISOLATE_CATEGORY":
     //  return { request: "PICK_CENTER", params: { reason: "Pick a representative door to inspect." } };
+    case "ZOOM_IN":
+    case "NEW_VIEW":
+      return { request: "ORBIT", params: { yawDegrees: 20, pitchDegrees: 0, reason: "Repeated view/zoom follow-up; gather a bounded alternate angle." } };
     default:
       return { request: "NEW_VIEW", params: { reason: "Repeated followUp; changing view to gather new evidence." } };
   }
@@ -691,7 +865,13 @@ const pickHighlightCandidates = (limit = 3): string[] => {
 
 const focusHighlightedIds = async (
   ids: string[],
-  minTargetAreaRatio = Math.max(HIGHLIGHT_TARGET_AREA_RATIO, HIGHLIGHT_NAVIGATION_DEFAULTS.targetAreaRatio)
+  minTargetAreaRatio = Math.max(HIGHLIGHT_TARGET_AREA_RATIO, HIGHLIGHT_NAVIGATION_DEFAULTS.targetAreaRatio),
+  opts?: {
+    enableOcclusion?: boolean;
+    maxOcclusionRatio?: number;
+    reasonPrefix?: string;
+    useDoorClearanceFocusBox?: boolean;
+  }
 ) => {
   if (!ids.length || !navigationAgent?.navigateToSelection) return undefined;
   const focus = currentTaskGraph ? getTaskGraphFocus(currentTaskGraph) : null;
@@ -709,15 +889,16 @@ const focusHighlightedIds = async (
   const map = buildModelIdMapFromObjectIds(ids);
   if (!Object.keys(map).length) return undefined;
   const focusBox =
-    isDoorTarget && viewerApi.getDoorClearanceFocusBox
+    isDoorTarget && opts?.useDoorClearanceFocusBox !== false && viewerApi.getDoorClearanceFocusBox
       ? await viewerApi.getDoorClearanceFocusBox(ids.slice(0, 1))
       : undefined;
   const m = await navigationAgent.navigateToSelection(map as any, {
     minTargetAreaRatio: targetAreaGoal,
+    maxOcclusionRatio: opts?.maxOcclusionRatio,
     maxSteps: navProfile.maxSteps,
     zoomFactor: navProfile.zoomFactor,
     orbitDegrees: lastViewPreset === "top" ? 0 : navProfile.orbitDegrees,
-    enableOcclusion: false,
+    enableOcclusion: Boolean(opts?.enableOcclusion),
     focusBox,
   });
   const zoomPotentialExhausted =
@@ -731,7 +912,7 @@ const focusHighlightedIds = async (
     convergenceScore: m.success ? 1 : 0,
     targetAreaGoal,
     success: m.success,
-    reason: m.reason,
+    reason: opts?.reasonPrefix ? `${opts.reasonPrefix}:${m.reason}` : m.reason,
     zoomPotentialExhausted,
   };
   return nav;
@@ -741,13 +922,13 @@ const recenterOnActiveHighlight = async (
   minTargetAreaRatio = Math.max(HIGHLIGHT_TARGET_AREA_RATIO, HIGHLIGHT_NAVIGATION_DEFAULTS.targetAreaRatio)
 ) => {
   if (!lastHighlightedIds.length) return undefined;
-  return focusHighlightedIds(lastHighlightedIds.slice(0, 1), minTargetAreaRatio);
+  return focusHighlightedIds(getActiveHighlightFocusIds(), minTargetAreaRatio);
 };
-
 
 if (f.request === "ISO_VIEW") {
   await viewerApi.setPresetView("iso", true);
   lastViewPreset = "iso";
+  await reapplyPersistentHighlight();
   const nav = await recenterOnActiveHighlight();
   return { didSomething: true, reason: "iso" as const, nav };
 }
@@ -758,7 +939,8 @@ if (f.request === "TOP_VIEW") {
   }
   await viewerApi.setPresetView("top", true);
   lastViewPreset = "top";
-  const nav = await recenterOnActiveHighlight();
+  await reapplyPersistentHighlight();
+  const nav = await recenterOnActiveHighlight(TOP_VIEW_TARGET_AREA_RATIO);
   return { didSomething: true, reason: "top" as const, nav };
 }
 // Set view preset follow-up
@@ -767,12 +949,14 @@ if (f.request === "SET_VIEW_PRESET") {
   if (preset === "TOP") {
     await viewerApi.setPresetView("top", true);
     lastViewPreset = "top";
-    const nav = await recenterOnActiveHighlight();
+    await reapplyPersistentHighlight();
+    const nav = await recenterOnActiveHighlight(TOP_VIEW_TARGET_AREA_RATIO);
     return { didSomething: true, reason: "top" as const, nav };
   }
   if (preset === "ISO") {
     await viewerApi.setPresetView("iso", true);
     lastViewPreset = "iso";
+    await reapplyPersistentHighlight();
     const nav = await recenterOnActiveHighlight();
     return { didSomething: true, reason: "iso" as const, nav };
   }
@@ -788,6 +972,7 @@ if (f.request === "HIDE_CATEGORY") {
   }
   const ok = await viewerApi.hideCategory(f.params.category);
   if (viewerApi.getHiddenIds) lastHiddenIds = await viewerApi.getHiddenIds();
+  if (ok) await reapplyPersistentHighlight();
   return { didSomething: ok, reason: ok ? "hide-category" as const : "hide-category-failed" as const };
 }
 
@@ -798,6 +983,7 @@ if (f.request === "SHOW_CATEGORY") {
   }
   const ok = await viewerApi.showCategory(f.params.category);
   if (viewerApi.getHiddenIds) lastHiddenIds = await viewerApi.getHiddenIds();
+  if (ok) await reapplyPersistentHighlight();
   return { didSomething: ok, reason: ok ? "show-category" as const : "show-category-failed" as const };
 }
 
@@ -812,9 +998,8 @@ if (f.request === "PICK_CENTER") {
     return { didSomething: false, reason: "highlight-candidates-empty" as const };
   }
 
-  await viewerApi.highlightIds(ids, "primary");
-  lastHighlightedIds = ids;
-  lastSelectedId = ids[0] ?? null;
+  await rememberPersistentHighlight(ids, "primary");
+  lastSelectedId = ids[0] ?? lastSelectedId;
   const nav = await focusHighlightedIds(ids);
   return { didSomething: true, reason: "highlight-center-candidate" as const, nav };
 }
@@ -831,9 +1016,8 @@ if (f.request === "PICK_OBJECT") {
     return { didSomething: false, reason: "highlight-candidates-empty" as const };
   }
 
-  await viewerApi.highlightIds(ids, "primary");
-  lastHighlightedIds = ids;
-  lastSelectedId = ids[0] ?? null;
+  await rememberPersistentHighlight(ids, "primary");
+  lastSelectedId = ids[0] ?? lastSelectedId;
   const nav = await focusHighlightedIds(ids.slice(0, 1));
   return { didSomething: true, reason: "highlight-picked-candidates" as const, nav };
 }
@@ -845,6 +1029,7 @@ if (f.request === "SET_PLAN_CUT") {
     return { didSomething: false, reason: "plan-cut-not-wired" as const };
   }
   await viewerApi.setPlanCut(f.params);
+  await reapplyPersistentHighlight();
   const nav = await recenterOnActiveHighlight();
   return { didSomething: true, reason: "plan-cut" as const, nav };
 }
@@ -857,6 +1042,7 @@ if (f.request === "SET_STOREY_PLAN_CUT") {
   }
   await viewerApi.setStoreyPlanCut(f.params);
   lastScope = { storeyId: f.params.storeyId };
+  await reapplyPersistentHighlight();
   const nav = await recenterOnActiveHighlight();
   return { didSomething: true, reason: "storey-plan-cut" as const, nav };
 }
@@ -867,6 +1053,7 @@ if (f.request === "CLEAR_PLAN_CUT") {
     return { didSomething: false, reason: "plan-cut-clear-not-wired" as const };
   }
   await viewerApi.clearPlanCut();
+  await reapplyPersistentHighlight();
   const nav = await recenterOnActiveHighlight();
   return { didSomething: true, reason: "plan-cut-clear" as const, nav };
 }
@@ -891,10 +1078,15 @@ if (f.request === "HIGHLIGHT_IDS") {
     focus?.activeEntityId && ids.includes(focus.activeEntityId)
       ? [focus.activeEntityId]
       : ids.slice(0, focus?.activeEntityId ? 1 : 6);
-  await viewerApi.highlightIds(targetIds, f.params.style);
-  lastHighlightedIds = targetIds;
-  lastSelectedId = targetIds[0] ?? null;
-  const nav = await focusHighlightedIds(targetIds);
+  const previousEntityId = lastSelectedId;
+  const selectedTargetId = targetIds[0] ?? lastSelectedId;
+  const nav = selectedTargetId
+    ? await activateEntityFocus(selectedTargetId, {
+        previousEntityId,
+        reasonPrefix: "highlight-ids",
+        highlightIds: targetIds,
+      })
+    : undefined;
   return { didSomething: true, reason: "highlight" as const, nav };
 }
 
@@ -904,9 +1096,8 @@ if (f.request === "GET_PROPERTIES") {
   if (!ids.length || !viewerApi.highlightIds) {
     return { didSomething: false, reason: "highlight-candidates-empty" as const };
   }
-  await viewerApi.highlightIds(ids.slice(0, 1), "primary");
-  lastHighlightedIds = ids.slice(0, 1);
-  lastSelectedId = ids[0] ?? null;
+  await rememberPersistentHighlight(ids.slice(0, 1), "primary");
+  lastSelectedId = ids[0] ?? lastSelectedId;
   const nav = await focusHighlightedIds(ids.slice(0, 1));
   return {
     didSomething: true,
@@ -929,39 +1120,106 @@ if (f.request === "HIDE_SELECTED") {
 }
 
 
-if (f.request === "NEW_VIEW") {
-  if (lastHighlightedIds.length) {
-    const nav = await recenterOnActiveHighlight();
-    return { didSomething: true, reason: "orbit20deg" as const, nav };
+if (f.request === "ORBIT" || f.request === "NEW_VIEW") {
+  const focus = currentTaskGraph ? getTaskGraphFocus(currentTaskGraph) : null;
+  const activeEntityKey = focus?.activeEntityId ?? lastSelectedId ?? lastHighlightedIds[0] ?? "__run__";
+  const stats = entityEvidenceStats.get(activeEntityKey) ?? {
+    steps: 0,
+    uncertainSteps: 0,
+    repeatedWorkflowStreak: 0,
+    orbitFollowUps: 0,
+  };
+
+  if (stats.orbitFollowUps >= MAX_ORBIT_FOLLOW_UPS_PER_ENTITY) {
+    return { didSomething: false, reason: "orbit-limit-reached" as const, nav: previousNav };
   }
 
+  const topLike = lastViewPreset === "top";
+  const params =
+    f.request === "ORBIT"
+      ? normalizeOrbitParams(f.params, topLike)
+      : normalizeOrbitParams(
+          {
+            yawDegrees: topLike ? 45 : 20,
+            pitchDegrees: topLike ? -30 : 0,
+            reason: f.params?.reason,
+          },
+          topLike
+        );
   const pose = await viewerApi.getCameraPose();
-  const ex = pose.eye.x, ey = pose.eye.y, ez = pose.eye.z;
-  const tx = pose.target.x, ty = pose.target.y, tz = pose.target.z;
+  await viewerApi.setCameraPose(buildOrbitPose(pose, params.yawDegrees, params.pitchDegrees), true);
+  lastViewPreset = null;
+  stats.orbitFollowUps += 1;
+  entityEvidenceStats.set(activeEntityKey, stats);
+  const orbitMaxHighlightOcclusionRatio = getPrototypeRuntimeSettings().orbitMaxHighlightOcclusionRatio;
+  const activeHighlightFocusIds = getActiveHighlightFocusIds();
+  const hasActiveHighlight = activeHighlightFocusIds.length > 0;
+  let nav: NavMetrics | undefined;
 
-  // Vector from target to eye
-  const vx = ex - tx;
-  const vy = ey - ty;
-  const vz = ez - tz;
+  if (hasActiveHighlight && navigationAgent?.measureSelection) {
+    const map = buildModelIdMapFromObjectIds(activeHighlightFocusIds);
+    const toNavMetrics = (m: {
+      targetAreaRatio: number;
+      occlusionRatio: number | null;
+      success: boolean;
+      reason: string;
+    }): NavMetrics => ({
+      projectedAreaRatio: m.targetAreaRatio,
+      occlusionRatio: m.occlusionRatio ?? undefined,
+      convergenceScore:
+        typeof m.occlusionRatio === "number" && m.occlusionRatio <= orbitMaxHighlightOcclusionRatio ? 1 : 0,
+      targetAreaGoal: HIGHLIGHT_NAVIGATION_DEFAULTS.targetAreaRatio,
+      success: m.success && (m.occlusionRatio === null || m.occlusionRatio <= orbitMaxHighlightOcclusionRatio),
+      reason: `orbit-occlusion-guard:${m.reason}`,
+      zoomPotentialExhausted: false,
+    });
 
-  // Orbit 20 degrees around world-up (Y). Deterministic and scale-invariant.
-  const deg = 20;
-  const rad = (deg * Math.PI) / 180;
-  const cos = Math.cos(rad);
-  const sin = Math.sin(rad);
+    const measureCurrentOrbitView = async () =>
+      toNavMetrics(await navigationAgent.measureSelection!(map as any, { enableOcclusion: true }));
 
-  const nx = vx * cos - vz * sin;
-  const nz = vx * sin + vz * cos;
+    nav = await measureCurrentOrbitView();
+    const yawDirection = params.yawDegrees < 0 ? -1 : 1;
+    const pitchDirection = params.pitchDegrees === 0 ? 0 : params.pitchDegrees < 0 ? -1 : 1;
+    const retryYawDegrees = yawDirection * MAX_ORBIT_DEGREES_PER_AXIS;
+    const retryPitchDegrees = pitchDirection * MAX_ORBIT_DEGREES_PER_AXIS;
 
-  await viewerApi.setCameraPose(
-    {
-      eye: { x: tx + nx, y: ty + vy, z: tz + nz },
-      target: pose.target,
-    },
-    true
-  );
+    for (
+      let attempt = 1;
+      typeof nav.occlusionRatio === "number" &&
+      nav.occlusionRatio > orbitMaxHighlightOcclusionRatio &&
+      attempt <= 3;
+      attempt++
+    ) {
+      const retryPose = await viewerApi.getCameraPose();
+      await viewerApi.setCameraPose(buildOrbitPose(retryPose, retryYawDegrees, retryPitchDegrees), true);
+      stats.orbitFollowUps += 1;
+      entityEvidenceStats.set(activeEntityKey, stats);
+      nav = {
+        ...(await measureCurrentOrbitView()),
+        reason: `orbit-occlusion-guard:retry-${attempt}-of-3`,
+      };
+    }
 
-  return { didSomething: true, reason: "orbit20deg" as const };
+    if (typeof nav.occlusionRatio === "number" && nav.occlusionRatio > orbitMaxHighlightOcclusionRatio) {
+      return {
+        didSomething: false,
+        reason: "orbit-highlight-occlusion-unresolved-needs-different-followup" as const,
+        nav: {
+          ...nav,
+          reason:
+            "orbit-highlight-occlusion-unresolved-needs-different-followup: target likely remains heavily occluded; VLM should request HIDE_CATEGORY, HIDE_IDS, ISO_VIEW, TOP_VIEW/plan cut, or another non-orbit follow-up for a better view.",
+        },
+      };
+    }
+  } else {
+    nav = await recenterOnActiveHighlight();
+  }
+
+  return {
+    didSomething: true,
+    reason: topLike ? "orbit-from-top" as const : "orbit" as const,
+    nav,
+  };
 }
 
     
@@ -970,7 +1228,7 @@ if (f.request === "NEW_VIEW") {
     return { didSomething: false, reason: "zoom-potential-exhausted" as const, nav: previousNav };
   }
   if (lastHighlightedIds.length) {
-    const nav = await focusHighlightedIds(lastHighlightedIds.slice(0, 1));
+    const nav = await focusHighlightedIds(getActiveHighlightFocusIds());
     if (nav) {
       return { didSomething: true, reason: "zoom-to-highlighted-entity" as const, nav };
     }
@@ -992,7 +1250,7 @@ if (f.request === "NEW_VIEW") {
     },
     true
   );
-  const nav = await focusHighlightedIds(lastHighlightedIds.slice(0, 1));
+  const nav = await focusHighlightedIds(getActiveHighlightFocusIds());
   return { didSomething: true, reason: "zoom" as const, nav };
 }
 
@@ -1010,9 +1268,8 @@ if (f.request === "ISOLATE_CATEGORY") {
         focus?.activeEntityId && ids.includes(focus.activeEntityId)
           ? [focus.activeEntityId]
           : focus?.suggestedHighlightIds?.filter((id) => ids.includes(id)).slice(0, limit) ?? ids.slice(0, limit);
-      await viewerApi.highlightIds(targetIds, "primary");
-      lastHighlightedIds = targetIds;
-      lastSelectedId = targetIds[0] ?? null;
+      await rememberPersistentHighlight(targetIds, "primary");
+      lastSelectedId = targetIds[0] ?? lastSelectedId;
       lastIsolatedCategories = [category];
       const nav = await focusHighlightedIds(targetIds.slice(0, 1));
       return { didSomething: true, reason: "highlight-category-context" as const, nav };
@@ -1036,6 +1293,7 @@ if (f.request === "ISOLATE_CATEGORY") {
   if (!map || count === 0) {
     return { didSomething: false, reason: "isolate-category-empty" as const };
   }
+  await reapplyPersistentHighlight();
 
   // Optional: navigation-derived metrics for next snapshot
   if (navigationAgent?.navigateToSelection) {
@@ -1081,8 +1339,7 @@ if (f.request === "ISOLATE_STOREY") {
   }
 
   lastScope = { storeyId: f.params.storeyId };
-  lastHighlightedIds = [];
-  lastSelectedId = null;
+  await reapplyPersistentHighlight();
   return { didSomething: true, reason: "isolate-storey" as const };
 }
 
@@ -1094,6 +1351,7 @@ if (f.request === "ISOLATE_SPACE") {
   }
   await viewerApi.isolateSpace(f.params.spaceId);
   lastScope = { spaceId: f.params.spaceId };
+  await reapplyPersistentHighlight();
   return { didSomething: true, reason: "isolate-space" as const };
 }
 
@@ -1123,6 +1381,7 @@ if (f.request === "HIDE_IDS") {
   // prefer authoritative getter if available
   if (viewerApi.getHiddenIds) lastHiddenIds = await viewerApi.getHiddenIds();
   else lastHiddenIds = Array.from(new Set([...lastHiddenIds, ...ids]));
+  await reapplyPersistentHighlight();
 
   return { didSomething: true, reason: "hide-ids" as const };
 }
@@ -1141,15 +1400,10 @@ if (f.request === "SHOW_IDS") {
 
   if (viewerApi.getHiddenIds) lastHiddenIds = await viewerApi.getHiddenIds();
   else lastHiddenIds = lastHiddenIds.filter(x => !ids.includes(x));
+  await reapplyPersistentHighlight();
 
   return { didSomething: true, reason: "show-ids" as const };
 }
-
-    // Optional: if nav exists and you want to support it
-    if (f.request === "ORBIT" && navigationAgent?.goToCurrentIsolateSelection) {
-      // you can map this later; for now ignore
-      return { didSomething: false, reason: "orbit-not-wired" as const };
-    }
 
     return { didSomething: false, reason: "unsupported-followup" as const };
   }
@@ -1170,28 +1424,40 @@ if (f.request === "SHOW_IDS") {
     enrichTaskGraphFromText(taskGraph, prompt);
     currentTaskGraph = taskGraph;
 
-    const maxSteps = Math.max(1, Math.min(20, params.maxSteps ?? DEFAULT_MAX_COMPLIANCE_STEPS));
+    const runtimeSettings = getPrototypeRuntimeSettings();
+    const maxSteps = Math.max(5, Math.min(30, params.maxSteps ?? runtimeSettings.maxComplianceSteps));
 
     // One rule per project: reset everything relevant
     await viewerApi.resetVisibility();
     await snapshotCollector.reset();
+    lastScope = {};
+    lastIsolatedCategories = [];
+    lastHiddenIds = [];
+    lastHighlightedIds = [];
+    lastSelectedId = null;
 
     // Create a new compliance run id (DB is “decisions only” for now)
     activeRunId = makeRunId();
     navigationBookmarks = [];
+    entityEvidenceStats = new Map<string, EntityEvidenceStat>();
 
     let lastActionReason: string | null = null;
     let pendingNav: NavMetrics | undefined = undefined;
     let lastEvidenceNav: NavMetrics | undefined = undefined;
     let lastFollowUpKey: string | null = null;
     let repeatedFollowUpCount = 0;
-    const entityEvidenceStats = new Map<string, EntityEvidenceStat>();
 
     // Apply deterministic start (optional)
     await applyDeterministicStart(params.deterministic);
     const metadataSeeded = await seedTaskGraphFromMetadata(taskGraph, params.deterministic);
     if (metadataSeeded) {
       lastActionReason = "metadata-seed";
+      const initialFocus = getTaskGraphFocus(taskGraph);
+      if (initialFocus.activeEntityId) {
+        await activateEntityFocus(initialFocus.activeEntityId, {
+          reasonPrefix: "initial-entity-focus",
+        });
+      }
     }
     params.onProgress?.({
       stage: metadataSeeded ? "seeded" : "starting",
@@ -1245,6 +1511,16 @@ const syncEntityTasks = () => {
 
     // Step loop
     for (let step = 1; step <= maxSteps; step++) {
+const stopRequestBeforeStep = params.shouldStop?.() ?? "continue";
+if (stopRequestBeforeStep === "stop" || stopRequestBeforeStep === "skip") {
+  return {
+    ok: false as const,
+    reason: stopRequestBeforeStep === "skip" ? "user-skip-requested" as const : "user-stop-requested" as const,
+    final: allDecisions.length > 0 ? allDecisions[allDecisions.length - 1] : undefined,
+    decisions: allDecisions,
+    snapshots: evidence.length,
+  };
+}
 const note = enrichNote(`compliance_step_${step}_view`, params.deterministic) +
   (lastActionReason ? ` | prevAction=${lastActionReason}` : "");
 
@@ -1276,8 +1552,7 @@ if (isProbablyBlank) {
   lastScope = {};
   lastIsolatedCategories = [];
   lastHiddenIds = [];
-  lastHighlightedIds = [];
-  lastSelectedId = null;
+  await reapplyPersistentHighlight();
 
   await (viewerApi as any).stabilizeForSnapshot?.();
 
@@ -1309,6 +1584,11 @@ const highlightAnnotations =
   artifact.meta.context && typeof artifact.meta.context.highlightAnnotations === "object"
     ? (artifact.meta.context.highlightAnnotations as Record<string, unknown>)
     : undefined;
+const currentFocusForBudget = getTaskGraphFocus(taskGraph);
+const currentEntityStatsForBudget = currentFocusForBudget.activeEntityId
+  ? entityEvidenceStats.get(currentFocusForBudget.activeEntityId)
+  : undefined;
+const orbitCallsForActiveEntity = currentEntityStatsForBudget?.orbitFollowUps ?? 0;
 
 // capture current evidence context
 const context: EvidenceContext = {
@@ -1329,8 +1609,23 @@ const context: EvidenceContext = {
   viewerGrid,
   floorContext,
   highlightAnnotations,
+  followUpBudget: {
+    orbitCallsForActiveEntity,
+    maxOrbitCallsPerEntity: MAX_ORBIT_FOLLOW_UPS_PER_ENTITY,
+    orbitRemainingForActiveEntity: Math.max(0, MAX_ORBIT_FOLLOW_UPS_PER_ENTITY - orbitCallsForActiveEntity),
+    orbitMaxHighlightOcclusionRatio: getPrototypeRuntimeSettings().orbitMaxHighlightOcclusionRatio,
+  },
   taskGraph: summarizeTaskGraph(taskGraph),
   navigationHistory: summarizeNavigationHistory(),
+};
+
+// Keep the snapshot artifact self-contained for inspection-history replay.
+// The viewer snapshot only includes lightweight HUD metadata; this runner
+// context carries the actual restorable state: isolation, hidden IDs,
+// highlights, camera pose, and plan-cut settings.
+artifact.meta.context = {
+  ...(artifact.meta.context ?? {}),
+  ...context,
 };
 
 // then after you capture the next snapshot:
@@ -1386,6 +1681,7 @@ syncEntityTasks();
         lastActionReason,
         verdict: decision.verdict,
         confidence: decision.confidence,
+        thinking: decision.rationale,
       });
 
       // activeRunId is set above; guard anyway for safety
@@ -1398,6 +1694,16 @@ syncEntityTasks();
       await complianceDb.saveDecision(activeRunId, decision);
       console.log("[Compliance] decision:", decision);
       params.onStep?.(step, decision);
+      const stopRequestAfterDecision = params.shouldStop?.() ?? "continue";
+      if (stopRequestAfterDecision === "stop" || stopRequestAfterDecision === "skip") {
+        return {
+          ok: false as const,
+          reason: stopRequestAfterDecision === "skip" ? "user-skip-requested" as const : "user-stop-requested" as const,
+          final: decision,
+          decisions: allDecisions,
+          snapshots: evidence.length,
+        };
+      }
 
       if (activeEntityBeforeDecision) {
         const workflowSignature = buildWorkflowSignature({
@@ -1413,6 +1719,7 @@ syncEntityTasks();
           steps: 0,
           uncertainSteps: 0,
           repeatedWorkflowStreak: 0,
+          orbitFollowUps: 0,
         };
         stats.topMeasurementReady =
           stats.topMeasurementReady || Boolean(doorClearanceReadiness?.evidenceBundle?.topMeasurementViewReady);
@@ -1426,6 +1733,9 @@ syncEntityTasks();
             : 1;
         stats.lastWorkflowSignature = workflowSignature;
         entityEvidenceStats.set(activeEntityBeforeDecision, stats);
+        const entityStepBudgetReached = stats.steps >= runtimeSettings.entityUncertainTerminationSteps;
+        const hasConfidentFinalVerdict =
+          (decision.verdict === "PASS" || decision.verdict === "FAIL") && decision.confidence >= minConfidence;
 
         if (
           decision.verdict === "UNCERTAIN" &&
@@ -1450,6 +1760,10 @@ syncEntityTasks();
             lastActionReason,
             verdict: decision.verdict,
             confidence: decision.confidence,
+            thinking: decision.rationale,
+            followUpSummary: advanceResult.advanced
+              ? "Focused zoom was exhausted, so the runner advanced to the next entity."
+              : "Focused zoom was exhausted, so the current entity was marked inconclusive.",
           });
           if (advanceResult.advanced) {
             await (viewerApi as any).stabilizeForSnapshot?.();
@@ -1467,8 +1781,8 @@ syncEntityTasks();
         if (
           decision.verdict === "UNCERTAIN" &&
           (
-            (stats.uncertainSteps >= ENTITY_UNCERTAIN_TERMINATION_STEPS &&
-              decision.confidence >= ENTITY_UNCERTAIN_TERMINATION_CONFIDENCE) ||
+            (stats.uncertainSteps >= runtimeSettings.entityUncertainTerminationSteps &&
+              decision.confidence >= runtimeSettings.entityUncertainTerminationConfidence) ||
             stats.repeatedWorkflowStreak >= ENTITY_REPEATED_WORKFLOW_TERMINATION_STEPS
           )
         ) {
@@ -1500,12 +1814,53 @@ syncEntityTasks();
             lastActionReason,
             verdict: decision.verdict,
             confidence: decision.confidence,
+            thinking: decision.rationale,
+            followUpSummary: advanceResult.advanced
+              ? "Evidence was insufficient, so the runner advanced to the next entity."
+              : "Evidence was insufficient, so the current entity was marked inconclusive.",
           });
           if (advanceResult.advanced) {
             await (viewerApi as any).stabilizeForSnapshot?.();
             continue;
           }
           toast?.("Active entity marked inconclusive after repeated uncertain evidence.");
+          return {
+            ok: true as const,
+            runId: activeRunId,
+            final: decision,
+            decisions: allDecisions,
+            snapshots: evidence.length,
+          };
+        }
+
+        if (entityStepBudgetReached && !hasConfidentFinalVerdict) {
+          markActiveEntityInconclusive(
+            taskGraph,
+            `Per-entity step budget reached after ${stats.steps} evaluation step(s).`
+          );
+          const advanceResult = await advanceToNextEntity(taskGraph, activeEntityBeforeDecision);
+          lastActionReason = advanceResult.restoredPreparedView
+            ? "restore-storey-plan-cut-view"
+            : "entity-step-budget-reached";
+          params.onProgress?.({
+            stage: "followup",
+            step,
+            summary: advanceResult.advanced
+              ? `The current entity reached the per-entity step budget (${stats.steps}/${runtimeSettings.entityUncertainTerminationSteps}), so the runner advanced to the next entity.`
+              : `The current entity reached the per-entity step budget (${stats.steps}/${runtimeSettings.entityUncertainTerminationSteps}), so it was marked inconclusive.`,
+            taskGraph: summarizeTaskGraph(taskGraph),
+            lastActionReason,
+            verdict: decision.verdict,
+            confidence: decision.confidence,
+            thinking: decision.rationale,
+            followUpSummary: advanceResult.advanced
+              ? `The current entity hit its step budget, so the runner advanced to the next entity.`
+              : `The current entity hit its step budget, so it was marked inconclusive.`,
+          });
+          if (advanceResult.advanced) {
+            await (viewerApi as any).stabilizeForSnapshot?.();
+            continue;
+          }
           return {
             ok: true as const,
             runId: activeRunId,
@@ -1540,6 +1895,10 @@ syncEntityTasks();
             lastActionReason,
             verdict: decision.verdict,
             confidence: decision.confidence,
+            thinking: decision.rationale,
+            followUpSummary: advanceResult.advanced
+              ? "The required evidence bundle was already collected, so the runner advanced to the next entity."
+              : "The required evidence bundle was already collected, so the current entity was marked inconclusive.",
           });
           if (advanceResult.advanced) {
             await (viewerApi as any).stabilizeForSnapshot?.();
@@ -1576,6 +1935,10 @@ syncEntityTasks();
             lastActionReason,
             verdict: decision.verdict,
             confidence: decision.confidence,
+            thinking: decision.rationale,
+            followUpSummary: advanceResult.advanced
+              ? "No additional follow-up was proposed, so the runner finalized this entity and moved on."
+              : "No additional follow-up was proposed, so the current entity was finalized.",
           });
           if (advanceResult.advanced) {
             await (viewerApi as any).stabilizeForSnapshot?.();
@@ -1610,6 +1973,10 @@ syncEntityTasks();
             lastActionReason,
             verdict: decision.verdict,
             confidence: decision.confidence,
+            thinking: decision.rationale,
+            followUpSummary: advanceResult.restoredPreparedView
+              ? "The entity was decided and the prepared storey view was restored for the next entity."
+              : "The entity was decided and the runner continued with the next entity.",
           });
           await (viewerApi as any).stabilizeForSnapshot?.();
           continue;
@@ -1625,6 +1992,7 @@ syncEntityTasks();
           lastActionReason,
           verdict: decision.verdict,
           confidence: decision.confidence,
+          thinking: decision.rationale,
         });
         return {
           ok: true as const,
@@ -1663,6 +2031,10 @@ params.onProgress?.({
     : `Follow-up ${followUpToRun?.request ?? "none"} could not improve the current evidence.`,
   taskGraph: summarizeTaskGraph(taskGraph),
   lastActionReason,
+  thinking: decision.rationale,
+  followUpSummary: acted.didSomething
+    ? `Executed ${followUpToRun?.request ?? "no"} follow-up to gather better evidence.`
+    : `The ${followUpToRun?.request ?? "requested"} follow-up did not improve the current evidence.`,
 });
 
 if (acted.didSomething) {
@@ -1723,6 +2095,10 @@ params.onProgress?.({
     : `Follow-up ${followUpToRun?.request ?? "none"} did not change the current state.`,
   taskGraph: summarizeTaskGraph(taskGraph),
   lastActionReason,
+  thinking: decision.rationale,
+  followUpSummary: acted.didSomething
+    ? `Executed ${followUpToRun?.request ?? "no"} follow-up to refine the current task.`
+    : `The ${followUpToRun?.request ?? "requested"} follow-up did not change the current state.`,
 });
 
 if (acted.didSomething) {

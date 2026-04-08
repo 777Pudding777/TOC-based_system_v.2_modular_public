@@ -123,7 +123,15 @@ function isFollowUp(x: any): x is VlmFollowUp {
       );
 
     case "ORBIT":
-      return x.params && typeof x.params.degrees === "number" && isFinite(x.params.degrees);
+      return (
+        x.params &&
+        typeof x.params === "object" &&
+        (x.params.degrees === undefined || (typeof x.params.degrees === "number" && isFinite(x.params.degrees))) &&
+        (x.params.yawDegrees === undefined || (typeof x.params.yawDegrees === "number" && isFinite(x.params.yawDegrees))) &&
+        (x.params.pitchDegrees === undefined || (typeof x.params.pitchDegrees === "number" && isFinite(x.params.pitchDegrees))) &&
+        (x.params.reason === undefined || typeof x.params.reason === "string") &&
+        (x.params.degrees !== undefined || x.params.yawDegrees !== undefined || x.params.pitchDegrees !== undefined)
+      );
 
     case "ZOOM_IN":
       return !x.params || (typeof x.params === "object");
@@ -350,12 +358,28 @@ async function fetchJsonWithTimeout(
   timeoutMs: number
 ): Promise<{ ok: boolean; status: number; json: any }> {
   const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), timeoutMs);
+  const id = setTimeout(() => ctrl.abort(`Request timed out after ${timeoutMs}ms.`), timeoutMs);
 
   try {
     const resp = await fetch(url, { ...init, signal: ctrl.signal });
     const json = await resp.json().catch(() => null);
     return { ok: resp.ok, status: resp.status, json };
+  } catch (error: any) {
+    if (error?.name === "AbortError" || ctrl.signal.aborted) {
+      return {
+        ok: false,
+        status: 408,
+        json: {
+          error: {
+            message:
+              typeof ctrl.signal.reason === "string"
+                ? ctrl.signal.reason
+                : `OpenRouter request timed out after ${timeoutMs}ms.`,
+          },
+        },
+      };
+    }
+    throw error;
   } finally {
     clearTimeout(id);
   }
@@ -365,7 +389,7 @@ async function fetchJsonWithTimeout(
 
 export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAdapter {
   const endpoint = cfg.endpoint ?? "https://openrouter.ai/api/v1/chat/completions";
-  const timeoutMs = Math.max(5_000, Math.min(120_000, cfg.requestTimeoutMs ?? 45_000));
+  const timeoutMs = Math.max(5_000, Math.min(180_000, cfg.requestTimeoutMs ?? 90_000));
 
   return {
     name: "openrouter",
@@ -605,6 +629,11 @@ if (verdict === "UNCERTAIN") {
   const planCutEnabled: boolean = Boolean(ctxAny?.planCut?.enabled);
   const zoomPotentialExhausted: boolean = Boolean(navAny?.zoomPotentialExhausted);
   const floorContextMissing: boolean = Boolean(ctxAny?.floorContext?.missingLikely);
+  const orbitRemaining: number = Number(ctxAny?.followUpBudget?.orbitRemainingForActiveEntity ?? 0);
+  const orbitCallsForActiveEntity: number = Number(ctxAny?.followUpBudget?.orbitCallsForActiveEntity ?? 0);
+  const canOrbit = orbitRemaining > 0;
+  const lastActionWasOrbit = lastActionReason === "orbit" || lastActionReason === "orbit-from-top";
+  const canRequestTopAfterOrbit = !lastActionWasOrbit || orbitCallsForActiveEntity >= 2;
   const taskProfile: string | undefined = ctxAny?.taskGraph?.profile;
   const primaryClass: string | undefined = ctxAny?.taskGraph?.primaryClass;
   const activeEntityId: string | undefined = ctxAny?.taskGraph?.activeEntity?.id;
@@ -665,10 +694,10 @@ if (verdict === "UNCERTAIN") {
     else if (isRampTask && activeEntityId && !highlightedIds?.includes(activeEntityId)) {
       followUp = { request: "HIGHLIGHT_IDS", params: { ids: [activeEntityId], style: "primary" } } as any;
     }
-    else if (isRampTask && safeVisibility.occlusionAssessment === "HIGH" && lastActionReason !== "orbit20deg") {
-      followUp = { request: "NEW_VIEW", params: { reason: "Need a side or less occluded view of the ramp run." } } as any;
+    else if (isRampTask && safeVisibility.occlusionAssessment === "HIGH" && canOrbit && !lastActionWasOrbit) {
+      followUp = { request: "ORBIT", params: { yawDegrees: 25, pitchDegrees: 0, reason: "Need a side or less occluded view of the ramp run." } } as any;
     }
-    else if (isRampTask && accessibilityFocused && currentViewPreset !== "top") {
+    else if (isRampTask && accessibilityFocused && currentViewPreset !== "top" && canRequestTopAfterOrbit) {
       followUp = { request: "TOP_VIEW" } as any;
     }
     else if (isRampTask && wantedStorey && !planCutEnabled && (accessibilityFocused || floorContextMissing || rationaleWantsPlanCut)) {
@@ -692,10 +721,10 @@ if (verdict === "UNCERTAIN") {
     else if (isStairTask && activeEntityId && !highlightedIds?.includes(activeEntityId)) {
       followUp = { request: "HIGHLIGHT_IDS", params: { ids: [activeEntityId], style: "primary" } } as any;
     }
-    else if (isStairTask && safeVisibility.occlusionAssessment === "HIGH" && lastActionReason !== "orbit20deg") {
-      followUp = { request: "NEW_VIEW", params: { reason: "Need a clearer side or landing view of the stair run." } } as any;
+    else if (isStairTask && safeVisibility.occlusionAssessment === "HIGH" && canOrbit && !lastActionWasOrbit) {
+      followUp = { request: "ORBIT", params: { yawDegrees: 25, pitchDegrees: 0, reason: "Need a clearer side or landing view of the stair run." } } as any;
     }
-    else if (isStairTask && accessibilityFocused && currentViewPreset !== "top") {
+    else if (isStairTask && accessibilityFocused && currentViewPreset !== "top" && canRequestTopAfterOrbit) {
       followUp = { request: "TOP_VIEW" } as any;
     }
     else if (isStairTask && wantedStorey && !planCutEnabled && (accessibilityFocused || floorContextMissing || rationaleWantsPlanCut)) {
@@ -708,7 +737,7 @@ if (verdict === "UNCERTAIN") {
       followUp = { request: "ZOOM_IN", params: { factor: 1.15 } } as any;
     }
     // 1) Go to TOP view for accessibility checks.
-    else if (isDoorTask && currentViewPreset !== "top") {
+    else if (isDoorTask && currentViewPreset !== "top" && canRequestTopAfterOrbit) {
       followUp = { request: "TOP_VIEW" } as any;
     }
     // 2) Then prepare a storey-aware plan cut for the active storey.
@@ -747,6 +776,16 @@ if (verdict === "UNCERTAIN") {
     // 6) Only after top view + storey plan cut prep, allow a tighter entity-focused zoom.
     else if ((!highlightedIds?.length || lastActionReason !== "zoom-to-highlighted-entity") && !zoomPotentialExhausted) {
       followUp = { request: "ZOOM_IN", params: { factor: 2 } } as any;
+    }
+    else if (zoomPotentialExhausted && highlightedIds?.length && canOrbit) {
+      followUp = {
+        request: "ORBIT",
+        params: {
+          yawDegrees: currentViewPreset === "top" ? 45 : 25,
+          pitchDegrees: currentViewPreset === "top" ? -30 : 0,
+          reason: "Focused target is already zoomed/highlighted; gather one bounded confirmation angle.",
+        },
+      } as any;
     }
     else if (zoomPotentialExhausted) {
       followUp = undefined;
@@ -848,7 +887,7 @@ export async function discoverIccClausesOnline(cfg: OpenRouterAdapterConfig, arg
 }): Promise<ClauseDiscoveryResult> {
   if (!cfg.apiKey) throw new Error("OpenRouter missing apiKey.");
   const endpoint = cfg.endpoint ?? "https://openrouter.ai/api/v1/chat/completions";
-  const timeoutMs = Math.max(5_000, Math.min(120_000, cfg.requestTimeoutMs ?? 45_000));
+  const timeoutMs = Math.max(5_000, Math.min(180_000, cfg.requestTimeoutMs ?? 90_000));
 
   const allowedDomains = cfg.webSearch?.allowedDomains?.length
     ? cfg.webSearch.allowedDomains
