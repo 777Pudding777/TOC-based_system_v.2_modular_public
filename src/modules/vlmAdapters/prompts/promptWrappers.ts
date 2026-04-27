@@ -1,4 +1,5 @@
 import type { ComplianceRule } from "../../../types/rule.types";
+import type { EvidenceRequirementKey } from "../../../types/evidenceRequirements.types";
 
 export type WrapPromptInput = {
   taskPrompt: string;
@@ -20,26 +21,24 @@ function buildPromptCore(args: {
           "WORKFLOW (expert guidance):",
           "1) Read the task as an inspection mission: identify the target class, the measurable question, the likely storey/space focus, and any special hint from the user prompt.",
           "2) Treat DYNAMIC_CHECKLIST as a compact runtime task brief inferred from prompt text, runtime evidence, and any grounded regulatory context. Use activeTask, activeEntity, activeStorey, and progress only; ignore completed or unrelated work.",
-          "3) Prefer the cheapest decisive view sequence. For repeated door checks this means: switch to TOP_VIEW, prepare a storey-aware plan cut for the active storey, reuse that prepared top/plan-cut setup for other doors on the same storey, then highlight and inspect doors one-by-one.",
-          "3a) For door-clearance checks, treat evidenceViews.context.highlightAnnotations.doorClearanceReadiness as the authoritative readiness signal for whether the current highlighted door is finally measurable.",
-          "4) If the active entity is still too small, request HIGHLIGHT_IDS or ZOOM_IN before asking for broader scene changes.",
-          "5) Once the active target is highlighted/centered and zoom is sufficient or exhausted, consider ORBIT as a late-stage multi-view confirmation action before finalizing an uncertain verdict.",
-          "6) If floor-based clearance cannot be grounded because local floor context is missing, treat evidenceViews.context.floorContext as authoritative and prefer SET_STOREY_PLAN_CUT for the active storey.",
-          "7) Use side or oblique views as confirmation views after a readable measurement-oriented view, not as the first choice for plan-based measurements.",
+          "3) Focus on evidence requirements, not navigation recipes. Report what is still missing or not ready, especially visibility, measurement readiness, surrounding-context readiness, occlusion, and regulatory context.",
+          "4) Treat evidenceViews.context.evidenceRequirements as the generalized runtime evidence state. If present, update or confirm that status instead of inventing a rule-specific action sequence.",
+          "5) For door-clearance checks, treat evidenceViews.context.highlightAnnotations.doorClearanceReadiness as an authoritative specialized readiness signal that should be expressed through generalized evidence-requirement status such as planMeasurementReady or contextViewReady.",
+          "6) If floor-based clearance cannot be grounded because local floor context is missing, describe that as a plan-measurement readiness gap rather than prescribing a specific tool unless a follow-up suggestion is still helpful.",
+          "7) Use side or oblique views as confirmation evidence after a readable measurement-oriented view, not as the primary basis for plan-based measurements.",
           "8) When the user prompt mentions a storey, level, side, or specific inspection strategy, prioritize that hint if compatible with the visible evidence and available storeys.",
-          "9) If the task prompt is vague on thresholds or clause text, prioritize WEB_FETCH before additional model navigation.",
+          "9) If the task prompt is vague on thresholds or clause text, report regulatoryClauseNeeded before additional geometry-oriented follow-up.",
           "10) If repeated targeted evidence is still insufficient for PASS or FAIL, it is acceptable to stay UNCERTAIN for the active entity rather than forcing more unproductive navigation.",
-          "11) Choose one best next action only if the current evidence is insufficient.",
+          "11) followUp is only an advisory suggestion. Prefer reporting missingEvidence and evidenceRequirementsStatus clearly.",
         ]
       : [
           "WORKFLOW:",
           "1) Interpret the requirement: identify target elements, measurable constraints, units, thresholds, and applicability.",
-          "2) Use DYNAMIC_CHECKLIST only as the current task brief. It may already reflect prompt intent and grounded regulatory context, so focus on the active target if one is provided and reuse current top-view/storey-plan-cut setup for later entities on the same storey instead of re-requesting it.",
-          "3) Check whether the target is visible and measurable enough from the current evidence.",
-          "3a) For doors, a decisive measurement view is a centered TOP_VIEW with storey plan cut active and both clearance sides visible around the highlighted door. Use the readiness signal if present.",
+          "2) Use DYNAMIC_CHECKLIST only as the current task brief. Focus on the active target if one is provided.",
+          "3) Check whether the target is visible, focused, and measurable enough from the current evidence.",
           "4) If measurable, evaluate PASS or FAIL from visible evidence plus authoritative nav/context values.",
-          "5) If the target is already highlighted/centered and one more angle would resolve uncertainty, request ORBIT before finalizing.",
-          "6) If not measurable, return UNCERTAIN and choose one best follow-up action.",
+          "5) If not measurable, return UNCERTAIN and report missingEvidence plus evidenceRequirementsStatus.",
+          "6) followUp is optional and advisory. Prefer describing the evidence gap over prescribing a tool-specific sequence.",
           "7) If multiple targeted attempts have already failed to make the active entity measurable, remain UNCERTAIN rather than repeating low-value navigation.",
         ];
 
@@ -68,25 +67,34 @@ function buildPromptCore(args: {
     "- If the requirement is vague on thresholds, section number, or edition, prioritize WEB_FETCH before model navigation.",
     "- Prefer authoritative code repositories over summaries.",
     "",
-    "FOLLOW-UP ACTION REFERENCE:",
-    "- ISO_VIEW: use for overall 3D context.",
-    "- TOP_VIEW: use for plan-based checks such as clearances, layouts, and swings.",
-    "- NEW_VIEW: generic fallback for a different angle when the current view is inconclusive and no target-focused orbit is appropriate.",
-    "- ORBIT: use as a late-stage target-focused confirmation angle after the active target is highlighted/centered and zoom is sufficient or exhausted. Params: { yawDegrees?: number, pitchDegrees?: number, reason?: string }; each angle must be at most 90 degrees in magnitude; max 3 ORBIT calls per entity. Do not request orbit values that would put the camera below the target; the camera must remain at the target level or higher. If the current view is top-down, prefer a small iso-like shift such as { yawDegrees: 45, pitchDegrees: -30 } while keeping the same target and distance.",
-    "- Do not request TOP_VIEW immediately after the first ORBIT for an entity. After the first ORBIT, use another useful follow-up or a second ORBIT if needed; TOP_VIEW is allowed after that.",
-    "- ZOOM_IN: use to make the active target and its immediate context readable.",
-    "- ISOLATE_STOREY / ISOLATE_SPACE / ISOLATE_CATEGORY: use to narrow scope.",
-    "- HIGHLIGHT_IDS: preferred way to focus the active target.",
-    "- HIDE_CATEGORY / HIDE_IDS: use to remove occluders.",
-    "- SET_STOREY_PLAN_CUT / SET_PLAN_CUT: use when plan-based geometry is hidden or floor context is missing.",
-    "- RESTORE_VIEW: use to return to a previous captured viewpoint or saved navigation bookmark when you want to retry from a known good state.",
-    "- WEB_FETCH: use when regulatory clause text is missing.",
+    "FOLLOW-UP ADVISORY REFERENCE:",
+    "- Prefer top-level missingEvidence and evidenceRequirementsStatus as the main control output.",
+    "- followUp is optional and should be a weak suggestion only when one action clearly matches the missing evidence.",
+    "- Use WEB_FETCH only when regulatory clause text, definitions, or exceptions are missing.",
+    "- Use scope/focus suggestions such as ISOLATE_STOREY, ISOLATE_CATEGORY, HIGHLIGHT_IDS, or ZOOM_IN when the target is not visible or not focused.",
+    "- Use plan-oriented suggestions such as TOP_VIEW or SET_STOREY_PLAN_CUT only when a plan-based measurement state is still not ready.",
+    "- Use ORBIT or NEW_VIEW only when another context angle is needed after the target is already reasonably focused.",
     "",
     "JSON shape:",
     "{",
     '  "verdict": "PASS" | "FAIL" | "UNCERTAIN",',
     '  "confidence": number,',
     '  "rationale": string,',
+    '  "missingEvidence"?: string[],',
+    '  "evidenceRequirementsStatus"?: {',
+    '    "targetVisible"?: boolean,',
+    '    "targetFocused"?: boolean,',
+    '    "planMeasurementNeeded"?: boolean,',
+    '    "planMeasurementReady"?: boolean,',
+    '    "contextViewNeeded"?: boolean,',
+    '    "contextViewReady"?: boolean,',
+    '    "obstructionContextNeeded"?: boolean,',
+    '    "dimensionReferenceNeeded"?: boolean,',
+    '    "regulatoryClauseNeeded"?: boolean,',
+    '    "occlusionProblem"?: boolean,',
+    '    "lowNoveltyOrRepeatedView"?: boolean,',
+    '    "bothSidesOrSurroundingsNeeded"?: boolean',
+    "  },",
     '  "visibility": { "isRuleTargetVisible": boolean, "occlusionAssessment": "LOW"|"MEDIUM"|"HIGH", "missingEvidence"?: string[] },',
     '  "evidence": { "snapshotIds": string[], "mode": string, "note"?: string },',
     '  "followUp"?: { "request": "<ACTION_NAME>", "params"?: object }',
@@ -98,10 +106,10 @@ function buildPromptCore(args: {
     "- If evidenceViews.context.highlightAnnotations.sizeReference, hudContents, or a visible HUD provides highlighted-object class/id/dimensions/color legend, you may use those as explicit reference evidence from the snapshot.",
     "- If the readiness signal says the highlighted door is measurableLikely, do not ask for another near-duplicate zoom or angle unless a specific missing evidence item still requires it.",
     "- Apply the same anti-repeat rule to every entity class: once focused zoom potential is exhausted, prefer another action or finish the entity as inconclusive rather than repeating ZOOM_IN.",
-    "- Prefer one focused action over repeated broad navigation.",
-    "- For occluders like slabs or ceilings, prefer HIDE_CATEGORY rather than listing many ids.",
-    "- followUp should be exactly one request that most efficiently resolves the missing evidence.",
-    "- Follow-up hierarchy: resolve missing clause text with WEB_FETCH; prepare scope with ISOLATE_STOREY/SPACE/CATEGORY; make plan geometry readable with TOP_VIEW/SET_STOREY_PLAN_CUT/SET_PLAN_CUT; focus the active entity with HIGHLIGHT_IDS/ZOOM_IN; use HIDE_CATEGORY/HIDE_IDS for occluders; use ORBIT only near the end for a bounded multi-view confirmation of an already focused target; then finalize PASS/FAIL/UNCERTAIN.",
+    "- Prefer one focused evidence statement over repeated broad navigation language.",
+    "- For occluders like slabs or ceilings, describe the obstruction context gap explicitly before suggesting an occlusion-removal action.",
+    "- If you include followUp, it should be exactly one request that most efficiently resolves the missing evidence.",
+    "- Missing evidence and evidenceRequirementsStatus are more important than followUp.",
     "evidenceViews:",
     evidenceViewsJson,
     "",
@@ -123,38 +131,121 @@ function formatList(items: string[] | undefined): string[] {
   return Array.isArray(items) ? items.filter(Boolean).map((item) => `- ${item}`) : [];
 }
 
-function inferRuleSpecificSteps(rule: ComplianceRule): string[] {
+function collectRuleText(rule: ComplianceRule): string {
+  return `${rule.title} ${rule.description} ${rule.tags.join(" ")} ${rule.navigationHints.recommendedViews.join(" ")} ${rule.navigationHints.tips.join(" ")}`
+    .toLowerCase();
+}
+
+function buildEvidenceRequirementList(keys: EvidenceRequirementKey[]): string[] {
+  return Array.from(new Set(keys)).map((key) => `- ${key}`);
+}
+
+function inferEvidenceRequirements(rule: ComplianceRule): EvidenceRequirementKey[] {
+  const text = collectRuleText(rule);
+  const requirements = new Set<EvidenceRequirementKey>(["targetVisible", "targetFocused"]);
+
+  const mentionsPlan =
+    text.includes("top view") ||
+    text.includes("plan") ||
+    text.includes("clearance") ||
+    text.includes("layout") ||
+    text.includes("swing") ||
+    Boolean(rule.navigationHints.usePlanCut);
+  const mentionsContext =
+    text.includes("oblique") ||
+    text.includes("side") ||
+    text.includes("angle") ||
+    text.includes("surround") ||
+    text.includes("landing") ||
+    text.includes("approach");
+  const mentionsDimensions =
+    text.includes("dimension") ||
+    text.includes("measure") ||
+    text.includes("width") ||
+    text.includes("height") ||
+    text.includes("depth") ||
+    Boolean(rule.dimensionalRequirements?.length);
+  const mentionsOcclusion =
+    text.includes("occlusion") ||
+    text.includes("obstruction") ||
+    text.includes("hidden") ||
+    text.includes("clutter") ||
+    text.includes("surrounding elements");
+  const mentionsRegulatory =
+    text.includes("ada") ||
+    text.includes("icc") ||
+    text.includes("ibc") ||
+    text.includes("a117") ||
+    text.includes("clause") ||
+    text.includes("section") ||
+    text.includes("standard");
+  const mentionsBothSides =
+    text.includes("both sides") ||
+    text.includes("surroundings") ||
+    text.includes("clear floor space") ||
+    text.includes("maneuvering");
+
+  if (mentionsPlan) requirements.add("planMeasurementNeeded");
+  if (mentionsContext) requirements.add("contextViewNeeded");
+  if (mentionsDimensions) requirements.add("dimensionReferenceNeeded");
+  if (mentionsOcclusion) requirements.add("obstructionContextNeeded");
+  if (mentionsRegulatory) requirements.add("regulatoryClauseNeeded");
+  if (mentionsBothSides) requirements.add("bothSidesOrSurroundingsNeeded");
+
+  if (text.includes("door")) {
+    requirements.add("planMeasurementNeeded");
+    requirements.add("contextViewNeeded");
+    requirements.add("obstructionContextNeeded");
+    requirements.add("bothSidesOrSurroundingsNeeded");
+    requirements.add("dimensionReferenceNeeded");
+  }
+  if (text.includes("stair")) {
+    requirements.add("contextViewNeeded");
+    requirements.add("obstructionContextNeeded");
+    requirements.add("bothSidesOrSurroundingsNeeded");
+    requirements.add("dimensionReferenceNeeded");
+  }
+  if (text.includes("ramp")) {
+    requirements.add("planMeasurementNeeded");
+    requirements.add("contextViewNeeded");
+    requirements.add("bothSidesOrSurroundingsNeeded");
+    requirements.add("dimensionReferenceNeeded");
+  }
+  if (text.includes("headroom")) {
+    requirements.add("contextViewNeeded");
+    requirements.add("dimensionReferenceNeeded");
+  }
+
+  return Array.from(requirements);
+}
+
+function inferGeneralizedEvidencePriorities(rule: ComplianceRule): string[] {
   const text = `${rule.title} ${rule.description} ${rule.tags.join(" ")}`.toLowerCase();
 
   if (text.includes("door")) {
     return [
-      "Work storey-wise when multiple doors exist: prepare TOP view and a storey-aware plan cut once for the current storey, then complete one highlighted door before moving to the next door on that same storey.",
-      "Prefer TOP view plus storey plan cut for measurement. Highlight the active door and only then zoom if the door plus its surrounding maneuvering floor area are still not readable.",
-      "Judge clearance from a centered top snapshot in the storey plan cut first. Reuse that prepared same-storey top/plan-cut context for the next door instead of rebuilding it.",
-      "Use an oblique side or angled snapshot only after the plan view, mainly to confirm swing direction, hinge side, latch side, and possible local intrusions.",
-      "Do not bulk-judge all visible doors together. Decide the currently highlighted door first, then continue with the next door.",
+      "Need the active door to be clearly visible and focused as one target at a time.",
+      "Need a measurement-oriented floor-context view that makes both maneuvering sides around the door readable.",
+      "Need a confirmation view for swing direction, hinge/latch side, and local intrusions only if the measurement-oriented evidence is still ambiguous.",
+      "Need surrounding elements and possible obstructions around the door, not only the leaf itself.",
     ];
   }
 
   if (text.includes("stair")) {
     return [
-      "Treat stair accessibility as a transition check, not a single-object close-up: keep the stair plus the landing and approach area on the current storey visible before judging compliance.",
-      "Start with an isometric or side-oriented view to understand the full stair run and how it connects storeys, then use closer side/front views for risers, treads, landings, and handrails.",
-      "For accessibility-focused stair checks, inspect the current storey landing first, then inspect the connected landing/storey, instead of isolating only the stair body and losing approach context.",
-      "Use the most revealing angle for the active concern: side for riser/tread geometry, front or oblique for handrails, top/plan-cut for landing and approach area, and low/upward views for headroom conflicts.",
-      "Prefer a new angle or storey-aware plan cut before making a dimensional judgement from a partially occluded stair.",
+      "Need the stair run, landing, and immediate approach context together before judging accessibility.",
+      "Need evidence that supports the active concern: geometry, handrails, landings, or headroom.",
+      "Need an additional context view if the landing relationship or run continuity is still ambiguous.",
+      "Need obstruction context if surrounding geometry hides the decisive stair relationships.",
     ];
   }
 
   if (text.includes("ramp")) {
     return [
-      "Treat ramp accessibility as a run-plus-context check: include the ramp run, top landing, bottom landing, and immediate approach floor area before deciding slope or accessibility.",
-      "Work storey-wise when multiple ramps or ramp segments exist, but do not over-zoom into a single small patch of the ramp or isolate away the landing context needed for accessibility.",
-      "Prefer an isometric or side-oriented view first so the full ramp run, top/bottom transitions, and nearby occluders are visible together for slope reasoning.",
-      "Use top or shallow oblique views plus storey-aware plan cuts to verify width, landings, and clear floor space at the top and bottom of the ramp.",
-      "If the current storey view shows only one transition, inspect that landing first and then move to the connected storey/landing rather than forcing one tight snapshot to explain both ends.",
-      "If the ramp run is hidden by slabs, walls, or surrounding building elements, request a section-style or storey-aware plan cut before trying tighter zooms.",
-      "Use close zooms only for local details such as handrails, landing edges, or small obstructions after the full ramp geometry and both transitions are already understood.",
+      "Need the ramp run plus top and bottom landing context before deciding accessibility.",
+      "Need evidence for slope, width, and landing relationships without losing the surrounding approach zones.",
+      "Need obstruction context if slabs, walls, or nearby building elements hide the decisive ramp relationships.",
+      "Need a focused local view only after the overall run and transition context are already readable.",
     ];
   }
 
@@ -165,11 +256,9 @@ function inferRuleSpecificSteps(rule: ComplianceRule): string[] {
     text.includes("turning space")
   ) {
     return [
-      "Treat this as a plan-based space check: start with TOP view and prefer a storey-aware plan cut so the usable floor area is readable.",
-      "Keep the entire room, corridor segment, or maneuvering zone in frame before zooming into local obstructions.",
-      "Prioritize walls, columns, furniture, sanitary fixtures, and doors that intrude into the clear floor or turning area.",
-      "Use the narrowest pinch point or most obstructed turning zone as the decisive focus for PASS or FAIL.",
-      "If clearance edges are still ambiguous, prefer plan cut or targeted hiding of overhead clutter before requesting more oblique views.",
+      "Need a readable floor-area relationship for the entire room, corridor segment, or maneuvering zone.",
+      "Need surrounding obstructions such as walls, columns, furniture, sanitary fixtures, or doors to be visible together with the usable clear space.",
+      "Need the narrowest pinch point or most obstructed turning zone to be readable enough for the decisive judgement.",
     ];
   }
 
@@ -181,11 +270,9 @@ function inferRuleSpecificSteps(rule: ComplianceRule): string[] {
     text.includes("toilet")
   ) {
     return [
-      "Treat the checked object and its surrounding approach area as one unit: keep the object plus front/side clearance zone visible together.",
-      "Prefer TOP view with a storey-aware plan cut first so front, side, and rear approach spaces can be compared clearly.",
-      "Highlight the target object before zooming so the VLM reasons about one accessible-area condition at a time.",
-      "Check whether walls, adjacent fixtures, furniture, or other equipment intrude into the required approach space.",
-      "Use oblique or front views only as confirmation after the plan-based clearance relationship is already visible.",
+      "Need the checked object and its surrounding approach area as one combined evidence unit.",
+      "Need front, side, or rear approach spaces to be readable enough to compare them reliably.",
+      "Need surrounding fixtures or equipment that intrude into the required accessible area to stay visible in context.",
     ];
   }
 
@@ -196,21 +283,17 @@ function inferRuleSpecificSteps(rule: ComplianceRule): string[] {
     text.includes("viewpoint")
   ) {
     return [
-      "Treat this as a viewpoint-and-occlusion check rather than a dimensional measurement task.",
-      "Start from ISO or a user-relevant viewing direction and keep both the target component and possible occluders visible together.",
-      "Prefer NEW_VIEW, ISO_VIEW, HIDE_CATEGORY, or HIDE_IDS when the target is hidden behind walls, slabs, or other large geometry.",
-      "Only isolate narrowly if it helps confirm whether the original scene visibility failure is caused by occlusion versus absence.",
-      "Base PASS or FAIL on whether the target is meaningfully inspectable from the current viewpoint, not just barely present in frame.",
+      "Need the target component and possible occluders visible together enough to judge actual inspectability.",
+      "Need to distinguish true absence from occlusion-driven non-visibility.",
+      "Need viewpoint/context evidence more than dimensional measurement evidence.",
     ];
   }
 
   if (text.includes("headroom")) {
     return [
-      "Treat headroom as a vertical clearance check: use SIDE, FRONT, or ISO views that show the circulation path and the overhead obstruction together.",
-      "Keep the walking path, stair, or ramp in frame with beams, ducts, soffits, or sloped ceilings that may reduce vertical clearance.",
-      "Prefer elevation-like views before plan views because plan alone usually cannot show the decisive overhead relationship.",
-      "Use targeted hiding of slabs or MEP clutter only when they prevent reading the true clearance envelope.",
-      "Judge FAIL when an overhead element clearly intrudes into the required accessible route height, and stay UNCERTAIN when the vertical distance cannot be grounded visually.",
+      "Need the circulation path and the overhead obstruction visible together as a vertical relationship.",
+      "Need the true clearance envelope rather than only a plan relationship.",
+      "Need obstruction context if slabs, ducts, beams, or clutter hide the decisive vertical distance.",
     ];
   }
 
@@ -222,6 +305,7 @@ function inferRuleSpecificSteps(rule: ComplianceRule): string[] {
 }
 
 export function buildPromptFromRule(rule: ComplianceRule): string {
+  const evidenceRequirements = inferEvidenceRequirements(rule);
   return [
     `COMPLIANCE RULE: ${rule.title}`,
     ``,
@@ -238,7 +322,8 @@ export function buildPromptFromRule(rule: ComplianceRule): string {
     ``,
     `RULE INTENT:`,
     `- Assess only the active target(s) relevant to this rule.`,
-    `- Use the rule-specific evidence cues and dimensional references below before asking for a new action.`,
+    `- Use the rule-specific evidence cues and dimensional references below before suggesting any follow-up.`,
+    `- Separate what evidence is needed from which navigation action might obtain it.`,
     ``,
     `WHAT TO LOOK FOR:`,
     ...formatList(rule.visualEvidence.lookFor),
@@ -257,19 +342,22 @@ export function buildPromptFromRule(rule: ComplianceRule): string {
     `FAIL if: ${rule.evaluationCriteria.fail.join("; ")}`,
     `UNCERTAIN if: ${rule.evaluationCriteria.uncertain.join("; ")}`,
     ``,
-    `RULE-SPECIFIC INSPECTION STEPS:`,
-    ...formatList(inferRuleSpecificSteps(rule)),
+    `GENERALIZED EVIDENCE REQUIREMENTS:`,
+    ...buildEvidenceRequirementList(evidenceRequirements),
     ``,
-    `NAVIGATION HINTS:`,
-    `Recommended views: ${rule.navigationHints.recommendedViews.join(", ")}`,
-    `Zoom level: ${rule.navigationHints.zoomLevel ?? "medium"}`,
+    `RULE-SPECIFIC EVIDENCE PRIORITIES:`,
+    ...formatList(inferGeneralizedEvidencePriorities(rule)),
+    ``,
+    `LEGACY NAVIGATION HINTS (semantic cues only; runtime decides actions):`,
+    `Recommended evidence orientations: ${rule.navigationHints.recommendedViews.join(", ")}`,
+    `Suggested focus scale: ${rule.navigationHints.zoomLevel ?? "medium"}`,
     ...(rule.navigationHints.isolateCategories?.length
-      ? [`Prefer isolated categories: ${rule.navigationHints.isolateCategories.join(", ")}`]
+      ? [`Relevant categories for focus or de-cluttering: ${rule.navigationHints.isolateCategories.join(", ")}`]
       : []),
     ...(rule.navigationHints.usePlanCut
-      ? [`Plan cut: recommended${rule.navigationHints.planCutHeight ? ` at ${rule.navigationHints.planCutHeight}` : ""}`]
-      : [`Plan cut: only if needed`]),
-    ...formatList(rule.navigationHints.tips),
+      ? [`Plan-based evidence may be required${rule.navigationHints.planCutHeight ? ` near ${rule.navigationHints.planCutHeight}` : ""}`]
+      : [`Plan-based evidence: only if needed`]),
+    ...formatList(rule.navigationHints.tips?.map((tip) => `Evidence cue: ${tip}`)),
     ...(rule.dimensionalRequirements?.length
       ? [
           ``,

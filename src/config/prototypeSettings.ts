@@ -55,6 +55,7 @@ export type PrototypeRuntimeSettings = {
   maxSnapshotsPerRequest: number;
   reducedTavilyMaxChars: number;
   orbitMaxHighlightOcclusionRatio: number;
+  snapshotNoveltyRedundancyThreshold: number;
 };
 
 export const DEFAULT_PROTOTYPE_RUNTIME_SETTINGS: PrototypeRuntimeSettings = {
@@ -64,6 +65,7 @@ export const DEFAULT_PROTOTYPE_RUNTIME_SETTINGS: PrototypeRuntimeSettings = {
   maxSnapshotsPerRequest: DEFAULT_MAX_SNAPSHOTS_PER_REQUEST,
   reducedTavilyMaxChars: DEFAULT_REDUCED_TAVILY_MAX_CHARS,
   orbitMaxHighlightOcclusionRatio: 0.2,
+  snapshotNoveltyRedundancyThreshold: 0.2,
 };
 
 const PROTOTYPE_RUNTIME_SETTING_RANGES = {
@@ -73,6 +75,7 @@ const PROTOTYPE_RUNTIME_SETTING_RANGES = {
   maxSnapshotsPerRequest: { min: 1, max: 10 },
   reducedTavilyMaxChars: { min: 500, max: 10000 },
   orbitMaxHighlightOcclusionRatio: { min: 0, max: 1 },
+  snapshotNoveltyRedundancyThreshold: { min: 0, max: 1 },
 } as const;
 
 let runtimeSettings: PrototypeRuntimeSettings = { ...DEFAULT_PROTOTYPE_RUNTIME_SETTINGS };
@@ -85,7 +88,9 @@ function clampSetting<K extends keyof PrototypeRuntimeSettings>(
   const numericValue = typeof value === "number" && Number.isFinite(value) ? value : DEFAULT_PROTOTYPE_RUNTIME_SETTINGS[key];
   const clamped = Math.max(range.min, Math.min(range.max, numericValue));
   return (
-    key === "entityUncertainTerminationConfidence" || key === "orbitMaxHighlightOcclusionRatio"
+    key === "entityUncertainTerminationConfidence" ||
+    key === "orbitMaxHighlightOcclusionRatio" ||
+    key === "snapshotNoveltyRedundancyThreshold"
       ? clamped
       : Math.round(clamped)
   ) as PrototypeRuntimeSettings[K];
@@ -177,6 +182,48 @@ export const MAX_ORBIT_DEGREES_PER_AXIS = 90;
  */
 export const ORBIT_MAX_HIGHLIGHT_OCCLUSION_RATIO =
   DEFAULT_PROTOTYPE_RUNTIME_SETTINGS.orbitMaxHighlightOcclusionRatio;
+
+/**
+ * Conservative per-entity budgets for semantic anti-cycle follow-up families.
+ * These are intentionally static prototype constants so the semantic
+ * stagnation logic stays easy to audit and reverse.
+ */
+export const SEMANTIC_FOLLOW_UP_FAMILY_BUDGETS = {
+  plan_measurement: 2,
+  context_angle: 2,
+  focus: 2,
+  scope: 1,
+  occlusion_or_context_cleanup: 1,
+  regulatory_grounding: 1,
+  property_measurement: 1,
+} as const;
+
+/**
+ * History-aware recurrence control for same-entity view states.
+ * Geometric decay keeps recent recurrences dominant while allowing older
+ * same-entity states to matter less over time.
+ */
+export const SAME_ENTITY_RECURRENCE_DECAY = 0.75;
+
+/**
+ * Threshold above which the current same-entity snapshot is treated as a
+ * recurrence of an older semantically unproductive view state.
+ */
+export const SAME_ENTITY_RECURRENCE_WARNING_THRESHOLD = 0.65;
+
+/**
+ * Weighted similarity model used by the same-entity recurrence score.
+ * The weights sum to 1.0 and emphasize preset/camera/plan-cut similarity.
+ */
+export const SAME_ENTITY_RECURRENCE_WEIGHTS = {
+  viewPreset: 0.22,
+  camera: 0.28,
+  planCut: 0.18,
+  scope: 0.12,
+  highlight: 0.08,
+  projectedArea: 0.07,
+  occlusion: 0.05,
+} as const;
 
 /**
  * Less aggressive framing profile for elongated elements like ramps.

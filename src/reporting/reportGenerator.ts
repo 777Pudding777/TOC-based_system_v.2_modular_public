@@ -6,7 +6,14 @@
  * @module reportGenerator
  */
 
-import type { ConversationTrace, InspectionMetrics, JudgeTaskVerdict, VlmResponseTrace } from "../types/trace.types";
+import type {
+  ConversationTrace,
+  InspectionMetrics,
+  JudgeTaskVerdict,
+  NavigationAction,
+  SnapshotNoveltyMetrics,
+  VlmResponseTrace,
+} from "../types/trace.types";
 import {
   DEFAULT_MAX_COMPLIANCE_STEPS,
   DEFAULT_MAX_SNAPSHOTS_PER_REQUEST,
@@ -26,6 +33,7 @@ import {
   ORBIT_MAX_HIGHLIGHT_OCCLUSION_RATIO,
   RAMP_NAVIGATION_DEFAULTS,
   REPEATED_FOLLOW_UPS_BEFORE_ESCALATION,
+  SEMANTIC_FOLLOW_UP_FAMILY_BUDGETS,
   TOP_VIEW_TARGET_AREA_RATIO,
   ZOOM_IN_EXHAUSTION_AREA_FACTOR,
 } from "../config/prototypeSettings";
@@ -72,6 +80,14 @@ function formatDuration(ms: number): string {
  */
 function formatConfidence(confidence: number): string {
   return `${(confidence * 100).toFixed(0)}%`;
+}
+
+function formatSnapshotNovelty(novelty: SnapshotNoveltyMetrics | undefined): string {
+  if (!novelty) return "";
+  const score = novelty.approximateNoveltyScore.toFixed(2);
+  const redundancy = novelty.redundancyWarning ? " | likely redundant" : "";
+  const basis = novelty.comparedToSnapshotId ? ` | vs ${novelty.comparedToSnapshotId}` : "";
+  return `Novelty ${score}${redundancy}${basis}`;
 }
 /**
  * Format token counts with thousands separators
@@ -656,6 +672,40 @@ function generateCss(): string {
       font-size: 12px;
     }
 
+    .step-suppressed-card {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      min-height: 220px;
+      padding: 18px;
+      border: 1px dashed #f59e0b;
+      border-radius: 8px;
+      background: linear-gradient(180deg, #fff7ed 0%, #ffffff 100%);
+      color: #9a3412;
+    }
+
+    .step-suppressed-label {
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: #c2410c;
+      margin-bottom: 6px;
+    }
+
+    .step-suppressed-title {
+      font-size: 16px;
+      font-weight: 700;
+      color: #7c2d12;
+      margin-bottom: 8px;
+    }
+
+    .step-suppressed-text {
+      font-size: 13px;
+      line-height: 1.5;
+      color: #9a3412;
+    }
+
     .step-snapshot-card figcaption {
       display: flex;
       flex-direction: column;
@@ -795,6 +845,267 @@ function generateCss(): string {
       color: #111827;
       max-height: 320px;
       overflow: auto;
+    }
+
+    .appendix-table-wrap {
+      width: 100%;
+      overflow-x: auto;
+    }
+
+    .appendix-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }
+
+    .appendix-table th,
+    .appendix-table td {
+      padding: 10px 12px;
+      border: 1px solid #e5e7eb;
+      vertical-align: top;
+      text-align: left;
+    }
+
+    .appendix-table th {
+      background: #f9fafb;
+      color: #1e3a8a;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .appendix-table td {
+      color: #374151;
+    }
+
+    .novelty-stack {
+      display: grid;
+      gap: 8px;
+      min-width: 280px;
+    }
+
+    .novelty-card {
+      background: #f8fafc;
+      border: 1px solid #dbeafe;
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+
+    .novelty-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      margin-bottom: 8px;
+    }
+
+    .novelty-card-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: #1e3a8a;
+    }
+
+    .novelty-card-score {
+      font-size: 12px;
+      font-weight: 800;
+      color: #111827;
+    }
+
+    .novelty-bar {
+      width: 100%;
+      height: 8px;
+      background: #e5e7eb;
+      border-radius: 999px;
+      overflow: hidden;
+      margin-bottom: 8px;
+    }
+
+    .novelty-bar-fill {
+      height: 100%;
+      border-radius: 999px;
+    }
+
+    .novelty-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+
+    .novelty-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      line-height: 1.2;
+      background: #e0f2fe;
+      color: #075985;
+    }
+
+    .novelty-badge.warn {
+      background: #fef3c7;
+      color: #92400e;
+    }
+
+    .novelty-badge.alert {
+      background: #fee2e2;
+      color: #b91c1c;
+    }
+
+    .nav-log-list {
+      display: grid;
+      gap: 14px;
+    }
+
+    .nav-log-card {
+      background: #fff;
+      border: 1px solid #e5e7eb;
+      border-radius: 14px;
+      padding: 16px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+    }
+
+    .nav-log-card-header {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+
+    .nav-log-step {
+      font-size: 13px;
+      font-weight: 800;
+      color: #1e3a8a;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      margin-bottom: 4px;
+    }
+
+    .nav-log-entity {
+      font-size: 15px;
+      font-weight: 700;
+      color: #111827;
+    }
+
+    .nav-log-storey {
+      font-size: 13px;
+      color: #6b7280;
+    }
+
+    .nav-log-result {
+      display: inline-flex;
+      align-items: center;
+      padding: 5px 10px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+    }
+
+    .nav-log-result.success {
+      background: #dcfce7;
+      color: #166534;
+    }
+
+    .nav-log-result.no-op {
+      background: #fef3c7;
+      color: #92400e;
+    }
+
+    .nav-log-result.suppressed {
+      background: #fee2e2;
+      color: #b91c1c;
+    }
+
+    .nav-log-summary {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+
+    .nav-log-chip {
+      display: inline-flex;
+      align-items: center;
+      padding: 5px 10px;
+      border-radius: 999px;
+      background: #eff6ff;
+      color: #1d4ed8;
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .nav-log-grid {
+      display: grid;
+      grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    .nav-log-text {
+      font-size: 13px;
+      line-height: 1.6;
+      color: #374151;
+    }
+
+    .nav-log-meta {
+      display: grid;
+      gap: 8px;
+      margin-top: 10px;
+    }
+
+    .nav-log-details {
+      margin-top: 14px;
+      border-top: 1px solid #e5e7eb;
+      padding-top: 12px;
+    }
+
+    .nav-log-details summary {
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 700;
+      color: #1e3a8a;
+      list-style: none;
+    }
+
+    .nav-log-details summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .nav-log-details-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+
+    .nav-log-detail-card {
+      background: #f8fafc;
+      border: 1px solid #e5e7eb;
+      border-radius: 10px;
+      padding: 12px;
+      font-size: 12px;
+      line-height: 1.5;
+      color: #374151;
+      overflow-wrap: anywhere;
+    }
+
+    .nav-log-detail-title {
+      display: block;
+      font-size: 12px;
+      font-weight: 800;
+      color: #1e3a8a;
+      margin-bottom: 6px;
+    }
+
+    @media (max-width: 980px) {
+      .nav-log-grid {
+        grid-template-columns: 1fr;
+      }
     }
 
     @media print {
@@ -1284,6 +1595,7 @@ function renderSnapshotsGrid(trace: ConversationTrace, embedImages: boolean): st
         <div class="info">
           <div class="reason">${escapeHtml(s.reason)}</div>
           <div class="time">${new Date(s.timestamp).toLocaleString()}</div>
+          ${s.novelty ? `<div class="time">${escapeHtml(formatSnapshotNovelty(s.novelty))}</div>` : ""}
         </div>
       </div>
     `
@@ -1342,6 +1654,7 @@ function renderEntitySnapshots(
             <div class="info">
               <div class="reason">${escapeHtml(snapshot.reason)}</div>
               <div class="time">${escapeHtml(snapshot.snapshotId)} | ${new Date(snapshot.timestamp).toLocaleString()}</div>
+              ${snapshot.novelty ? `<div class="time">${escapeHtml(formatSnapshotNovelty(snapshot.novelty))}</div>` : ""}
             </div>
           </div>
         `
@@ -1525,12 +1838,27 @@ function buildEntityTraceGroups(trace: ConversationTrace): EntityTraceGroup[] {
   return Array.from(groupsByKey.values());
 }
 
+function renderSuppressedFollowUpPlaceholder(action: NavigationAction): string {
+  const suppressed = action.suppressedFollowUp;
+  if (!suppressed) return "";
+  const title = `Suppressed "${suppressed.request}"`;
+  const reason = suppressed.reason || action.finalizationReason || action.evaluationSummary || "The runtime blocked this follow-up before execution.";
+  return `
+    <div class="step-suppressed-card">
+      <div class="step-suppressed-label">No New Snapshot</div>
+      <div class="step-suppressed-title">${escapeHtml(title)}</div>
+      <div class="step-suppressed-text">${escapeHtml(reason)}</div>
+    </div>
+  `;
+}
+
 function renderTraceStepItem(
   trace: ConversationTrace,
   response: VlmResponseTrace,
   snapshotsById: Map<string, ConversationTrace["snapshots"][number]>,
   promptByStep: Map<number, ConversationTrace["prompts"][number]>,
-  snapshotIdByStep: Map<number, string>
+  snapshotIdByStep: Map<number, string>,
+  navigationActionsByStep: Map<number, NavigationAction[]>
 ): string {
   const prompt = promptByStep.get(response.step);
   const promptSnapshotIds = prompt?.snapshotIds ?? [];
@@ -1542,8 +1870,20 @@ function renderTraceStepItem(
   const primarySnapshot = primarySnapshotId ? snapshotsById.get(primarySnapshotId) : undefined;
   const additionalSnapshotIds = promptSnapshotIds.filter((snapshotId) => snapshotId !== primarySnapshotId);
   const additionalSnapshotCount = additionalSnapshotIds.length;
+  const stepActions = navigationActionsByStep.get(response.step) ?? [];
+  const suppressedActions = stepActions.filter((action) => action.suppressedFollowUp);
+  const uniqueSuppressedActions = suppressedActions.filter((action, index) => {
+    const key = `${action.suppressedFollowUp?.request ?? ""}|${action.suppressedFollowUp?.reason ?? ""}`;
+    return suppressedActions.findIndex(
+      (candidate) =>
+        `${candidate.suppressedFollowUp?.request ?? ""}|${candidate.suppressedFollowUp?.reason ?? ""}` === key
+    ) === index;
+  });
+  const suppressedPlaceholders = uniqueSuppressedActions
+    .map((action) => renderSuppressedFollowUpPlaceholder(action))
+    .join("");
 
-  const snapshotsHtml = primarySnapshot
+  const snapshotsHtml = primarySnapshot || suppressedPlaceholders
     ? `
     <div class="step-snapshots">
       <div class="step-snapshots-title">Visual evidence</div>
@@ -1551,6 +1891,8 @@ function renderTraceStepItem(
         ? `<div class="step-snapshots-note">This VLM decision also cited ${additionalSnapshotCount} additional snapshot${additionalSnapshotCount === 1 ? "" : "s"}: ${additionalSnapshotIds.map(escapeHtml).join(", ")}.</div>`
         : ""}
       <div class="step-snapshots-grid">
+        ${primarySnapshot
+          ? `
         <figure class="step-snapshot-card">
           ${primarySnapshot.imageBase64
             ? `<img src="data:image/png;base64,${primarySnapshot.imageBase64}" alt="Snapshot ${primarySnapshot.snapshotId}" />`
@@ -1558,12 +1900,23 @@ function renderTraceStepItem(
           <figcaption>
             <span class="snapshot-id">${escapeHtml(primarySnapshot.snapshotId)}</span>
             <span>${escapeHtml(primarySnapshot.reason)}</span>
+            ${primarySnapshot.novelty ? `<span>${escapeHtml(formatSnapshotNovelty(primarySnapshot.novelty))}</span>` : ""}
           </figcaption>
         </figure>
+        `
+          : ""}
+        ${suppressedPlaceholders}
       </div>
     </div>
   `
     : "";
+
+  const semanticProgress = primarySnapshot?.semanticEvidenceProgress;
+  const semanticNote = semanticProgress?.finalizationReason
+    ? `<div class="meta" style="margin-top:8px;">Stopped because repeated views did not reduce missing evidence gaps.</div>`
+    : semanticProgress?.semanticStagnationWarning
+      ? `<div class="meta" style="margin-top:8px;">Semantic stagnation warning: unresolved evidence gaps stayed materially unchanged.</div>`
+      : "";
 
   const promptHtml = prompt?.promptText
     ? `
@@ -1607,6 +1960,7 @@ function renderTraceStepItem(
       <div class="step-content">
         <div class="rationale">${escapeHtml(response.decision.rationale)}</div>
         ${snapshotsHtml}
+        ${semanticNote}
         ${promptHtml}
         <div class="meta">
           Response time: ${formatDuration(response.responseTimeMs)} |
@@ -1634,6 +1988,12 @@ function generateTraceSection(trace: ConversationTrace): string {
 
   const snapshotsById = new Map(trace.snapshots.map((snapshot) => [snapshot.snapshotId, snapshot]));
   const promptByStep = new Map(trace.prompts.map((prompt) => [prompt.step, prompt]));
+  const navigationActionsByStep = new Map<number, NavigationAction[]>();
+  for (const action of trace.navigationActions ?? []) {
+    const bucket = navigationActionsByStep.get(action.step) ?? [];
+    bucket.push(action);
+    navigationActionsByStep.set(action.step, bucket);
+  }
   const snapshotIdByStep = new Map(
     trace.sceneStates
       .filter((state) => state.step != null && Boolean(state.snapshotId))
@@ -1643,7 +2003,16 @@ function generateTraceSection(trace: ConversationTrace): string {
   return buildEntityTraceGroups(trace)
     .map((group, index) => {
       const stepsHtml = group.responses
-        .map((response) => renderTraceStepItem(trace, response, snapshotsById, promptByStep, snapshotIdByStep))
+        .map((response) =>
+          renderTraceStepItem(
+            trace,
+            response,
+            snapshotsById,
+            promptByStep,
+            snapshotIdByStep,
+            navigationActionsByStep
+          )
+        )
         .join("");
       const title = group.entityId
         ? `Entity ${escapeHtml(group.entityId)} - Step-by-Step Trace`
@@ -1743,6 +2112,226 @@ function generateWebEvidenceAppendix(trace: ConversationTrace): string {
     `);
 }
 
+function formatShortCameraPose(actionState: NavigationAction["beforeState"] | NavigationAction["afterState"] | undefined): string {
+  const pose = actionState?.cameraPose;
+  if (!pose) return "N/A";
+  const eye = `${pose.eye.x.toFixed(2)}, ${pose.eye.y.toFixed(2)}, ${pose.eye.z.toFixed(2)}`;
+  const target = `${pose.target.x.toFixed(2)}, ${pose.target.y.toFixed(2)}, ${pose.target.z.toFixed(2)}`;
+  return `eye(${eye}) -> target(${target})`;
+}
+
+function formatShortPlanCut(actionState: NavigationAction["beforeState"] | NavigationAction["afterState"] | undefined): string {
+  const planCut = actionState?.planCut;
+  if (!planCut?.enabled) return "off";
+  const bits = [
+    planCut.storeyId ? `storey ${planCut.storeyId}` : null,
+    typeof planCut.absoluteHeight === "number" ? `abs ${planCut.absoluteHeight.toFixed(2)}` : null,
+    typeof planCut.height === "number" ? `rel ${planCut.height.toFixed(2)}` : null,
+    planCut.mode ?? null,
+  ].filter(Boolean);
+  return bits.length ? bits.join(" | ") : "on";
+}
+
+function formatNavigationMetrics(action: NavigationAction): string {
+  const metrics = action.navigationMetrics;
+  if (!metrics) return "N/A";
+  const parts = [
+    typeof metrics.targetAreaRatio === "number" ? `area ${metrics.targetAreaRatio.toFixed(3)}` : null,
+    typeof metrics.occlusionRatio === "number" ? `occ ${metrics.occlusionRatio.toFixed(3)}` : null,
+    metrics.zoomExhausted ? "zoom exhausted" : null,
+  ].filter(Boolean);
+  return parts.length ? parts.join(" | ") : "Recorded";
+}
+
+function getScoreFillColor(score: number, mode: "novelty" | "progress" | "recurrence"): string {
+  if (mode === "recurrence") {
+    if (score >= 0.65) return "#f59e0b";
+    if (score >= 0.4) return "#fbbf24";
+    return "#94a3b8";
+  }
+  if (score >= 0.7) return "#22c55e";
+  if (score >= 0.35) return "#3b82f6";
+  return "#94a3b8";
+}
+
+function renderNoveltyBadges(action: NavigationAction): string {
+  const novelty = action.snapshotNoveltyBeforeAction;
+  const semantic = action.semanticEvidenceProgress;
+  const badges: string[] = [];
+
+  if (novelty?.redundancyWarning) {
+    badges.push(`<span class="novelty-badge warn">visual redundant</span>`);
+  }
+  if (semantic?.semanticStagnationWarning) {
+    badges.push(`<span class="novelty-badge alert">semantic stagnation</span>`);
+  }
+  if (semantic?.sameEntityRecurrenceWarning) {
+    badges.push(`<span class="novelty-badge warn">same-entity recurrence</span>`);
+  }
+  if (action.suppressedFollowUp) {
+    badges.push(`<span class="novelty-badge alert">suppressed ${escapeHtml(action.suppressedFollowUp.request)}</span>`);
+  }
+
+  return badges.length ? `<div class="novelty-meta">${badges.join("")}</div>` : "";
+}
+
+function renderNavigationNoveltyScores(action: NavigationAction): string {
+  const novelty = action.snapshotNoveltyBeforeAction;
+  const semantic = action.semanticEvidenceProgress;
+  const visualScore = novelty?.approximateNoveltyScore;
+  const semanticScore = semantic?.semanticProgressScore;
+  const recurrenceScore = semantic?.sameEntityRecurrenceScore;
+
+  const cards = [
+    typeof visualScore === "number"
+      ? `
+        <div class="novelty-card">
+          <div class="novelty-card-header">
+            <span class="novelty-card-title">Visual Novelty</span>
+            <span class="novelty-card-score">${visualScore.toFixed(2)}</span>
+          </div>
+          <div class="novelty-bar"><div class="novelty-bar-fill" style="width:${(visualScore * 100).toFixed(0)}%;background:${getScoreFillColor(visualScore, "novelty")};"></div></div>
+          <div class="novelty-meta">
+            ${novelty?.comparedToSnapshotId ? `<span class="novelty-badge">vs ${escapeHtml(novelty.comparedToSnapshotId)}</span>` : ""}
+            ${novelty?.sameEntityAsPrevious ? `<span class="novelty-badge">same entity</span>` : `<span class="novelty-badge">cross-step baseline</span>`}
+            ${novelty?.redundancyWarning ? `<span class="novelty-badge warn">redundancy warning</span>` : ""}
+          </div>
+        </div>
+      `
+      : "",
+    typeof semanticScore === "number"
+      ? `
+        <div class="novelty-card">
+          <div class="novelty-card-header">
+            <span class="novelty-card-title">Semantic Progress</span>
+            <span class="novelty-card-score">${semanticScore.toFixed(2)}</span>
+          </div>
+          <div class="novelty-bar"><div class="novelty-bar-fill" style="width:${(semanticScore * 100).toFixed(0)}%;background:${getScoreFillColor(semanticScore, "progress")};"></div></div>
+          <div class="novelty-meta">
+            <span class="novelty-badge">resolved ${semantic?.resolvedGapCount ?? 0}</span>
+            <span class="novelty-badge">unchanged ${semantic?.unchangedGapCount ?? 0}</span>
+            <span class="novelty-badge">new ${semantic?.newGapCount ?? 0}</span>
+            ${semantic?.semanticStagnationWarning ? `<span class="novelty-badge alert">stagnation</span>` : ""}
+          </div>
+        </div>
+      `
+      : "",
+    typeof recurrenceScore === "number"
+      ? `
+        <div class="novelty-card">
+          <div class="novelty-card-header">
+            <span class="novelty-card-title">Same-Entity Recurrence</span>
+            <span class="novelty-card-score">${recurrenceScore.toFixed(2)}</span>
+          </div>
+          <div class="novelty-bar"><div class="novelty-bar-fill" style="width:${(recurrenceScore * 100).toFixed(0)}%;background:${getScoreFillColor(recurrenceScore, "recurrence")};"></div></div>
+          <div class="novelty-meta">
+            ${semantic?.sameEntityRecurrenceComparedSnapshotId ? `<span class="novelty-badge">vs ${escapeHtml(semantic.sameEntityRecurrenceComparedSnapshotId)}</span>` : ""}
+            ${typeof semantic?.sameEntityRecurrenceStepDelta === "number" ? `<span class="novelty-badge">Δstep ${semantic.sameEntityRecurrenceStepDelta}</span>` : ""}
+            ${typeof semantic?.sameEntityRecurrenceDecayWeight === "number" ? `<span class="novelty-badge">decay ${semantic.sameEntityRecurrenceDecayWeight.toFixed(2)}</span>` : ""}
+            ${typeof semantic?.sameEntityRecurrenceViewSimilarity === "number" ? `<span class="novelty-badge">view sim ${semantic.sameEntityRecurrenceViewSimilarity.toFixed(2)}</span>` : ""}
+            ${typeof semantic?.sameEntityRecurrenceFailureWeight === "number" ? `<span class="novelty-badge">failure ${semantic.sameEntityRecurrenceFailureWeight.toFixed(2)}</span>` : ""}
+            ${semantic?.sameEntityRecurrenceWarning ? `<span class="novelty-badge warn">warning</span>` : ""}
+          </div>
+        </div>
+      `
+      : "",
+  ].filter(Boolean);
+
+  if (!cards.length) return "N/A";
+  return `<div class="novelty-stack">${cards.join("")}${renderNoveltyBadges(action)}</div>`;
+}
+
+function getNavigationResultClass(action: NavigationAction): "success" | "no-op" | "suppressed" {
+  if (action.suppressedFollowUp) return "suppressed";
+  return action.success ? "success" : "no-op";
+}
+
+function getNavigationResultLabel(action: NavigationAction): string {
+  if (action.suppressedFollowUp) return "suppressed";
+  return action.success ? "success" : "no-op";
+}
+
+function renderNavigationActionDetails(action: NavigationAction): string {
+  return `
+    <details class="nav-log-details">
+      <summary>Technical View State</summary>
+      <div class="nav-log-details-grid">
+        <div class="nav-log-detail-card">
+          <span class="nav-log-detail-title">Camera Before / After</span>
+          ${escapeHtml(formatShortCameraPose(action.beforeState))}<br>
+          ${escapeHtml(formatShortCameraPose(action.afterState))}
+        </div>
+        <div class="nav-log-detail-card">
+          <span class="nav-log-detail-title">Highlights Before / After</span>
+          ${escapeHtml((action.beforeState?.highlightedIds ?? []).join(", ") || "none")}<br>
+          ${escapeHtml((action.afterState?.highlightedIds ?? []).join(", ") || "none")}
+        </div>
+        <div class="nav-log-detail-card">
+          <span class="nav-log-detail-title">Plan Cut Before / After</span>
+          ${escapeHtml(formatShortPlanCut(action.beforeState))}<br>
+          ${escapeHtml(formatShortPlanCut(action.afterState))}
+        </div>
+      </div>
+    </details>
+  `;
+}
+
+function generateNavigationAppendix(trace: ConversationTrace): string {
+  const actions = trace.navigationActions ?? [];
+  if (!actions.length) {
+    return renderAppendixSubsection(
+      "Navigation Action Evaluation Log",
+      `<p style="color: #6b7280;">No deterministic navigation follow-up evaluations were recorded for this run.</p>`
+    );
+  }
+
+  const cards = actions
+    .map(
+      (action) => `
+        <div class="nav-log-card">
+          <div class="nav-log-card-header">
+            <div>
+              <div class="nav-log-step">Step ${action.step}</div>
+              <div class="nav-log-entity">${escapeHtml(action.activeEntityId ?? "No active entity")}</div>
+              <div class="nav-log-storey">${escapeHtml(action.activeStoreyId ?? "No scoped storey")}</div>
+            </div>
+            <span class="nav-log-result ${getNavigationResultClass(action)}">${escapeHtml(getNavigationResultLabel(action))}</span>
+          </div>
+          <div class="nav-log-summary">
+            <span class="nav-log-chip">Requested ${escapeHtml(action.requestedAction ?? action.action)}</span>
+            <span class="nav-log-chip">Executed ${escapeHtml(action.action)}</span>
+            <span class="nav-log-chip">${escapeHtml(formatNavigationMetrics(action))}</span>
+            ${action.actionFamily ? `<span class="nav-log-chip">family ${escapeHtml(action.actionFamily)}</span>` : ""}
+            ${action.suppressedFollowUp ? `<span class="nav-log-chip">suppressed ${escapeHtml(action.suppressedFollowUp.request)}</span>` : ""}
+          </div>
+          <div class="nav-log-grid">
+            <div>${renderNavigationNoveltyScores(action)}</div>
+            <div class="nav-log-text">
+              ${escapeHtml(action.evaluationSummary ?? action.reason ?? "N/A")}
+              <div class="nav-log-meta">
+                ${action.decisionSource ? `<div><strong>Decision source:</strong> ${escapeHtml(action.decisionSource)}</div>` : ""}
+                ${action.decisionReason ? `<div><strong>Decision reason:</strong> ${escapeHtml(action.decisionReason)}</div>` : ""}
+                ${action.noOpReason && !action.suppressedFollowUp ? `<div><strong>No-op reason:</strong> ${escapeHtml(action.noOpReason)}</div>` : ""}
+              </div>
+            </div>
+          </div>
+          ${renderNavigationActionDetails(action)}
+        </div>
+      `
+    )
+    .join("");
+
+  return renderAppendixSubsection(
+    "Navigation Action Evaluation Log",
+    `
+      <p style="color: #4b5563; margin-bottom: 16px;">
+        Deterministic, paper-inspired navigation evaluations recorded after each executed VLM follow-up action, including local visual novelty, semantic evidence progress, and same-entity recurrence risk.
+      </p>
+      <div class="nav-log-list">${cards}</div>
+    `
+  );
+}
+
 function formatSettingValue(value: unknown): string {
   if (value == null) return "N/A";
   if (typeof value === "number" || typeof value === "boolean" || typeof value === "string") return String(value);
@@ -1795,6 +2384,7 @@ function generatePrototypeSettingsAppendix(): string {
         MAX_ORBIT_FOLLOW_UPS_PER_ENTITY,
         MAX_ORBIT_DEGREES_PER_AXIS,
         ORBIT_MAX_HIGHLIGHT_OCCLUSION_RATIO,
+        SEMANTIC_FOLLOW_UP_FAMILY_BUDGETS,
       })}
     </div>
     <div class="appendix-item">
@@ -1814,6 +2404,7 @@ function generateAppendixSection(trace: ConversationTrace, embedImages: boolean)
     <div class="section" id="appendix">
       <h2> Appendix</h2>
       ${renderAppendixSubsection("All Snapshots", renderSnapshotsGrid(trace, embedImages))}
+      ${generateNavigationAppendix(trace)}
       ${generateJudgeAppendixSection(trace)}
       ${generateWebEvidenceAppendix(trace)}
       ${generatePrototypeSettingsAppendix()}

@@ -362,7 +362,8 @@ function getActiveGroupAny(): any | null {
       highlightPlanCutAdjustmentInFlight ||
       !planCutState.enabled ||
       planCutState.mode !== "WORLD_UP" ||
-      !activeHighlightState?.entries.length
+      !activeHighlightState?.entries.length ||
+      planCutState.storeyId
     ) {
       return false;
     }
@@ -377,8 +378,8 @@ function getActiveGroupAny(): any | null {
     if (!hasBox || union.isEmpty()) return false;
 
     const upAxis = getUpAxis();
-    const minH = upAxis === "y" ? union.min.y : union.min.z;
     const maxH = upAxis === "y" ? union.max.y : union.max.z;
+    const minH = upAxis === "y" ? union.min.y : union.min.z;
     const height = Math.max(0.01, maxH - minH);
     const margin = Math.max(0.01, height * 0.02);
     const requiredAbs = maxH + margin;
@@ -1345,6 +1346,15 @@ function forEachMaterial(obj: THREE.Object3D, fn: (m: THREE.Material) => void) {
   });
 }
 
+function shouldForceDoubleSideForClipping(material: THREE.Material) {
+  if (planCutState.mode !== "CAMERA") return false;
+  const m = material as any;
+  if (m.transparent) return false;
+  if (typeof m.opacity === "number" && m.opacity < 0.999) return false;
+  if (typeof m.alphaTest === "number" && m.alphaTest > 0) return false;
+  return true;
+}
+
 function applyClippingPlanes(planes: THREE.Plane[]) {
   const model = getActiveModel();
   if (!model?.object) return;
@@ -1365,10 +1375,13 @@ function applyClippingPlanes(planes: THREE.Plane[]) {
         side: (m as any).side,
         clippingPlanes: (m as any).clippingPlanes ?? null,
         clipIntersection: (m as any).clipIntersection,
+        clipping: (m as any).clipping,
       });
     }
 
-    (m as any).side = THREE.DoubleSide;
+    if (shouldForceDoubleSideForClipping(m)) {
+      (m as any).side = THREE.DoubleSide;
+    }
     (m as any).clippingPlanes = planes;
     (m as any).clipIntersection = planes.length > 1;
     (m as any).clipping = true;
@@ -1380,8 +1393,8 @@ function clearClippingPlanes() {
   const model = getActiveModel();
   if (!model?.object) return;
 
-  // ✅ clear global clipping planes
   world.renderer.three.clippingPlanes = [];
+  world.renderer.three.localClippingEnabled = false;
 
   if (savedMaterialState) {
     forEachMaterial(model.object, (m) => {
@@ -1392,6 +1405,7 @@ function clearClippingPlanes() {
       (m as any).side = prev.side;
       (m as any).clippingPlanes = prev.clippingPlanes ?? null;
       (m as any).clipIntersection = prev.clipIntersection;
+      (m as any).clipping = prev.clipping;
       m.needsUpdate = true;
     });
 
@@ -2144,15 +2158,9 @@ async setStoreyPlanCut(params: {
   const box = map ? await this.getSelectionWorldBox(map) : null;
   const upAxis = getUpAxis();
   let abs: number | null = null;
+  let stableBaseAbs: number | null = null;
 
-  if (highlightBox && !highlightBox.isEmpty()) {
-    const highlightTop = upAxis === "y" ? highlightBox.max.y : highlightBox.max.z;
-    const highlightMin = upAxis === "y" ? highlightBox.min.y : highlightBox.min.z;
-    const height = Math.max(0.02, highlightTop - highlightMin);
-    abs = highlightTop + Math.max(0.01, height * 0.02);
-  }
-
-  if (abs == null && box && !box.isEmpty()) {
+  if (box && !box.isEmpty()) {
     const minH = upAxis === "y" ? box.min.y : box.min.z;
     const maxH = upAxis === "y" ? box.max.y : box.max.z;
     const storeyHeight = maxH - minH;
@@ -2163,7 +2171,20 @@ async setStoreyPlanCut(params: {
     if (storeyHeight < 3.0 || offset > storeyHeight * 0.8) {
       offset = storeyHeight * 0.4;
     }
-    abs = minH + offset;
+    stableBaseAbs = minH + offset;
+    abs = stableBaseAbs;
+
+    if (highlightBox && !highlightBox.isEmpty()) {
+      const highlightTop = upAxis === "y" ? highlightBox.max.y : highlightBox.max.z;
+      const highlightMin = upAxis === "y" ? highlightBox.min.y : highlightBox.min.z;
+      const highlightHeight = Math.max(0.02, highlightTop - highlightMin);
+      const margin = Math.max(0.01, highlightHeight * 0.02);
+      const preferredAbs = highlightTop + margin;
+
+      // Stabilize storey cuts by allowing only a bounded raise inside the storey band.
+      const maxStableAbs = minH + Math.min(storeyHeight * 0.65, Math.max(offset + 0.45, 1.85));
+      abs = Math.max(stableBaseAbs, Math.min(preferredAbs, maxStableAbs, maxH - 0.05));
+    }
   }
 
   if (abs == null) {
@@ -2175,7 +2196,7 @@ async setStoreyPlanCut(params: {
   await this.setPlanCut({
     absoluteHeight: abs,
     mode,
-    source: highlightBox && !highlightBox.isEmpty() ? "highlight-top" : "absolute",
+    source: highlightBox && stableBaseAbs != null && abs > stableBaseAbs + 1e-4 ? "highlight-top" : "absolute",
     storeyId,
   });
 

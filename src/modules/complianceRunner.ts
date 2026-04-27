@@ -10,6 +10,10 @@ import {
   MAX_ORBIT_FOLLOW_UPS_PER_ENTITY,
   RAMP_NAVIGATION_DEFAULTS,
   REPEATED_FOLLOW_UPS_BEFORE_ESCALATION,
+  SEMANTIC_FOLLOW_UP_FAMILY_BUDGETS,
+  SAME_ENTITY_RECURRENCE_DECAY,
+  SAME_ENTITY_RECURRENCE_WARNING_THRESHOLD,
+  SAME_ENTITY_RECURRENCE_WEIGHTS,
   TOP_VIEW_TARGET_AREA_RATIO,
   ZOOM_IN_EXHAUSTION_AREA_FACTOR,
   getPrototypeRuntimeSettings,
@@ -29,6 +33,20 @@ import {
   updateTaskGraphFromDecision,
   updateTaskGraphFromFollowUpResult,
 } from "./taskGraph";
+import type {
+  FollowUpActionFamily,
+  NavigationAction,
+  NavigationStateTrace,
+  PlanCutStateTrace,
+  SemanticEvidenceProgressTrace,
+  SnapshotNoveltyMetrics,
+  SuppressedFollowUpTrace,
+} from "../types/trace.types";
+import type {
+  EvidenceRequirementReasonMap,
+  EvidenceRequirementsSnapshot,
+  EvidenceRequirementsStatus,
+} from "../types/evidenceRequirements.types";
 
 type NavMetrics = {
   projectedAreaRatio?: number;
@@ -48,12 +66,33 @@ type EntityEvidenceStat = {
   lastWorkflowSignature?: string;
   topMeasurementReady?: boolean;
   contextConfirmReady?: boolean;
+  recentLowNoveltyCount: number;
+  recentRedundancyWarnings: number;
+  lastLowNoveltyAction?: VlmFollowUp["request"];
+  lastUsefulNoveltyScore?: number;
+};
+
+type SemanticEvidenceProgress = SemanticEvidenceProgressTrace;
+
+type EntitySemanticEvidenceTracker = {
+  activeEntityId: string;
+  previousMissingEvidenceNormalized: string[];
+  previousEvidenceRequirementsStatus: EvidenceRequirementsStatus;
+  repeatedEvidenceGapCount: number;
+  triedActionFamilies: FollowUpActionFamily[];
+  triedActionFamilyCounts: Partial<Record<FollowUpActionFamily, number>>;
+  stagnatedActionFamilies: FollowUpActionFamily[];
+  lastActionFamily?: FollowUpActionFamily;
+  lastEvidenceProgressSummary?: string;
+  lastSemanticProgressScore?: number;
+  suppressedFollowUp?: SuppressedFollowUpTrace;
+  finalizationReason?: string;
 };
 
 type EvidenceItem = {
   artifact: SnapshotArtifact;
   nav?: NavMetrics;
-  context?: any;
+  context?: EvidenceContext;
 };
 
 type NavigationBookmark = {
@@ -65,6 +104,7 @@ type NavigationBookmark = {
   viewPreset?: "iso" | "top";
   cameraPose: CameraPose;
   scope?: { storeyId?: string; spaceId?: string };
+  isolatedIds: string[];
   isolatedCategories: string[];
   hiddenIds: string[];
   highlightedIds: string[];
@@ -85,6 +125,7 @@ type EvidenceContext = {
   phase: "context" | "refined" | "final";
   viewPreset?: "iso" | "top";            // or StartPosePreset
   cameraPose: CameraPose;               // already accessible
+  activeEntityId?: string;
   scope?: { storeyId?: string; spaceId?: string };
   isolatedCategories?: string[];
   isolatedIds?: string[];
@@ -118,6 +159,7 @@ type EvidenceContext = {
     orbitRemainingForActiveEntity: number;
     orbitMaxHighlightOcclusionRatio: number;
   };
+  evidenceRequirements?: EvidenceRequirementsSnapshot;
   taskGraph?: {
     profile: CompactTaskGraphState["profile"];
     source: CompactTaskGraphState["source"];
@@ -150,9 +192,1455 @@ type EvidenceContext = {
       hasPlanCut: boolean;
     }>;
   };
+  snapshotNovelty?: SnapshotNoveltyMetrics;
+  semanticEvidenceProgress?: SemanticEvidenceProgress;
+  normalizedEvidenceGaps?: string[];
+  triedActionFamilies?: FollowUpActionFamily[];
+  suppressedFollowUp?: SuppressedFollowUpTrace;
+  finalizationReason?: string;
+};
+
+type SnapshotNoveltyComparable = {
+  snapshotId: string;
+  activeEntityId?: string;
+  viewPreset?: EvidenceContext["viewPreset"];
+  cameraPose: CameraPose;
+  scope?: EvidenceContext["scope"];
+  highlightedIds?: string[];
+  planCut?: EvidenceContext["planCut"];
+  nav?: NavMetrics;
 };
 
 type ToastFn = (msg: string, ms?: number) => void;
+
+function distance3d(
+  a: { x: number; y: number; z: number },
+  b: { x: number; y: number; z: number }
+): number {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  const dz = a.z - b.z;
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function normalizeStringArray(values?: string[]): string[] {
+  return Array.isArray(values)
+    ? values
+        .filter((value): value is string => typeof value === "string" && value.length > 0)
+        .slice()
+        .sort()
+    : [];
+}
+
+function sameStringArray(a?: string[], b?: string[]): boolean {
+  const left = normalizeStringArray(a);
+  const right = normalizeStringArray(b);
+  if (left.length !== right.length) return false;
+  return left.every((value, index) => value === right[index]);
+}
+
+function normalizeScope(scope?: EvidenceContext["scope"]): { storeyId?: string; spaceId?: string } | undefined {
+  if (!scope) return undefined;
+  return {
+    storeyId: typeof scope.storeyId === "string" ? scope.storeyId : undefined,
+    spaceId: typeof scope.spaceId === "string" ? scope.spaceId : undefined,
+  };
+}
+
+function sameScope(a?: EvidenceContext["scope"], b?: EvidenceContext["scope"]): boolean {
+  const left = normalizeScope(a);
+  const right = normalizeScope(b);
+  return (left?.storeyId ?? null) === (right?.storeyId ?? null) &&
+    (left?.spaceId ?? null) === (right?.spaceId ?? null);
+}
+
+function normalizePlanCutKey(planCut?: EvidenceContext["planCut"]): string {
+  if (!planCut) return "none";
+  return JSON.stringify({
+    enabled: Boolean(planCut.enabled),
+    height: typeof planCut.height === "number" ? Number(planCut.height.toFixed(3)) : null,
+    absoluteHeight:
+      typeof planCut.absoluteHeight === "number" ? Number(planCut.absoluteHeight.toFixed(3)) : null,
+    thickness: typeof planCut.thickness === "number" ? Number(planCut.thickness.toFixed(3)) : null,
+    mode: typeof planCut.mode === "string" ? planCut.mode : null,
+    source: typeof planCut.source === "string" ? planCut.source : null,
+    storeyId: typeof planCut.storeyId === "string" ? planCut.storeyId : null,
+  });
+}
+
+function stableJson(x: any): string {
+  if (x == null) return "";
+  if (Array.isArray(x)) return `[${x.map(stableJson).join(",")}]`;
+  if (typeof x === "object") {
+    const keys = Object.keys(x).sort();
+    return `{${keys.map((key) => `${key}:${stableJson((x as any)[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(x);
+}
+
+function getYawPitchDegrees(pose: CameraPose): { yawDeg: number; pitchDeg: number } | null {
+  const dx = pose.target.x - pose.eye.x;
+  const dy = pose.target.y - pose.eye.y;
+  const dz = pose.target.z - pose.eye.z;
+  const horizontalLength = Math.sqrt(dx * dx + dz * dz);
+  const fullLength = Math.sqrt(dx * dx + dy * dy + dz * dz);
+  if (!isFinite(fullLength) || fullLength <= 1e-6) return null;
+  return {
+    yawDeg: Math.atan2(dz, dx) * (180 / Math.PI),
+    pitchDeg: Math.atan2(dy, Math.max(horizontalLength, 1e-6)) * (180 / Math.PI),
+  };
+}
+
+function getSmallestAngleDeltaDegrees(a: number, b: number): number {
+  const wrapped = ((a - b + 540) % 360) - 180;
+  return Math.abs(wrapped);
+}
+
+function clamp01(value: number): number {
+  return Math.max(0, Math.min(1, value));
+}
+
+function expSimilarity(delta: number, scale: number): number {
+  if (!Number.isFinite(delta) || !Number.isFinite(scale) || scale <= 1e-6) return 0;
+  return clamp01(Number(Math.exp(-Math.max(0, delta) / scale).toFixed(2)));
+}
+
+function nullableStringEqual(a?: string | null, b?: string | null): boolean {
+  return (a ?? null) === (b ?? null);
+}
+
+function computeJaccardSimilarity(a?: string[], b?: string[]): number {
+  const left = new Set(normalizeStringArray(a));
+  const right = new Set(normalizeStringArray(b));
+  if (!left.size && !right.size) return 1;
+  const intersection = [...left].filter((value) => right.has(value)).length;
+  const union = new Set([...left, ...right]).size;
+  return union > 0 ? Number((intersection / union).toFixed(2)) : 0;
+}
+
+function computeScopeSimilarity(a?: EvidenceContext["scope"], b?: EvidenceContext["scope"]): number {
+  if (!a && !b) return 1;
+  if (sameScope(a, b)) return 1;
+  if ((a?.storeyId ?? null) && (a?.storeyId ?? null) === (b?.storeyId ?? null)) return 0.5;
+  return 0;
+}
+
+function computePlanCutSimilarity(
+  current?: EvidenceContext["planCut"],
+  previous?: EvidenceContext["planCut"]
+): number {
+  if (!current && !previous) return 1;
+  if (normalizePlanCutKey(current) === normalizePlanCutKey(previous)) return 1;
+  if (!current || !previous) return 0;
+
+  const enabledSimilarity = Boolean(current.enabled) === Boolean(previous.enabled) ? 1 : 0;
+  const modeSimilarity = nullableStringEqual(current.mode, previous.mode) ? 1 : 0;
+  const storeySimilarity = nullableStringEqual(current.storeyId, previous.storeyId) ? 1 : 0;
+
+  const currentHeight =
+    typeof current.absoluteHeight === "number"
+      ? current.absoluteHeight
+      : typeof current.height === "number"
+        ? current.height
+        : undefined;
+  const previousHeight =
+    typeof previous.absoluteHeight === "number"
+      ? previous.absoluteHeight
+      : typeof previous.height === "number"
+        ? previous.height
+        : undefined;
+  const heightSimilarity =
+    typeof currentHeight === "number" && typeof previousHeight === "number"
+      ? expSimilarity(Math.abs(currentHeight - previousHeight), 0.25)
+      : currentHeight == null && previousHeight == null
+        ? 1
+        : 0.25;
+
+  return clamp01(
+    Number(
+      (
+        enabledSimilarity * 0.35 +
+        modeSimilarity * 0.2 +
+        storeySimilarity * 0.2 +
+        heightSimilarity * 0.25
+      ).toFixed(2)
+    )
+  );
+}
+
+function computeCameraSimilarity(current: CameraPose, previous: CameraPose): number {
+  const currentDistance = distance3d(current.eye, current.target);
+  const previousDistance = distance3d(previous.eye, previous.target);
+  const representativeDistance = Math.max(currentDistance, previousDistance, 1);
+  const eyeDelta = distance3d(current.eye, previous.eye);
+  const targetDelta = distance3d(current.target, previous.target);
+  const eyeSimilarity = expSimilarity(eyeDelta, Math.max(0.35, representativeDistance * 0.08));
+  const targetSimilarity = expSimilarity(targetDelta, Math.max(0.25, representativeDistance * 0.06));
+  return Number((((eyeSimilarity + targetSimilarity) / 2)).toFixed(2));
+}
+
+function computeMetricSimilarity(
+  current?: number,
+  previous?: number,
+  scale = 0.1
+): number {
+  if (typeof current === "number" && typeof previous === "number") {
+    return expSimilarity(Math.abs(current - previous), scale);
+  }
+  return current == null && previous == null ? 1 : 0.5;
+}
+
+function computeSameEntityViewSimilarity(args: {
+  current: SnapshotNoveltyComparable;
+  previous: SnapshotNoveltyComparable;
+}): number {
+  const { current, previous } = args;
+  const viewPresetSimilarity = (current.viewPreset ?? null) === (previous.viewPreset ?? null) ? 1 : 0;
+  const cameraSimilarity = computeCameraSimilarity(current.cameraPose, previous.cameraPose);
+  const planCutSimilarity = computePlanCutSimilarity(current.planCut, previous.planCut);
+  const scopeSimilarity = computeScopeSimilarity(current.scope, previous.scope);
+  const highlightSimilarity = computeJaccardSimilarity(current.highlightedIds, previous.highlightedIds);
+  const projectedAreaSimilarity = computeMetricSimilarity(
+    current.nav?.projectedAreaRatio,
+    previous.nav?.projectedAreaRatio,
+    0.08
+  );
+  const occlusionSimilarity = computeMetricSimilarity(
+    current.nav?.occlusionRatio,
+    previous.nav?.occlusionRatio,
+    0.12
+  );
+  const presetPenalty =
+    current.viewPreset && previous.viewPreset && current.viewPreset !== previous.viewPreset ? 0.55 : 1;
+
+  return clamp01(
+    Number(
+      ((
+        SAME_ENTITY_RECURRENCE_WEIGHTS.viewPreset * viewPresetSimilarity +
+        SAME_ENTITY_RECURRENCE_WEIGHTS.camera * cameraSimilarity +
+        SAME_ENTITY_RECURRENCE_WEIGHTS.planCut * planCutSimilarity +
+        SAME_ENTITY_RECURRENCE_WEIGHTS.scope * scopeSimilarity +
+        SAME_ENTITY_RECURRENCE_WEIGHTS.highlight * highlightSimilarity +
+        SAME_ENTITY_RECURRENCE_WEIGHTS.projectedArea * projectedAreaSimilarity +
+        SAME_ENTITY_RECURRENCE_WEIGHTS.occlusion * occlusionSimilarity
+      ) * presetPenalty).toFixed(2)
+    )
+  );
+}
+
+function computeSemanticFailureWeight(progress?: SemanticEvidenceProgress): number {
+  if (!progress) return 0;
+  const unresolved = (progress.normalizedEvidenceGaps?.length ?? 0) > 0 || progress.unchangedGapCount > 0;
+  if (!unresolved) return 0;
+  const base = 1 - clamp01(progress.semanticProgressScore ?? 1);
+  const boosted = progress.semanticStagnationWarning ? Math.max(base, 0.85) : base;
+  return Number(boosted.toFixed(2));
+}
+
+function normalizeEvidenceText(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function bucketMissingEvidenceGap(text: string): string[] {
+  const buckets = new Set<string>();
+  const has = (pattern: RegExp) => pattern.test(text);
+
+  if (has(/\bvisible|visibility|see|seen|viewable\b/)) buckets.add("target_visibility");
+  if (has(/\bfocus|focused|close up|closeup|zoom|center|centred|readable\b/)) buckets.add("target_focus");
+  if (has(/\bplan|top view|plan cut|measure|measurement|measurable\b/)) buckets.add("plan_measurement");
+  if (has(/\bcontext|angle|orbit|side view|side angle|overview|isometric|iso\b/)) buckets.add("context_view");
+  if (has(/\boccl|obstruct|blocked|hidden|clutter\b/)) buckets.add("obstruction_context");
+  if (has(/\bdimension|reference|scale|grid|ruler\b/)) buckets.add("dimension_reference");
+  if (has(/\bclause|section|regulation|standard|code text|threshold|edition\b/)) buckets.add("regulatory_clause");
+  if (has(/\bboth sides|surroundings|adjacent|around|opposite side|nearby\b/)) {
+    buckets.add("both_sides_or_surroundings");
+  }
+  if (has(/\bhandrail|guardrail|rail\b/)) buckets.add("handrail");
+  if (has(/\briser|tread|nosing|stair run|step depth|step height\b/)) buckets.add("riser_tread");
+  if (has(/\blanding\b/)) buckets.add("landing");
+  if (has(/\bheadroom|overhead\b/)) buckets.add("headroom");
+  if (has(/\bclearance|clear width|free width\b/)) buckets.add("clearance");
+
+  return [...buckets];
+}
+
+function normalizeMissingEvidenceGaps(values?: string[]): string[] {
+  const normalized = new Set<string>();
+  for (const raw of values ?? []) {
+    if (typeof raw !== "string") continue;
+    const text = normalizeEvidenceText(raw);
+    if (!text) continue;
+    const buckets = bucketMissingEvidenceGap(text);
+    if (buckets.length) {
+      for (const bucket of buckets) normalized.add(bucket);
+      continue;
+    }
+    normalized.add(text.replace(/\b(the|a|an|need|needs|missing)\b/g, "").replace(/\s+/g, " ").trim());
+  }
+  return [...normalized].filter(Boolean).sort();
+}
+
+function normalizeEvidenceRequirementsStatusSnapshot(
+  status?: EvidenceRequirementsStatus
+): EvidenceRequirementsStatus {
+  return Object.fromEntries(
+    Object.entries(status ?? {}).filter(([, value]) => typeof value === "boolean")
+  ) as EvidenceRequirementsStatus;
+}
+
+function classifyFollowUpActionFamily(
+  followUp?: VlmFollowUp | VlmFollowUp["request"]
+): FollowUpActionFamily | undefined {
+  const request = typeof followUp === "string" ? followUp : followUp?.request;
+  if (!request) return undefined;
+  switch (request) {
+    case "TOP_VIEW":
+    case "SET_PLAN_CUT":
+    case "SET_STOREY_PLAN_CUT":
+    case "CLEAR_PLAN_CUT":
+      return "plan_measurement";
+    case "ISO_VIEW":
+    case "NEW_VIEW":
+    case "ORBIT":
+    case "SET_VIEW_PRESET":
+      return "context_angle";
+    case "ZOOM_IN":
+    case "HIGHLIGHT_IDS":
+    case "PICK_OBJECT":
+    case "PICK_CENTER":
+      return "focus";
+    case "ISOLATE_STOREY":
+    case "ISOLATE_SPACE":
+    case "ISOLATE_CATEGORY":
+      return "scope";
+    case "HIDE_CATEGORY":
+    case "HIDE_IDS":
+    case "SHOW_CATEGORY":
+    case "SHOW_IDS":
+    case "HIDE_SELECTED":
+      return "occlusion_or_context_cleanup";
+    case "WEB_FETCH":
+      return "regulatory_grounding";
+    case "GET_PROPERTIES":
+      return "property_measurement";
+    case "RESTORE_VIEW":
+      return "restore";
+    case "RESET_VISIBILITY":
+      return "reset";
+    default:
+      return undefined;
+  }
+}
+
+function summarizeTriedActionFamilies(
+  counts: Partial<Record<FollowUpActionFamily, number>>
+): FollowUpActionFamily[] {
+  return Object.entries(counts)
+    .filter(([, count]) => Number(count) > 0)
+    .map(([family]) => family as FollowUpActionFamily)
+    .sort();
+}
+
+function makeDefaultSemanticTracker(activeEntityId: string): EntitySemanticEvidenceTracker {
+  return {
+    activeEntityId,
+    previousMissingEvidenceNormalized: [],
+    previousEvidenceRequirementsStatus: {},
+    repeatedEvidenceGapCount: 0,
+    triedActionFamilies: [],
+    triedActionFamilyCounts: {},
+    stagnatedActionFamilies: [],
+  };
+}
+
+function cloneSuppressedFollowUp(
+  value?: SuppressedFollowUpTrace
+): SuppressedFollowUpTrace | undefined {
+  return value ? { ...value } : undefined;
+}
+
+function getLowNoveltyActionFamily(action?: VlmFollowUp["request"]): string | null {
+  if (!action) return null;
+  switch (action) {
+    case "NEW_VIEW":
+    case "ORBIT":
+    case "ZOOM_IN":
+    case "TOP_VIEW":
+    case "ISO_VIEW":
+    case "SET_VIEW_PRESET":
+      return "view";
+    case "SET_PLAN_CUT":
+    case "SET_STOREY_PLAN_CUT":
+    case "CLEAR_PLAN_CUT":
+      return "plan";
+    case "ISOLATE_STOREY":
+    case "ISOLATE_SPACE":
+    case "ISOLATE_CATEGORY":
+    case "HIDE_IDS":
+    case "SHOW_IDS":
+    case "RESET_VISIBILITY":
+    case "HIDE_CATEGORY":
+    case "SHOW_CATEGORY":
+    case "HIDE_SELECTED":
+      return "scope";
+    case "PICK_CENTER":
+    case "PICK_OBJECT":
+    case "GET_PROPERTIES":
+    case "HIGHLIGHT_IDS":
+      return "target";
+    case "RESTORE_VIEW":
+      return "restore";
+    case "WEB_FETCH":
+      return "web";
+    default:
+      return action;
+  }
+}
+
+function makeDefaultEntityEvidenceStat(): EntityEvidenceStat {
+  return {
+    steps: 0,
+    uncertainSteps: 0,
+    repeatedWorkflowStreak: 0,
+    orbitFollowUps: 0,
+    recentLowNoveltyCount: 0,
+    recentRedundancyWarnings: 0,
+  };
+}
+
+type FollowUpDecisionSource = "runtime_planner" | "vlm_advisory" | "provider_override" | "anti_repeat";
+
+type FollowUpPlan = {
+  followUp?: VlmFollowUp;
+  source: FollowUpDecisionSource;
+  reason: string;
+  evidenceRequirements: EvidenceRequirementsSnapshot;
+  suppressedFollowUp?: SuppressedFollowUpTrace;
+  finalizationReason?: string;
+};
+
+function makeEvidenceRequirementsSnapshot(
+  status: EvidenceRequirementsStatus,
+  reasons?: EvidenceRequirementReasonMap
+): EvidenceRequirementsSnapshot {
+  const filteredStatus = Object.fromEntries(
+    Object.entries(status).filter(([, value]) => typeof value === "boolean")
+  ) as EvidenceRequirementsStatus;
+  const filteredReasons = reasons
+    ? Object.fromEntries(
+        Object.entries(reasons).filter(([, value]) => typeof value === "string" && value.length > 0)
+      ) as EvidenceRequirementReasonMap
+    : undefined;
+  return {
+    status: filteredStatus,
+    ...(filteredReasons && Object.keys(filteredReasons).length ? { reasons: filteredReasons } : {}),
+  };
+}
+
+function mergeEvidenceRequirements(
+  base: EvidenceRequirementsSnapshot | undefined,
+  overlay: EvidenceRequirementsSnapshot | undefined
+): EvidenceRequirementsSnapshot | undefined {
+  if (!base && !overlay) return undefined;
+  return makeEvidenceRequirementsSnapshot(
+    {
+      ...(base?.status ?? {}),
+      ...(overlay?.status ?? {}),
+    },
+    {
+      ...(base?.reasons ?? {}),
+      ...(overlay?.reasons ?? {}),
+    }
+  );
+}
+
+function boolFromRequirement(
+  value: unknown
+): boolean | undefined {
+  return typeof value === "boolean" ? value : undefined;
+}
+
+function summarizeEvidenceRequirementsStatus(status?: EvidenceRequirementsStatus): Record<string, boolean> | undefined {
+  const normalized = normalizeEvidenceRequirementsStatusSnapshot(status);
+  return Object.keys(normalized).length ? { ...normalized } : undefined;
+}
+
+function computeEvidenceRequirementStatusDelta(
+  previous: EvidenceRequirementsStatus,
+  current: EvidenceRequirementsStatus
+): { improved: number; regressed: number } {
+  const positiveWhenTrue = new Set([
+    "targetVisible",
+    "targetFocused",
+    "planMeasurementReady",
+    "contextViewReady",
+  ]);
+  const positiveWhenFalse = new Set([
+    "obstructionContextNeeded",
+    "dimensionReferenceNeeded",
+    "regulatoryClauseNeeded",
+    "occlusionProblem",
+    "lowNoveltyOrRepeatedView",
+    "bothSidesOrSurroundingsNeeded",
+  ]);
+  let improved = 0;
+  let regressed = 0;
+  const keys = new Set([...Object.keys(previous ?? {}), ...Object.keys(current ?? {})]);
+  for (const key of keys) {
+    const prev = boolFromRequirement(previous[key as keyof EvidenceRequirementsStatus]);
+    const next = boolFromRequirement(current[key as keyof EvidenceRequirementsStatus]);
+    if (prev === undefined || next === undefined || prev === next) continue;
+    if (positiveWhenTrue.has(key)) {
+      if (prev === false && next === true) improved += 1;
+      if (prev === true && next === false) regressed += 1;
+    } else if (positiveWhenFalse.has(key)) {
+      if (prev === true && next === false) improved += 1;
+      if (prev === false && next === true) regressed += 1;
+    }
+  }
+  return { improved, regressed };
+}
+
+function computeSameEntityRecurrenceMetrics(args: {
+  currentStep: number;
+  current: SnapshotNoveltyComparable;
+  history: EvidenceItem[];
+}): Pick<
+  SemanticEvidenceProgress,
+  | "sameEntityRecurrenceScore"
+  | "sameEntityRecurrenceWarning"
+  | "sameEntityRecurrenceComparedSnapshotId"
+  | "sameEntityRecurrenceStepDelta"
+  | "sameEntityRecurrenceViewSimilarity"
+  | "sameEntityRecurrenceDecayWeight"
+  | "sameEntityRecurrenceFailureWeight"
+> {
+  const { currentStep, current, history } = args;
+  if (!current.activeEntityId) {
+    return {
+      sameEntityRecurrenceScore: 0,
+      sameEntityRecurrenceWarning: false,
+    };
+  }
+
+  let strongestScore = 0;
+  let strongestSnapshotId: string | undefined;
+  let strongestStepDelta: number | undefined;
+  let strongestSimilarity: number | undefined;
+  let strongestDecay: number | undefined;
+  let strongestFailureWeight: number | undefined;
+
+  for (const item of history) {
+    const previousContext = item.context;
+    if (!previousContext?.activeEntityId || previousContext.activeEntityId !== current.activeEntityId) continue;
+    if (previousContext.step >= currentStep) continue;
+
+    const previousProgress = previousContext.semanticEvidenceProgress;
+    const failureWeight = computeSemanticFailureWeight(previousProgress);
+    if (failureWeight <= 0) continue;
+
+    const stepDelta = currentStep - previousContext.step;
+    const decayWeight = Number(Math.pow(SAME_ENTITY_RECURRENCE_DECAY, Math.max(0, stepDelta - 1)).toFixed(2));
+    const viewSimilarity = computeSameEntityViewSimilarity({
+      current,
+      previous: {
+        snapshotId: item.artifact.id,
+        activeEntityId: previousContext.activeEntityId,
+        viewPreset: previousContext.viewPreset,
+        cameraPose: previousContext.cameraPose ?? item.artifact.meta.camera,
+        scope: previousContext.scope,
+        highlightedIds: previousContext.highlightedIds,
+        planCut: previousContext.planCut,
+        nav: item.nav,
+      },
+    });
+    const recurrenceScore = clamp01(Number((decayWeight * viewSimilarity * failureWeight).toFixed(2)));
+    if (recurrenceScore <= strongestScore) continue;
+
+    strongestScore = recurrenceScore;
+    strongestSnapshotId = item.artifact.id;
+    strongestStepDelta = stepDelta;
+    strongestSimilarity = viewSimilarity;
+    strongestDecay = decayWeight;
+    strongestFailureWeight = failureWeight;
+  }
+
+  return {
+    sameEntityRecurrenceScore: strongestScore,
+    sameEntityRecurrenceWarning: strongestScore >= SAME_ENTITY_RECURRENCE_WARNING_THRESHOLD,
+    sameEntityRecurrenceComparedSnapshotId: strongestSnapshotId,
+    sameEntityRecurrenceStepDelta: strongestStepDelta,
+    sameEntityRecurrenceViewSimilarity: strongestSimilarity,
+    sameEntityRecurrenceDecayWeight: strongestDecay,
+    sameEntityRecurrenceFailureWeight: strongestFailureWeight,
+  };
+}
+
+function predictComparableStateForFollowUp(args: {
+  followUp?: VlmFollowUp;
+  context: EvidenceContext;
+}): SnapshotNoveltyComparable | undefined {
+  const { followUp, context } = args;
+  if (!followUp || !context.activeEntityId) return undefined;
+
+  const predicted: SnapshotNoveltyComparable = {
+    snapshotId: `predicted_step_${context.step + 1}`,
+    activeEntityId: context.activeEntityId,
+    viewPreset: context.viewPreset,
+    cameraPose: context.cameraPose,
+    scope: context.scope,
+    highlightedIds: context.highlightedIds,
+    planCut: context.planCut,
+    nav: undefined,
+  };
+
+  switch (followUp.request) {
+    case "TOP_VIEW":
+      predicted.viewPreset = "top";
+      return predicted;
+    case "ISO_VIEW":
+      predicted.viewPreset = "iso";
+      return predicted;
+    case "SET_VIEW_PRESET":
+      predicted.viewPreset =
+        followUp.params.preset === "TOP"
+          ? "top"
+          : followUp.params.preset === "ISO"
+            ? "iso"
+            : undefined;
+      return predicted;
+    case "SET_PLAN_CUT":
+      predicted.planCut = {
+        enabled: true,
+        height: followUp.params.height,
+        thickness: followUp.params.thickness,
+        mode: followUp.params.mode,
+        absoluteHeight: context.planCut?.absoluteHeight,
+        source: "predicted",
+        storeyId: context.planCut?.storeyId,
+      };
+      return predicted;
+    case "SET_STOREY_PLAN_CUT":
+      predicted.planCut = {
+        enabled: true,
+        mode: followUp.params.mode ?? "WORLD_UP",
+        storeyId: followUp.params.storeyId,
+        height: followUp.params.offsetFromFloor,
+        source: "predicted",
+      };
+      predicted.scope = { ...(predicted.scope ?? {}), storeyId: followUp.params.storeyId };
+      return predicted;
+    case "CLEAR_PLAN_CUT":
+      predicted.planCut = { enabled: false };
+      return predicted;
+    case "ISOLATE_STOREY":
+      predicted.scope = { storeyId: followUp.params.storeyId };
+      return predicted;
+    case "ISOLATE_SPACE":
+      predicted.scope = { spaceId: followUp.params.spaceId };
+      return predicted;
+    case "HIGHLIGHT_IDS":
+      predicted.highlightedIds = followUp.params.ids;
+      return predicted;
+    default:
+      if (followUp.request === "ORBIT" || followUp.request === "NEW_VIEW") {
+        return undefined;
+      }
+      return predicted;
+  }
+}
+
+function computeProspectiveSameEntityRecurrenceMetrics(args: {
+  followUp?: VlmFollowUp;
+  context: EvidenceContext;
+  history: EvidenceItem[];
+}): Pick<
+  SemanticEvidenceProgress,
+  | "sameEntityRecurrenceScore"
+  | "sameEntityRecurrenceWarning"
+  | "sameEntityRecurrenceComparedSnapshotId"
+  | "sameEntityRecurrenceStepDelta"
+  | "sameEntityRecurrenceViewSimilarity"
+  | "sameEntityRecurrenceDecayWeight"
+  | "sameEntityRecurrenceFailureWeight"
+> | undefined {
+  const predicted = predictComparableStateForFollowUp(args);
+  if (!predicted) return undefined;
+  return computeSameEntityRecurrenceMetrics({
+    currentStep: args.context.step + 1,
+    current: predicted,
+    history: args.history,
+  });
+}
+
+// Semantic evidence stagnation / anti-cycle logic:
+// compare normalized evidence gaps plus requirement-status deltas so visually
+// novel snapshots can still be flagged as semantically redundant.
+function assessSemanticEvidenceProgress(args: {
+  activeEntityId: string;
+  tracker?: EntitySemanticEvidenceTracker;
+  missingEvidence: string[];
+  evidenceRequirementsStatus: EvidenceRequirementsStatus;
+  recurrenceMetrics?: Pick<
+    SemanticEvidenceProgress,
+    | "sameEntityRecurrenceScore"
+    | "sameEntityRecurrenceWarning"
+    | "sameEntityRecurrenceComparedSnapshotId"
+    | "sameEntityRecurrenceStepDelta"
+    | "sameEntityRecurrenceViewSimilarity"
+    | "sameEntityRecurrenceDecayWeight"
+    | "sameEntityRecurrenceFailureWeight"
+  >;
+}): SemanticEvidenceProgress {
+  const {
+    activeEntityId,
+    tracker,
+    missingEvidence,
+    evidenceRequirementsStatus,
+    recurrenceMetrics,
+  } = args;
+  const previousGaps = tracker?.previousMissingEvidenceNormalized ?? [];
+  const previousStatus = tracker?.previousEvidenceRequirementsStatus ?? {};
+  const currentGapSet = new Set(missingEvidence);
+  const previousGapSet = new Set(previousGaps);
+  const resolvedGapCount = previousGaps.filter((gap) => !currentGapSet.has(gap)).length;
+  const newGapCount = missingEvidence.filter((gap) => !previousGapSet.has(gap)).length;
+  const unchangedGapCount = missingEvidence.filter((gap) => previousGapSet.has(gap)).length;
+  const evidenceGapsChanged =
+    !sameStringArray(previousGaps, missingEvidence) ||
+    stableJson(normalizeEvidenceRequirementsStatusSnapshot(previousStatus)) !==
+      stableJson(normalizeEvidenceRequirementsStatusSnapshot(evidenceRequirementsStatus));
+  const statusDelta = computeEvidenceRequirementStatusDelta(previousStatus, evidenceRequirementsStatus);
+  const noPreviousState =
+    !tracker ||
+    (!tracker.previousMissingEvidenceNormalized.length &&
+      !Object.keys(tracker.previousEvidenceRequirementsStatus ?? {}).length);
+
+  const repeatedEvidenceGapCount = noPreviousState
+    ? (missingEvidence.length ? 1 : 0)
+    : unchangedGapCount > 0 &&
+        resolvedGapCount === 0 &&
+        newGapCount === 0 &&
+        statusDelta.improved === 0
+      ? Math.max(tracker?.repeatedEvidenceGapCount ?? 1, 1) + 1
+      : (missingEvidence.length ? 1 : 0);
+
+  const scoreDenominator =
+    resolvedGapCount + unchangedGapCount + newGapCount + statusDelta.improved + statusDelta.regressed;
+  const semanticProgressScore = noPreviousState
+    ? 1
+    : scoreDenominator <= 0
+      ? 0
+      : clamp01(
+          Number(
+            (
+              (resolvedGapCount + statusDelta.improved * 0.75) /
+              Math.max(1, scoreDenominator)
+            ).toFixed(2)
+          )
+        );
+  const semanticStagnationWarning = Boolean(
+    repeatedEvidenceGapCount >= 2 &&
+      semanticProgressScore <= 0.15 &&
+      missingEvidence.length > 0
+  );
+  const summary = noPreviousState
+    ? `Baseline evidence state recorded for entity ${activeEntityId}.`
+    : `Semantic evidence progress for ${activeEntityId}: resolved=${resolvedGapCount}, new=${newGapCount}, unchanged=${unchangedGapCount}, score=${semanticProgressScore.toFixed(2)}.`;
+
+  return {
+    normalizedEvidenceGaps: missingEvidence,
+    evidenceGapsChanged,
+    resolvedGapCount,
+    newGapCount,
+    unchangedGapCount,
+    semanticProgressScore,
+    semanticStagnationWarning,
+    sameEntityRecurrenceScore: recurrenceMetrics?.sameEntityRecurrenceScore ?? 0,
+    sameEntityRecurrenceWarning: recurrenceMetrics?.sameEntityRecurrenceWarning ?? false,
+    sameEntityRecurrenceComparedSnapshotId: recurrenceMetrics?.sameEntityRecurrenceComparedSnapshotId,
+    sameEntityRecurrenceStepDelta: recurrenceMetrics?.sameEntityRecurrenceStepDelta,
+    sameEntityRecurrenceViewSimilarity: recurrenceMetrics?.sameEntityRecurrenceViewSimilarity,
+    sameEntityRecurrenceDecayWeight: recurrenceMetrics?.sameEntityRecurrenceDecayWeight,
+    sameEntityRecurrenceFailureWeight: recurrenceMetrics?.sameEntityRecurrenceFailureWeight,
+    repeatedEvidenceGapCount,
+    previousEvidenceRequirementsStatus: summarizeEvidenceRequirementsStatus(previousStatus),
+    currentEvidenceRequirementsStatus: summarizeEvidenceRequirementsStatus(evidenceRequirementsStatus),
+    triedActionFamilies: tracker?.triedActionFamilies ?? [],
+    triedActionFamilyCounts: tracker?.triedActionFamilyCounts ?? {},
+    lastActionFamily: tracker?.lastActionFamily,
+    lastEvidenceProgressSummary: summary,
+  };
+}
+
+function updateSemanticTrackerFromDecision(args: {
+  tracker: EntitySemanticEvidenceTracker;
+  progress: SemanticEvidenceProgress;
+  evidenceRequirementsStatus: EvidenceRequirementsStatus;
+}): EntitySemanticEvidenceTracker {
+  const { tracker, progress, evidenceRequirementsStatus } = args;
+  const nextTracker: EntitySemanticEvidenceTracker = {
+    ...tracker,
+    previousMissingEvidenceNormalized: [...progress.normalizedEvidenceGaps],
+    previousEvidenceRequirementsStatus: normalizeEvidenceRequirementsStatusSnapshot(evidenceRequirementsStatus),
+    repeatedEvidenceGapCount: progress.repeatedEvidenceGapCount,
+    lastEvidenceProgressSummary: progress.lastEvidenceProgressSummary,
+    lastSemanticProgressScore: progress.semanticProgressScore,
+  };
+  if (tracker.lastActionFamily && progress.semanticProgressScore <= 0.15) {
+    nextTracker.stagnatedActionFamilies = Array.from(
+      new Set([...(tracker.stagnatedActionFamilies ?? []), tracker.lastActionFamily])
+    ).sort() as FollowUpActionFamily[];
+  }
+  if (tracker.lastActionFamily && progress.semanticProgressScore > 0.15) {
+    nextTracker.stagnatedActionFamilies = (tracker.stagnatedActionFamilies ?? []).filter(
+      (family) => family !== tracker.lastActionFamily
+    );
+  }
+  nextTracker.triedActionFamilies = summarizeTriedActionFamilies(nextTracker.triedActionFamilyCounts);
+  return nextTracker;
+}
+
+function recordTriedActionFamily(
+  tracker: EntitySemanticEvidenceTracker,
+  family?: FollowUpActionFamily
+): EntitySemanticEvidenceTracker {
+  if (!family) return tracker;
+  const count = Number(tracker.triedActionFamilyCounts[family] ?? 0) + 1;
+  const triedActionFamilyCounts = {
+    ...tracker.triedActionFamilyCounts,
+    [family]: count,
+  };
+  return {
+    ...tracker,
+    lastActionFamily: family,
+    triedActionFamilyCounts,
+    triedActionFamilies: summarizeTriedActionFamilies(triedActionFamilyCounts),
+  };
+}
+
+function buildSemanticStagnationFinalizationReason(progress: SemanticEvidenceProgress): string {
+  const gaps = progress.normalizedEvidenceGaps.length
+    ? progress.normalizedEvidenceGaps.join(", ")
+    : "unresolved evidence";
+  return `Multiple navigation strategies were attempted, but the same evidence gaps remained unresolved: ${gaps}. Further visual navigation is unlikely to ground the requirement without measurement/property support.`;
+}
+
+function hasConcern(context: EvidenceContext, concern: string): boolean {
+  return Boolean(context.taskGraph?.concerns?.includes(concern as any));
+}
+
+function deriveRuntimeEvidenceRequirements(args: {
+  context: EvidenceContext;
+  decision?: VlmDecision;
+  nav?: NavMetrics;
+  stats?: EntityEvidenceStat;
+}): EvidenceRequirementsSnapshot {
+  const { context, decision, nav, stats } = args;
+  const reasons: EvidenceRequirementReasonMap = {};
+  const status: EvidenceRequirementsStatus = {};
+  const activeEntityId = context.activeEntityId;
+  const highlightIds = context.highlightedIds ?? [];
+  const projectedAreaRatio = typeof nav?.projectedAreaRatio === "number" ? nav.projectedAreaRatio : undefined;
+  const zoomExhausted = Boolean(nav?.zoomPotentialExhausted);
+  const missingEvidence = [
+    ...(decision?.missingEvidence ?? []),
+    ...(decision?.visibility?.missingEvidence ?? []),
+  ]
+    .map((item) => String(item).toLowerCase());
+  const readiness = (context.highlightAnnotations as any)?.doorClearanceReadiness as
+    | {
+        measurableLikely?: boolean;
+        evidenceBundle?: {
+          topMeasurementViewReady?: boolean;
+          contextConfirmViewReady?: boolean;
+        };
+      }
+    | undefined;
+
+  const visibleFromDecision = decision?.visibility?.isRuleTargetVisible;
+  const visibleFromHighlights = Boolean(activeEntityId && highlightIds.includes(activeEntityId));
+  status.targetVisible = visibleFromDecision ?? visibleFromHighlights;
+  if (status.targetVisible === false) {
+    reasons.targetVisible = "The active target is not yet clearly visible in the current evidence.";
+  }
+
+  const targetAreaGoal = nav?.targetAreaGoal ?? HIGHLIGHT_TARGET_AREA_RATIO;
+  status.targetFocused = Boolean(
+    activeEntityId &&
+      highlightIds.includes(activeEntityId) &&
+      (
+        (typeof projectedAreaRatio === "number" && projectedAreaRatio >= targetAreaGoal * 0.8) ||
+        zoomExhausted
+      )
+  );
+  if (status.targetFocused === false && activeEntityId) {
+    reasons.targetFocused = "The active target is not yet sufficiently centered or readable.";
+  }
+
+  const planMeasurementNeeded =
+    Boolean(readiness) ||
+    hasConcern(context, "clearance") ||
+    hasConcern(context, "dimensions") ||
+    hasConcern(context, "landing") ||
+    hasConcern(context, "slope") ||
+    hasConcern(context, "egress_width") ||
+    hasConcern(context, "object_clearance") ||
+    hasConcern(context, "accessibility");
+  status.planMeasurementNeeded = planMeasurementNeeded;
+  status.planMeasurementReady = planMeasurementNeeded
+    ? Boolean(
+        readiness?.evidenceBundle?.topMeasurementViewReady ||
+          readiness?.measurableLikely ||
+          (
+            context.viewPreset === "top" &&
+            (context.planCut?.enabled || !context.floorContext?.missingLikely)
+          )
+      )
+    : false;
+  if (planMeasurementNeeded && status.planMeasurementReady === false) {
+    reasons.planMeasurementReady = "A decisive plan-oriented measurement view is not ready yet.";
+  }
+
+  const contextViewNeeded =
+    hasConcern(context, "opening_direction") ||
+    hasConcern(context, "hardware_side") ||
+    hasConcern(context, "line_of_sight") ||
+    hasConcern(context, "headroom") ||
+    hasConcern(context, "handrail") ||
+    hasConcern(context, "landing") ||
+    boolFromRequirement(decision?.evidenceRequirementsStatus?.contextViewNeeded) === true;
+  status.contextViewNeeded = contextViewNeeded;
+  status.contextViewReady = contextViewNeeded
+    ? Boolean(
+        readiness?.evidenceBundle?.contextConfirmViewReady ||
+          (context.viewPreset && context.viewPreset !== "top" && decision?.visibility?.isRuleTargetVisible)
+      )
+    : false;
+  if (contextViewNeeded && status.contextViewReady === false) {
+    reasons.contextViewReady = "A confirming context or side view is still missing.";
+  }
+
+  status.obstructionContextNeeded = Boolean(
+    hasConcern(context, "clearance") ||
+      hasConcern(context, "object_clearance") ||
+      missingEvidence.some((item) => item.includes("occl") || item.includes("obstruct") || item.includes("hidden")) ||
+      boolFromRequirement(decision?.evidenceRequirementsStatus?.obstructionContextNeeded) === true
+  );
+  status.occlusionProblem = Boolean(
+    decision?.visibility?.occlusionAssessment === "HIGH" ||
+      (typeof nav?.occlusionRatio === "number" && nav.occlusionRatio >= 0.45) ||
+      context.floorContext?.missingLikely
+  );
+  if (status.occlusionProblem) {
+    reasons.occlusionProblem = "Occlusion or missing floor context is limiting the current evidence.";
+  }
+
+  status.dimensionReferenceNeeded = Boolean(
+    planMeasurementNeeded ||
+      hasConcern(context, "dimensions") ||
+      hasConcern(context, "headroom") ||
+      boolFromRequirement(decision?.evidenceRequirementsStatus?.dimensionReferenceNeeded) === true
+  );
+
+  status.regulatoryClauseNeeded = Boolean(
+    decision?.followUp?.request === "WEB_FETCH" ||
+      missingEvidence.some((item) =>
+        item.includes("clause") ||
+        item.includes("section") ||
+        item.includes("threshold") ||
+        item.includes("standard") ||
+        item.includes("edition")
+      ) ||
+      boolFromRequirement(decision?.evidenceRequirementsStatus?.regulatoryClauseNeeded) === true
+  );
+  if (status.regulatoryClauseNeeded) {
+    reasons.regulatoryClauseNeeded = "The rule threshold or clause text is still missing or underspecified.";
+  }
+
+  status.lowNoveltyOrRepeatedView = Boolean(
+    context.snapshotNovelty?.redundancyWarning ||
+      (context.snapshotNovelty &&
+        context.snapshotNovelty.approximateNoveltyScore <
+          getPrototypeRuntimeSettings().snapshotNoveltyRedundancyThreshold) ||
+      (stats && stats.repeatedWorkflowStreak >= 2)
+  );
+  if (status.lowNoveltyOrRepeatedView) {
+    reasons.lowNoveltyOrRepeatedView = "Recent evidence changes were low-novelty or repetitive.";
+  }
+
+  status.bothSidesOrSurroundingsNeeded = Boolean(
+    hasConcern(context, "clearance") ||
+      hasConcern(context, "object_clearance") ||
+      hasConcern(context, "opening_direction") ||
+      boolFromRequirement(decision?.evidenceRequirementsStatus?.bothSidesOrSurroundingsNeeded) === true
+  );
+
+  return makeEvidenceRequirementsSnapshot(
+    {
+      ...status,
+      ...(decision?.evidenceRequirementsStatus ?? {}),
+    },
+    reasons
+  );
+}
+
+type FollowUpCandidate = {
+  followUp?: VlmFollowUp;
+  source: FollowUpDecisionSource;
+  reason: string;
+};
+
+function evaluateSemanticFollowUpCandidate(args: {
+  followUp?: VlmFollowUp;
+  context: EvidenceContext;
+  semanticTracker?: EntitySemanticEvidenceTracker;
+  semanticProgress?: SemanticEvidenceProgress;
+  sameEntityHistory?: EvidenceItem[];
+}): { allowed: boolean; family?: FollowUpActionFamily; suppressionReason?: string } {
+  const { followUp, context, semanticTracker, semanticProgress, sameEntityHistory } = args;
+  if (!followUp) return { allowed: true };
+  const family = classifyFollowUpActionFamily(followUp);
+  if (!family || !semanticTracker) return { allowed: true, family };
+
+  const count = Number(semanticTracker.triedActionFamilyCounts[family] ?? 0);
+  const maxBudget =
+    family === "restore" || family === "reset"
+      ? undefined
+      : SEMANTIC_FOLLOW_UP_FAMILY_BUDGETS[
+          family as keyof typeof SEMANTIC_FOLLOW_UP_FAMILY_BUDGETS
+        ];
+  const novelty = context.snapshotNovelty;
+  const lowVisualNovelty = Boolean(
+    novelty &&
+      (novelty.redundancyWarning ||
+        novelty.approximateNoveltyScore < getPrototypeRuntimeSettings().snapshotNoveltyRedundancyThreshold)
+  );
+  const lowSemanticProgress = (semanticProgress?.semanticProgressScore ?? 1) <= 0.15;
+  const recurrenceWarning = Boolean(semanticProgress?.sameEntityRecurrenceWarning);
+  const semanticStagnation = Boolean(
+    semanticProgress?.semanticStagnationWarning || semanticTracker.repeatedEvidenceGapCount >= 2
+  );
+  const prospectiveRecurrence = sameEntityHistory?.length
+    ? computeProspectiveSameEntityRecurrenceMetrics({
+        followUp,
+        context,
+        history: sameEntityHistory,
+      })
+    : undefined;
+  const triedFamilyAlready = semanticTracker.triedActionFamilies.includes(family);
+  const stagnatedFamilyAlready = semanticTracker.stagnatedActionFamilies.includes(family);
+  const viewCycleFamily = family === "plan_measurement" || family === "context_angle";
+
+  if (typeof maxBudget === "number" && count >= maxBudget) {
+    return {
+      allowed: false,
+      family,
+      suppressionReason: `Action family ${family} reached its per-entity budget (${count}/${maxBudget}).`,
+    };
+  }
+
+  if (semanticStagnation && stagnatedFamilyAlready) {
+    return {
+      allowed: false,
+      family,
+      suppressionReason: `Action family ${family} already failed to reduce the same evidence gaps for this entity.`,
+    };
+  }
+
+  if (semanticStagnation && viewCycleFamily && triedFamilyAlready) {
+    return {
+      allowed: false,
+      family,
+      suppressionReason: `Semantic stagnation blocked another ${family} step because repeated view-family cycling did not reduce the missing evidence gaps.`,
+    };
+  }
+
+  if (recurrenceWarning && lowSemanticProgress && viewCycleFamily && triedFamilyAlready) {
+    return {
+      allowed: false,
+      family,
+      suppressionReason:
+        `Same-entity recurrence score ${(semanticProgress?.sameEntityRecurrenceScore ?? 0).toFixed(2)} ` +
+        `blocked another ${family} step because the current view state closely matches a recent semantically unproductive state.`,
+    };
+  }
+
+  if (
+    prospectiveRecurrence?.sameEntityRecurrenceWarning &&
+    lowSemanticProgress &&
+    viewCycleFamily &&
+    triedFamilyAlready
+  ) {
+    return {
+      allowed: false,
+      family,
+      suppressionReason:
+        `Projected same-entity recurrence score ${(prospectiveRecurrence.sameEntityRecurrenceScore ?? 0).toFixed(2)} ` +
+        `blocked ${followUp.request} before execution because it would recreate a recent semantically unproductive view state ` +
+        `${prospectiveRecurrence.sameEntityRecurrenceComparedSnapshotId ? `from ${prospectiveRecurrence.sameEntityRecurrenceComparedSnapshotId}` : ""}.`,
+    };
+  }
+
+  if (lowVisualNovelty && lowSemanticProgress && semanticTracker.lastActionFamily === family) {
+    return {
+      allowed: false,
+      family,
+      suppressionReason: `Low visual novelty and low semantic progress suppressed another ${family} step for the current entity.`,
+    };
+  }
+
+  return { allowed: true, family };
+}
+
+function pushUniqueFollowUpCandidate(
+  candidates: FollowUpCandidate[],
+  candidate: FollowUpCandidate | undefined
+) {
+  if (!candidate) return;
+  const serializeFollowUp = (followUp?: VlmFollowUp) =>
+    followUp ? `${followUp.request}|${stableJson((followUp as any).params ?? null)}` : "none";
+  const key = serializeFollowUp(candidate.followUp);
+  const exists = candidates.some((entry) => serializeFollowUp(entry.followUp) === key);
+  if (!exists) candidates.push(candidate);
+}
+
+function buildEvidenceRequirementFollowUpCandidates(args: {
+  decision: VlmDecision;
+  context: EvidenceContext;
+  lastViewPreset: StartPosePreset | null;
+  nav?: NavMetrics;
+  evidenceRequirements: EvidenceRequirementsSnapshot;
+}): FollowUpCandidate[] {
+  const { decision, context, lastViewPreset, nav, evidenceRequirements } = args;
+  const advisory = decision.followUp;
+  const targetClass = context.taskGraph?.activeEntity?.class ?? context.taskGraph?.primaryClass;
+  const activeEntityId = context.activeEntityId ?? context.taskGraph?.activeEntity?.id;
+  const activeStoreyId = context.scope?.storeyId ?? context.planCut?.storeyId ?? context.taskGraph?.activeStoreyId;
+  const status = evidenceRequirements.status;
+  const followUpSourceFromDecision = decision.meta?.followUpSource;
+  const orbitAvailable =
+    Number(context.followUpBudget?.orbitRemainingForActiveEntity ?? 0) > 0;
+  const canZoom = !nav?.zoomPotentialExhausted;
+  const candidates: FollowUpCandidate[] = [];
+
+  if (status.regulatoryClauseNeeded && advisory?.request === "WEB_FETCH") {
+    pushUniqueFollowUpCandidate(candidates, {
+      followUp: advisory,
+      source: followUpSourceFromDecision === "provider_override" ? "provider_override" : "vlm_advisory",
+      reason: "Regulatory clause text is still missing, so the advisory web fetch is retained.",
+    });
+  }
+
+  if (status.targetVisible === false) {
+    if (activeStoreyId && context.scope?.storeyId !== activeStoreyId) {
+      pushUniqueFollowUpCandidate(candidates, {
+        followUp: { request: "ISOLATE_STOREY", params: { storeyId: activeStoreyId } },
+        source: "runtime_planner",
+        reason: "The target is not yet visible, so the runtime narrows the scope to the active storey.",
+      });
+    }
+    if (targetClass && !context.isolatedCategories?.some((cat) => cat.toLowerCase() === targetClass.toLowerCase())) {
+      pushUniqueFollowUpCandidate(candidates, {
+        followUp: { request: "ISOLATE_CATEGORY", params: { category: targetClass } },
+        source: "runtime_planner",
+        reason: "The target is not yet visible, so the runtime narrows the visible category set.",
+      });
+    }
+    if (activeEntityId && !context.highlightedIds?.includes(activeEntityId)) {
+      pushUniqueFollowUpCandidate(candidates, {
+        followUp: { request: "HIGHLIGHT_IDS", params: { ids: [activeEntityId], style: "primary" } },
+        source: "runtime_planner",
+        reason: "The target is not yet clearly visible, so the runtime highlights the active entity.",
+      });
+    }
+  }
+
+  if (status.targetFocused === false && activeEntityId) {
+    if (!context.highlightedIds?.includes(activeEntityId)) {
+      pushUniqueFollowUpCandidate(candidates, {
+        followUp: { request: "HIGHLIGHT_IDS", params: { ids: [activeEntityId], style: "primary" } },
+        source: "runtime_planner",
+        reason: "The target is visible but not yet focused, so the runtime highlights the active entity.",
+      });
+    }
+    if (canZoom) {
+      pushUniqueFollowUpCandidate(candidates, {
+        followUp: { request: "ZOOM_IN", params: { factor: 1.15 } },
+        source: "runtime_planner",
+        reason: "The target is visible but not yet readable enough, so the runtime requests a tighter view.",
+      });
+    }
+  }
+
+  if (status.planMeasurementNeeded && status.planMeasurementReady === false) {
+    if (lastViewPreset !== "top") {
+      pushUniqueFollowUpCandidate(candidates, {
+        followUp: { request: "TOP_VIEW" },
+        source: "runtime_planner",
+        reason: "Plan-based measurement evidence is needed but not ready, so the runtime moves to a top view first.",
+      });
+    }
+    if (activeStoreyId && (!context.planCut?.enabled || context.floorContext?.missingLikely)) {
+      pushUniqueFollowUpCandidate(candidates, {
+        followUp: {
+          request: "SET_STOREY_PLAN_CUT",
+          params: { storeyId: activeStoreyId, offsetFromFloor: 1.2, mode: "WORLD_UP" },
+        },
+        source: "runtime_planner",
+        reason: "Plan-based measurement evidence is needed but local floor context is not ready, so the runtime prepares a storey plan cut.",
+      });
+    }
+    if (!context.planCut?.enabled) {
+      pushUniqueFollowUpCandidate(candidates, {
+        followUp: { request: "SET_PLAN_CUT", params: { height: 1.2, mode: "WORLD_UP" } },
+        source: "runtime_planner",
+        reason: "Plan-based measurement evidence is needed but not readable yet, so the runtime enables a plan cut.",
+      });
+    }
+  }
+
+  if (status.obstructionContextNeeded && status.occlusionProblem) {
+    if (targetClass && (!context.isolatedCategories?.length || !context.isolatedCategories.some((cat) => cat.toLowerCase() === targetClass.toLowerCase()))) {
+      pushUniqueFollowUpCandidate(candidates, {
+        followUp: { request: "ISOLATE_CATEGORY", params: { category: targetClass } },
+        source: "runtime_planner",
+        reason: "Occlusion is limiting the target evidence, so the runtime narrows visible geometry to the relevant category.",
+      });
+    }
+    if (status.contextViewNeeded && orbitAvailable) {
+      pushUniqueFollowUpCandidate(candidates, {
+        followUp: {
+          request: "ORBIT",
+          params: {
+            yawDegrees: lastViewPreset === "top" ? 45 : 25,
+            pitchDegrees: lastViewPreset === "top" ? -30 : 0,
+            reason: "Need a less occluded context confirmation view.",
+          },
+        },
+        source: "runtime_planner",
+        reason: "Occlusion is still limiting the evidence, so the runtime asks for a bounded alternate context angle.",
+      });
+    }
+  }
+
+  if (status.contextViewNeeded && status.contextViewReady === false) {
+    pushUniqueFollowUpCandidate(candidates, {
+      followUp: orbitAvailable
+        ? {
+            request: "ORBIT",
+            params: {
+              yawDegrees: lastViewPreset === "top" ? 45 : 25,
+              pitchDegrees: lastViewPreset === "top" ? -30 : 0,
+              reason: "Need a confirming context view for the active target.",
+            },
+          }
+        : { request: "NEW_VIEW", params: { reason: "Need a different context angle for the active target." } },
+      source: "runtime_planner",
+      reason: orbitAvailable
+        ? "A confirming context view is still missing, so the runtime requests one bounded orbit."
+        : "A confirming context view is still missing, so the runtime requests a generic new view.",
+    });
+  }
+
+  if (advisory) {
+    pushUniqueFollowUpCandidate(candidates, {
+      followUp: advisory,
+      source: followUpSourceFromDecision === "provider_override" ? "provider_override" : "vlm_advisory",
+      reason:
+        followUpSourceFromDecision === "provider_override"
+          ? "No stronger runtime evidence-state action was required, so the provider-level advisory was preserved."
+          : "No stronger runtime evidence-state action was required, so the VLM advisory was preserved.",
+    });
+  }
+
+  if (!candidates.length) {
+    candidates.push({
+      followUp: undefined,
+      source: "vlm_advisory",
+      reason: "No decisive additional follow-up was justified by the generalized evidence requirements.",
+    });
+  }
+
+  return candidates;
+}
+
+function chooseFollowUpFromEvidenceRequirements(args: {
+  decision: VlmDecision;
+  context: EvidenceContext;
+  lastViewPreset: StartPosePreset | null;
+  nav?: NavMetrics;
+  stats?: EntityEvidenceStat;
+  evidenceRequirements?: EvidenceRequirementsSnapshot;
+  semanticTracker?: EntitySemanticEvidenceTracker;
+  semanticProgress?: SemanticEvidenceProgress;
+  sameEntityHistory?: EvidenceItem[];
+}): FollowUpPlan {
+  const { decision, context, lastViewPreset, nav, stats, semanticTracker, semanticProgress, sameEntityHistory } = args;
+  const evidenceRequirements =
+    args.evidenceRequirements ?? deriveRuntimeEvidenceRequirements({ context, decision, nav, stats });
+  const candidates = buildEvidenceRequirementFollowUpCandidates({
+    decision,
+    context,
+    lastViewPreset,
+    nav,
+    evidenceRequirements,
+  });
+  let suppressedFollowUp: SuppressedFollowUpTrace | undefined;
+
+  for (const candidate of candidates) {
+    const evaluation = evaluateSemanticFollowUpCandidate({
+      followUp: candidate.followUp,
+      context,
+      semanticTracker,
+      semanticProgress,
+      sameEntityHistory,
+    });
+    if (evaluation.allowed) {
+      return {
+        followUp: candidate.followUp,
+        source: candidate.source,
+        reason: candidate.reason,
+        evidenceRequirements,
+        suppressedFollowUp,
+      };
+    }
+    if (!suppressedFollowUp && candidate.followUp) {
+      suppressedFollowUp = {
+        request: candidate.followUp.request,
+        family: evaluation.family,
+        reason: evaluation.suppressionReason ?? "Suppressed by semantic anti-cycle logic.",
+      };
+    }
+  }
+
+  const finalizationReason =
+    (semanticProgress?.semanticStagnationWarning || semanticProgress?.sameEntityRecurrenceWarning) &&
+    semanticProgress.normalizedEvidenceGaps.length
+      ? buildSemanticStagnationFinalizationReason(semanticProgress)
+      : suppressedFollowUp?.reason ??
+        "No decisive additional follow-up was justified by the generalized evidence requirements.";
+
+  return {
+    followUp: undefined,
+    source: "anti_repeat",
+    reason: finalizationReason,
+    evidenceRequirements,
+    suppressedFollowUp,
+    finalizationReason,
+  };
+}
+
+// Paper-inspired but intentionally lightweight thresholds:
+// the goal is to reward materially different evidence views while keeping
+// repeated same-entity snapshots deterministic and easy to audit.
+function computeSnapshotNoveltyMetrics(args: {
+  current: SnapshotNoveltyComparable;
+  previous?: SnapshotNoveltyComparable;
+  previousSameEntity?: SnapshotNoveltyComparable;
+}): SnapshotNoveltyMetrics {
+  const { current, previous, previousSameEntity } = args;
+  const baseline = previousSameEntity ?? previous;
+  const sameEntityAsPrevious = Boolean(
+    previous?.activeEntityId &&
+      current.activeEntityId &&
+      previous.activeEntityId === current.activeEntityId
+  );
+
+  if (!baseline) {
+    return {
+      sameEntityAsPrevious,
+      viewPresetChanged: true,
+      cameraMoved: true,
+      yawPitchChanged: true,
+      planCutChanged: true,
+      highlightedIdsChanged: true,
+      scopeChanged: true,
+      approximateNoveltyScore: 1,
+      redundancyWarning: false,
+    };
+  }
+
+  const currentViewDistance = distance3d(current.cameraPose.eye, current.cameraPose.target);
+  const baselineViewDistance = distance3d(baseline.cameraPose.eye, baseline.cameraPose.target);
+  const representativeViewDistance = Math.max(currentViewDistance, baselineViewDistance, 1);
+  const cameraMoveThreshold = Math.max(0.35, representativeViewDistance * 0.05);
+  const eyeDelta = distance3d(current.cameraPose.eye, baseline.cameraPose.eye);
+  const targetDelta = distance3d(current.cameraPose.target, baseline.cameraPose.target);
+  const cameraMoved = eyeDelta >= cameraMoveThreshold || targetDelta >= cameraMoveThreshold * 0.5;
+
+  const currentAngles = getYawPitchDegrees(current.cameraPose);
+  const baselineAngles = getYawPitchDegrees(baseline.cameraPose);
+  const yawDeltaDeg =
+    currentAngles && baselineAngles
+      ? getSmallestAngleDeltaDegrees(currentAngles.yawDeg, baselineAngles.yawDeg)
+      : 0;
+  const pitchDeltaDeg =
+    currentAngles && baselineAngles
+      ? Math.abs(currentAngles.pitchDeg - baselineAngles.pitchDeg)
+      : 0;
+  const yawPitchChanged = yawDeltaDeg >= 12 || pitchDeltaDeg >= 8;
+
+  const viewPresetChanged = (current.viewPreset ?? null) !== (baseline.viewPreset ?? null);
+  const planCutChanged = normalizePlanCutKey(current.planCut) !== normalizePlanCutKey(baseline.planCut);
+  const highlightedIdsChanged = !sameStringArray(current.highlightedIds, baseline.highlightedIds);
+  const scopeChanged = !sameScope(current.scope, baseline.scope);
+
+  const projectedAreaDelta =
+    typeof current.nav?.projectedAreaRatio === "number" && typeof baseline.nav?.projectedAreaRatio === "number"
+      ? Math.abs(current.nav.projectedAreaRatio - baseline.nav.projectedAreaRatio)
+      : undefined;
+  const occlusionDelta =
+    typeof current.nav?.occlusionRatio === "number" && typeof baseline.nav?.occlusionRatio === "number"
+      ? Math.abs(current.nav.occlusionRatio - baseline.nav.occlusionRatio)
+      : undefined;
+  const projectedAreaChanged =
+    typeof projectedAreaDelta === "number" ? projectedAreaDelta >= 0.05 : undefined;
+  const occlusionChanged = typeof occlusionDelta === "number" ? occlusionDelta >= 0.08 : undefined;
+
+  let approximateNoveltyScore = 0;
+  if (viewPresetChanged) approximateNoveltyScore += 0.18;
+  if (cameraMoved) approximateNoveltyScore += 0.18;
+  if (yawPitchChanged) approximateNoveltyScore += 0.18;
+  if (planCutChanged) approximateNoveltyScore += 0.16;
+  if (highlightedIdsChanged) approximateNoveltyScore += 0.1;
+  if (scopeChanged) approximateNoveltyScore += 0.1;
+  if (projectedAreaChanged) approximateNoveltyScore += 0.06;
+  if (occlusionChanged) approximateNoveltyScore += 0.04;
+  if (baseline === previousSameEntity && current.activeEntityId && baseline.activeEntityId === current.activeEntityId) {
+    approximateNoveltyScore += 0.04;
+  }
+
+  approximateNoveltyScore = clamp01(Number(approximateNoveltyScore.toFixed(2)));
+
+  const redundancyWarning = Boolean(
+    baseline.activeEntityId &&
+      current.activeEntityId &&
+      baseline.activeEntityId === current.activeEntityId &&
+      approximateNoveltyScore <= getPrototypeRuntimeSettings().snapshotNoveltyRedundancyThreshold
+  );
+
+  return {
+    comparedToSnapshotId: baseline.snapshotId,
+    comparedEntityId: baseline.activeEntityId,
+    sameEntityAsPrevious,
+    viewPresetChanged,
+    cameraMoved,
+    yawPitchChanged,
+    planCutChanged,
+    highlightedIdsChanged,
+    scopeChanged,
+    projectedAreaChanged,
+    occlusionChanged,
+    approximateNoveltyScore,
+    redundancyWarning,
+  };
+}
 
 export type DeterministicStart =
   | { enabled: false }
@@ -184,6 +1672,7 @@ export function createComplianceRunner(params: {
   viewerApi: {
     hasModelLoaded: () => boolean;
     resetVisibility: () => Promise<void>;
+    isolate?: (map: Record<string, Set<number>>) => Promise<void>;
     setPresetView: (preset: StartPosePreset, smooth?: boolean) => Promise<void>;
     setCameraPose: (pose: CameraPose, smooth?: boolean) => Promise<void>;
     getCameraPose: () => Promise<CameraPose>;
@@ -200,6 +1689,7 @@ export function createComplianceRunner(params: {
 
     hideCategory?: (category: string) => Promise<boolean>;
     showCategory?: (category: string) => Promise<boolean>;
+    getProperties?: (objectId: string) => Promise<Record<string, unknown> | null>;
     getRendererDomElement?: () => HTMLCanvasElement;
 
     highlightIds?: (ids: string[], style?: "primary" | "warn") => Promise<void>;
@@ -285,7 +1775,9 @@ evidenceViews: {
   let lastViewPreset: StartPosePreset | null = null;
   let currentTaskGraph: ReturnType<typeof createTaskGraph> | null = null;
   let navigationBookmarks: NavigationBookmark[] = [];
+  let navigationActionLog: NavigationAction[] = [];
   let entityEvidenceStats = new Map<string, EntityEvidenceStat>();
+  let entitySemanticTrackers = new Map<string, EntitySemanticEvidenceTracker>();
 
   // one-rule-per-project: single active run id
   let activeRunId: string | null = null;
@@ -422,6 +1914,320 @@ function buildWorkflowSignature(args: {
   });
 }
 
+function clonePlanCutState(planCut: PlanCutStateTrace | undefined): PlanCutStateTrace | undefined {
+  return planCut ? { ...planCut } : undefined;
+}
+
+function toPlanCutTrace(planCut: any): PlanCutStateTrace | undefined {
+  if (!planCut || typeof planCut !== "object") return undefined;
+  return {
+    enabled: typeof planCut.enabled === "boolean" ? planCut.enabled : undefined,
+    height: typeof planCut.height === "number" ? planCut.height : undefined,
+    absoluteHeight: typeof planCut.absoluteHeight === "number" ? planCut.absoluteHeight : undefined,
+    thickness: typeof planCut.thickness === "number" ? planCut.thickness : undefined,
+    mode: typeof planCut.mode === "string" ? planCut.mode : undefined,
+    source: typeof planCut.source === "string" ? planCut.source : undefined,
+    storeyId: typeof planCut.storeyId === "string" ? planCut.storeyId : undefined,
+  };
+}
+
+async function captureNavigationStateTrace(): Promise<NavigationStateTrace> {
+  const pose = await viewerApi.getCameraPose();
+  const planCut = (viewerApi as any).getPlanCutState ? await (viewerApi as any).getPlanCutState() : undefined;
+  return {
+    cameraPose: pose
+      ? {
+          eye: { ...pose.eye },
+          target: { ...pose.target },
+        }
+      : undefined,
+    highlightedIds: [...lastHighlightedIds],
+    planCut: toPlanCutTrace(planCut),
+  };
+}
+
+function cloneNavigationStateTrace(
+  state: NavigationStateTrace | undefined
+): NavigationStateTrace | undefined {
+  if (!state) return undefined;
+  return {
+    cameraPose: state.cameraPose
+      ? {
+          eye: { ...state.cameraPose.eye },
+          target: { ...state.cameraPose.target },
+        }
+      : undefined,
+    highlightedIds: [...(state.highlightedIds ?? [])],
+    planCut: clonePlanCutState(state.planCut),
+  };
+}
+
+async function recordNavigationControlEvent(args: {
+  step: number;
+  requestedFollowUp?: VlmFollowUp;
+  executedFollowUp?: VlmFollowUp;
+  activeEntityId?: string;
+  activeStoreyId?: string;
+  note: string;
+  evidenceRequirementsBeforeAction?: EvidenceRequirementsSnapshot;
+  decisionSource?: FollowUpDecisionSource;
+  snapshotNoveltyBeforeAction?: SnapshotNoveltyMetrics;
+  semanticEvidenceProgress?: SemanticEvidenceProgress;
+  suppressedFollowUp?: SuppressedFollowUpTrace;
+  finalizationReason?: string;
+}) {
+  const {
+    step,
+    requestedFollowUp,
+    executedFollowUp,
+    activeEntityId,
+    activeStoreyId,
+    note,
+    evidenceRequirementsBeforeAction,
+    decisionSource,
+    snapshotNoveltyBeforeAction,
+    semanticEvidenceProgress,
+    suppressedFollowUp,
+    finalizationReason,
+  } = args;
+  const state = await captureNavigationStateTrace();
+  const actionFamily = classifyFollowUpActionFamily(executedFollowUp ?? requestedFollowUp);
+  navigationActionLog.push({
+    step,
+    action: executedFollowUp?.request ?? requestedFollowUp?.request ?? "NEW_VIEW",
+    requestedAction: requestedFollowUp?.request,
+    activeEntityId,
+    activeStoreyId,
+    params: ((executedFollowUp as any)?.params ?? undefined) as Record<string, unknown> | undefined,
+    requestedParams: ((requestedFollowUp as any)?.params ?? undefined) as Record<string, unknown> | undefined,
+    reason: note,
+    timestamp: new Date().toISOString(),
+    success: false,
+    noOpReason: note,
+    beforeState: cloneNavigationStateTrace(state),
+    afterState: cloneNavigationStateTrace(state),
+    evidenceRequirementsBeforeAction,
+    chosenFollowUp: executedFollowUp
+      ? {
+          request: executedFollowUp.request,
+          params: ((executedFollowUp as any)?.params ?? undefined) as Record<string, unknown> | undefined,
+        }
+      : undefined,
+    decisionSource,
+    decisionReason: note,
+    evaluationSummary: note,
+    snapshotNoveltyBeforeAction,
+    semanticEvidenceProgress,
+    actionFamily,
+    suppressedFollowUp: cloneSuppressedFollowUp(suppressedFollowUp),
+    finalizationReason,
+  });
+}
+
+function summarizeNavigationEvaluation(args: {
+  requestedAction?: VlmFollowUp["request"];
+  executedAction?: VlmFollowUp["request"];
+  activeEntityId?: string;
+  activeStoreyId?: string;
+  success: boolean;
+  reason?: string;
+  nav?: NavMetrics;
+  beforeState?: NavigationStateTrace;
+  afterState?: NavigationStateTrace;
+  controlNote?: string;
+  evidenceRequirementsBeforeAction?: EvidenceRequirementsSnapshot;
+  decisionSource?: FollowUpDecisionSource;
+  decisionReason?: string;
+  snapshotNoveltyBeforeAction?: SnapshotNoveltyMetrics;
+  semanticEvidenceProgress?: SemanticEvidenceProgress;
+  suppressedFollowUp?: SuppressedFollowUpTrace;
+}) {
+  const {
+    requestedAction,
+    executedAction,
+    activeEntityId,
+    activeStoreyId,
+    success,
+    reason,
+    nav,
+    beforeState,
+    afterState,
+    controlNote,
+    evidenceRequirementsBeforeAction,
+    decisionSource,
+    decisionReason,
+    snapshotNoveltyBeforeAction,
+    semanticEvidenceProgress,
+    suppressedFollowUp,
+  } = args;
+  const scope = activeEntityId
+    ? `entity ${activeEntityId}`
+    : activeStoreyId
+      ? `storey ${activeStoreyId}`
+      : "current scope";
+  const normalized = requestedAction && executedAction && requestedAction !== executedAction
+    ? `normalized ${requestedAction} to ${executedAction}`
+    : `executed ${executedAction ?? requestedAction ?? "no-followup"}`;
+  const areaRatio = typeof nav?.projectedAreaRatio === "number" ? nav.projectedAreaRatio.toFixed(3) : null;
+  const occlusion = typeof nav?.occlusionRatio === "number" ? nav.occlusionRatio.toFixed(3) : null;
+  const beforeHighlights = beforeState?.highlightedIds?.length ?? 0;
+  const afterHighlights = afterState?.highlightedIds?.length ?? 0;
+  const beforePlanCut = beforeState?.planCut?.enabled ? "on" : "off";
+  const afterPlanCut = afterState?.planCut?.enabled ? "on" : "off";
+  const evidenceSummary = evidenceRequirementsBeforeAction
+    ? Object.entries(evidenceRequirementsBeforeAction.status)
+        .filter(([, value]) => value === true)
+        .map(([key]) => key)
+        .join(", ")
+    : "";
+  return [
+    `${scope}: ${normalized}.`,
+    success ? "Outcome: success." : `Outcome: no-op${reason ? ` (${reason})` : ""}.`,
+    `Highlights ${beforeHighlights}->${afterHighlights}; plan cut ${beforePlanCut}->${afterPlanCut}.`,
+    areaRatio ? `Target area ${areaRatio}.` : "",
+    occlusion ? `Occlusion ${occlusion}.` : "",
+    decisionSource ? `Decision source: ${decisionSource}.` : "",
+    decisionReason ? `Decision reason: ${decisionReason}` : "",
+    evidenceSummary ? `Evidence requirements before action: ${evidenceSummary}.` : "",
+    snapshotNoveltyBeforeAction
+      ? `Visual novelty ${snapshotNoveltyBeforeAction.approximateNoveltyScore.toFixed(2)}${snapshotNoveltyBeforeAction.redundancyWarning ? " (redundant)" : ""}.`
+      : "",
+    semanticEvidenceProgress
+      ? `Semantic progress ${semanticEvidenceProgress.semanticProgressScore.toFixed(2)}; unchanged gaps ${semanticEvidenceProgress.unchangedGapCount}.`
+      : "",
+    semanticEvidenceProgress?.sameEntityRecurrenceScore
+      ? `Same-entity recurrence ${semanticEvidenceProgress.sameEntityRecurrenceScore.toFixed(2)}${semanticEvidenceProgress.sameEntityRecurrenceComparedSnapshotId ? ` vs ${semanticEvidenceProgress.sameEntityRecurrenceComparedSnapshotId}` : ""}.`
+      : "",
+    suppressedFollowUp ? `Suppressed follow-up: ${suppressedFollowUp.request}.` : "",
+    nav?.zoomPotentialExhausted ? "Zoom exhausted." : "",
+    controlNote ? `Control: ${controlNote}` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+}
+
+// Paper-inspired deterministic ReAct-style navigation evaluation:
+// every executed follow-up gets a before/after viewer-state audit record
+// without issuing an additional VLM call.
+async function executeFollowUpWithEvaluation(params: {
+  step: number;
+  requestedFollowUp: VlmFollowUp | undefined;
+  executedFollowUp: VlmFollowUp | undefined;
+  previousActionReason?: string | null;
+  previousNav?: NavMetrics;
+  controlNote?: string;
+  evidenceRequirementsBeforeAction?: EvidenceRequirementsSnapshot;
+  decisionSource?: FollowUpDecisionSource;
+  decisionReason?: string;
+  snapshotNoveltyBeforeAction?: SnapshotNoveltyMetrics;
+  semanticEvidenceProgress?: SemanticEvidenceProgress;
+  suppressedFollowUp?: SuppressedFollowUpTrace;
+}) {
+  const {
+    step,
+    requestedFollowUp,
+    executedFollowUp,
+    previousActionReason,
+    previousNav,
+    controlNote,
+    evidenceRequirementsBeforeAction,
+    decisionSource,
+    decisionReason,
+    snapshotNoveltyBeforeAction,
+    semanticEvidenceProgress,
+    suppressedFollowUp,
+  } = params;
+  const focus = currentTaskGraph ? getTaskGraphFocus(currentTaskGraph) : null;
+  const beforeState = await captureNavigationStateTrace();
+  const activeEntityId = focus?.activeEntityId ?? lastSelectedId ?? beforeState.highlightedIds?.[0];
+  const activeStoreyId =
+    lastScope.storeyId ??
+    beforeState.planCut?.storeyId ??
+    focus?.activeStoreyId ??
+    undefined;
+  const actionFamily = classifyFollowUpActionFamily(executedFollowUp ?? requestedFollowUp);
+  const acted = await executeFollowUp(executedFollowUp, previousActionReason, previousNav);
+  const afterState = await captureNavigationStateTrace();
+  const nav = (acted as any).nav as NavMetrics | undefined;
+  navigationActionLog.push({
+    step,
+    action: executedFollowUp?.request ?? requestedFollowUp?.request ?? "NEW_VIEW",
+    requestedAction: requestedFollowUp?.request,
+    activeEntityId,
+    activeStoreyId,
+    params: ((executedFollowUp as any)?.params ?? undefined) as Record<string, unknown> | undefined,
+    requestedParams: ((requestedFollowUp as any)?.params ?? undefined) as Record<string, unknown> | undefined,
+    reason: acted.reason,
+    timestamp: new Date().toISOString(),
+    success: acted.didSomething,
+    noOpReason: acted.didSomething ? undefined : acted.reason,
+    beforeState: {
+      cameraPose: beforeState.cameraPose
+        ? { eye: { ...beforeState.cameraPose.eye }, target: { ...beforeState.cameraPose.target } }
+        : undefined,
+      highlightedIds: [...(beforeState.highlightedIds ?? [])],
+      planCut: clonePlanCutState(beforeState.planCut),
+    },
+    afterState: {
+      cameraPose: afterState.cameraPose
+        ? { eye: { ...afterState.cameraPose.eye }, target: { ...afterState.cameraPose.target } }
+        : undefined,
+      highlightedIds: [...(afterState.highlightedIds ?? [])],
+      planCut: clonePlanCutState(afterState.planCut),
+    },
+    navigationMetrics: nav
+      ? {
+          targetAreaRatio: nav.projectedAreaRatio,
+          projectedAreaRatio: nav.projectedAreaRatio,
+          occlusionRatio: nav.occlusionRatio,
+          convergenceScore: nav.convergenceScore,
+          targetAreaGoal: nav.targetAreaGoal,
+          zoomExhausted: nav.zoomPotentialExhausted,
+          success: nav.success,
+          reason: nav.reason,
+        }
+      : undefined,
+    evidenceRequirementsBeforeAction,
+    chosenFollowUp: executedFollowUp
+      ? {
+          request: executedFollowUp.request,
+          params: ((executedFollowUp as any)?.params ?? undefined) as Record<string, unknown> | undefined,
+        }
+      : undefined,
+    decisionSource,
+    decisionReason,
+    evaluationSummary: summarizeNavigationEvaluation({
+      requestedAction: requestedFollowUp?.request,
+      executedAction: executedFollowUp?.request,
+      activeEntityId,
+      activeStoreyId,
+      success: acted.didSomething,
+      reason: acted.reason,
+      nav,
+      beforeState,
+      afterState,
+      controlNote,
+      evidenceRequirementsBeforeAction,
+      decisionSource,
+      decisionReason,
+      snapshotNoveltyBeforeAction,
+      semanticEvidenceProgress,
+      suppressedFollowUp,
+    }),
+    error: acted.didSomething ? undefined : acted.reason,
+    snapshotNoveltyBeforeAction,
+    semanticEvidenceProgress,
+    actionFamily,
+    suppressedFollowUp: cloneSuppressedFollowUp(suppressedFollowUp),
+  });
+  if (activeEntityId && executedFollowUp && actionFamily) {
+    const tracker =
+      entitySemanticTrackers.get(activeEntityId) ?? makeDefaultSemanticTracker(activeEntityId);
+    entitySemanticTrackers.set(activeEntityId, recordTriedActionFamily(tracker, actionFamily));
+  }
+  return acted;
+}
+
 async function createNavigationBookmark(step: number, label: string, action: string): Promise<NavigationBookmark> {
   const pose = await viewerApi.getCameraPose();
   const planCut = (viewerApi as any).getPlanCutState ? await (viewerApi as any).getPlanCutState() : undefined;
@@ -433,6 +2239,7 @@ async function createNavigationBookmark(step: number, label: string, action: str
     viewPreset: lastViewPreset ?? undefined,
     cameraPose: pose,
     scope: lastScope.storeyId || lastScope.spaceId ? { ...lastScope } : undefined,
+    isolatedIds: flattenModelIdMap(viewerApi.getCurrentIsolateSelection?.() ?? null),
     isolatedCategories: [...lastIsolatedCategories],
     hiddenIds: [...lastHiddenIds],
     highlightedIds: [...lastHighlightedIds],
@@ -617,8 +2424,21 @@ async function restoreNavigationBookmark(params?: { step?: number; snapshotId?: 
     return { ok: false, reason: "navigation-bookmark-not-found" as const };
   }
 
-  if (target.planCut?.enabled && target.scope?.storeyId) {
-    await viewerApi.resetVisibility();
+  await viewerApi.resetVisibility();
+
+  if (target.isolatedIds.length && viewerApi.isolate) {
+    const isolateMap = buildModelIdMapFromObjectIds(target.isolatedIds);
+    if (Object.keys(isolateMap).length) {
+      await viewerApi.isolate(isolateMap);
+    }
+    if (target.scope?.storeyId) {
+      lastScope = { storeyId: target.scope.storeyId };
+    } else if (target.scope?.spaceId) {
+      lastScope = { spaceId: target.scope.spaceId };
+    } else {
+      lastScope = {};
+    }
+  } else if (target.planCut?.enabled && target.scope?.storeyId) {
     lastScope = { storeyId: target.scope.storeyId };
   } else if (target.scope?.storeyId && viewerApi.isolateStorey) {
     await viewerApi.isolateStorey(target.scope.storeyId);
@@ -627,7 +2447,6 @@ async function restoreNavigationBookmark(params?: { step?: number; snapshotId?: 
     await viewerApi.isolateSpace(target.scope.spaceId);
     lastScope = { spaceId: target.scope.spaceId };
   } else {
-    await viewerApi.resetVisibility();
     lastScope = {};
   }
 
@@ -641,6 +2460,10 @@ async function restoreNavigationBookmark(params?: { step?: number; snapshotId?: 
     });
   } else if (!target.planCut?.enabled && viewerApi.clearPlanCut) {
     await viewerApi.clearPlanCut();
+  }
+
+  if (target.hiddenIds.length && viewerApi.hideIds) {
+    await viewerApi.hideIds(target.hiddenIds);
   }
 
   if (target.highlightedIds.length && viewerApi.highlightIds) {
@@ -829,6 +2652,207 @@ function escalateFollowUp(fu: VlmFollowUp | undefined): VlmFollowUp | undefined 
     default:
       return { request: "NEW_VIEW", params: { reason: "Repeated followUp; changing view to gather new evidence." } };
   }
+}
+
+function getLatestSuccessfulActionForEntity(entityId?: string): VlmFollowUp["request"] | undefined {
+  if (!entityId) return undefined;
+  const entry = [...navigationActionLog]
+    .reverse()
+    .find((item) => item.activeEntityId === entityId && item.success);
+  return entry?.action;
+}
+
+function chooseLowNoveltyAlternative(args: {
+  requestedFollowUp: VlmFollowUp | undefined;
+  context: EvidenceContext;
+  lastViewPreset: StartPosePreset | null;
+  stats: EntityEvidenceStat;
+}): VlmFollowUp | undefined {
+  const { requestedFollowUp, context, lastViewPreset, stats } = args;
+  if (!requestedFollowUp) return undefined;
+
+  const storeyId = context.scope?.storeyId ?? context.planCut?.storeyId ?? context.taskGraph?.activeStoreyId;
+  const planCutMissing = !context.planCut?.enabled || context.floorContext?.missingLikely;
+  const orbitAvailable = stats.orbitFollowUps < MAX_ORBIT_FOLLOW_UPS_PER_ENTITY;
+
+  switch (requestedFollowUp.request) {
+    case "ZOOM_IN":
+      if (orbitAvailable) {
+        return {
+          request: "ORBIT",
+          params: {
+            yawDegrees: lastViewPreset === "top" ? 45 : 20,
+            pitchDegrees: lastViewPreset === "top" ? -30 : 0,
+            reason: "Low novelty after zoom; try a bounded alternate angle.",
+          },
+        };
+      }
+      if (lastViewPreset !== "top") return { request: "TOP_VIEW" };
+      if (planCutMissing && storeyId) {
+        return { request: "SET_STOREY_PLAN_CUT", params: { storeyId, mode: "WORLD_UP" } };
+      }
+      return undefined;
+    case "ORBIT":
+    case "NEW_VIEW":
+    case "ISO_VIEW":
+      if (lastViewPreset !== "top") return { request: "TOP_VIEW" };
+      if (planCutMissing && storeyId) {
+        return { request: "SET_STOREY_PLAN_CUT", params: { storeyId, mode: "WORLD_UP" } };
+      }
+      if (!context.planCut?.enabled) {
+        return { request: "SET_PLAN_CUT", params: { height: 1.2, mode: "WORLD_UP" } };
+      }
+      return undefined;
+    case "TOP_VIEW":
+      if (planCutMissing && storeyId) {
+        return { request: "SET_STOREY_PLAN_CUT", params: { storeyId, mode: "WORLD_UP" } };
+      }
+      if (!context.planCut?.enabled) {
+        return { request: "SET_PLAN_CUT", params: { height: 1.2, mode: "WORLD_UP" } };
+      }
+      return orbitAvailable
+        ? {
+            request: "ORBIT",
+            params: { yawDegrees: 25, pitchDegrees: 0, reason: "Low novelty after top view; gather side confirmation." },
+          }
+        : undefined;
+    case "SET_VIEW_PRESET":
+      if (requestedFollowUp.params.preset === "TOP") {
+        if (planCutMissing && storeyId) {
+          return { request: "SET_STOREY_PLAN_CUT", params: { storeyId, mode: "WORLD_UP" } };
+        }
+        if (!context.planCut?.enabled) {
+          return { request: "SET_PLAN_CUT", params: { height: 1.2, mode: "WORLD_UP" } };
+        }
+      }
+      return undefined;
+    case "ISOLATE_CATEGORY":
+    case "HIDE_CATEGORY":
+    case "ISOLATE_STOREY":
+    case "ISOLATE_SPACE":
+    case "HIDE_SELECTED":
+    case "RESET_VISIBILITY":
+    case "HIDE_IDS":
+      if (lastViewPreset !== "top") return { request: "TOP_VIEW" };
+      if (planCutMissing && storeyId) {
+        return { request: "SET_STOREY_PLAN_CUT", params: { storeyId, mode: "WORLD_UP" } };
+      }
+      return undefined;
+    case "SET_PLAN_CUT":
+      if (storeyId) {
+        return { request: "SET_STOREY_PLAN_CUT", params: { storeyId, mode: "WORLD_UP" } };
+      }
+      return lastViewPreset !== "top" ? { request: "TOP_VIEW" } : undefined;
+    default:
+      if (lastViewPreset !== "top") return { request: "TOP_VIEW" };
+      if (planCutMissing && storeyId) {
+        return { request: "SET_STOREY_PLAN_CUT", params: { storeyId, mode: "WORLD_UP" } };
+      }
+      return undefined;
+  }
+}
+
+// Paper-inspired low-novelty anti-repeat logic:
+// if a same-entity snapshot fails to add useful visual evidence, avoid spending
+// more of the view budget on the same navigation pattern.
+async function applyLowNoveltyFollowUpGuard(args: {
+  step: number;
+  decision: VlmDecision;
+  context: EvidenceContext;
+  activeEntityId?: string;
+  activeStoreyId?: string;
+  stats?: EntityEvidenceStat;
+  lastViewPreset: StartPosePreset | null;
+}): Promise<
+  | { kind: "continue"; followUp: VlmFollowUp | undefined; controlNote?: string }
+  | { kind: "finalize"; note: string }
+> {
+  const { step, decision, context, activeEntityId, activeStoreyId, stats, lastViewPreset } = args;
+  const novelty = context.snapshotNovelty;
+  const threshold = getPrototypeRuntimeSettings().snapshotNoveltyRedundancyThreshold;
+  if (!activeEntityId || !stats || !novelty) {
+    return { kind: "continue", followUp: decision.followUp };
+  }
+
+  const isLowNovelty =
+    novelty.redundancyWarning || novelty.approximateNoveltyScore < threshold;
+  if (!isLowNovelty) {
+    return { kind: "continue", followUp: decision.followUp };
+  }
+
+  const repeatedLowNovelty =
+    stats.recentLowNoveltyCount >= 2 || stats.recentRedundancyWarnings >= 2;
+  const requestedFollowUp = decision.followUp;
+  const requestedFamily = getLowNoveltyActionFamily(requestedFollowUp?.request);
+  const lowNoveltyFamily = getLowNoveltyActionFamily(stats.lastLowNoveltyAction);
+  const repeatsLowValuePattern = Boolean(
+    requestedFollowUp &&
+      stats.lastLowNoveltyAction &&
+      (
+        requestedFollowUp.request === stats.lastLowNoveltyAction ||
+        (lowNoveltyFamily === "scope" && requestedFamily === "scope") ||
+        (lowNoveltyFamily === "plan" && requestedFamily === "plan")
+      )
+  );
+
+  const noveltyDescriptor = `snapshot novelty ${novelty.approximateNoveltyScore.toFixed(2)} (threshold ${threshold.toFixed(2)})`;
+  if (repeatedLowNovelty) {
+    const note =
+      `Low-novelty anti-repeat finalized entity ${activeEntityId} as inconclusive: ${noveltyDescriptor}; ` +
+      `additional navigation produced redundant evidence and required measurement could not be grounded.`;
+    await recordNavigationControlEvent({
+      step,
+      requestedFollowUp,
+      activeEntityId,
+      activeStoreyId,
+      note,
+      evidenceRequirementsBeforeAction: context.evidenceRequirements,
+      decisionSource: "anti_repeat",
+      snapshotNoveltyBeforeAction: context.snapshotNovelty,
+    });
+    return { kind: "finalize", note };
+  }
+
+  if (requestedFollowUp && repeatsLowValuePattern) {
+    const alternative = chooseLowNoveltyAlternative({
+      requestedFollowUp,
+      context,
+      lastViewPreset,
+      stats,
+    });
+    if (alternative && followUpKey(alternative) !== followUpKey(requestedFollowUp)) {
+      return {
+        kind: "continue",
+        followUp: alternative,
+        controlNote:
+          `Low-novelty anti-repeat substituted ${requestedFollowUp.request} with ${alternative.request} after ${noveltyDescriptor}.`,
+      };
+    }
+
+    const note =
+      `Low-novelty anti-repeat suppressed ${requestedFollowUp.request} for entity ${activeEntityId}: ` +
+      `${noveltyDescriptor}; no clearly useful alternate action remained.`;
+    await recordNavigationControlEvent({
+      step,
+      requestedFollowUp,
+      activeEntityId,
+      activeStoreyId,
+      note,
+      evidenceRequirementsBeforeAction: context.evidenceRequirements,
+      decisionSource: "anti_repeat",
+      snapshotNoveltyBeforeAction: context.snapshotNovelty,
+    });
+    return { kind: "finalize", note };
+  }
+
+  return {
+    kind: "continue",
+    followUp: requestedFollowUp,
+    controlNote:
+      requestedFollowUp
+        ? `Low-novelty context observed after ${noveltyDescriptor}; allowing ${requestedFollowUp.request} because it changes strategy.`
+        : `Low-novelty context observed after ${noveltyDescriptor}.`,
+  };
 }
 
   //------------------------------------------------//
@@ -1099,11 +3123,12 @@ if (f.request === "GET_PROPERTIES") {
   await rememberPersistentHighlight(ids.slice(0, 1), "primary");
   lastSelectedId = ids[0] ?? lastSelectedId;
   const nav = await focusHighlightedIds(ids.slice(0, 1));
+  const props = viewerApi.getProperties ? await viewerApi.getProperties(ids[0]) : null;
   return {
     didSomething: true,
-    reason: "properties-deprecated-highlighted-candidate" as const,
+    reason: props ? "properties" as const : "properties-highlight-fallback" as const,
     nav,
-    props: { objectId: ids[0], source: "highlighting-fallback" },
+    props: props ?? { objectId: ids[0], source: "highlighting-fallback" },
   };
 }
 
@@ -1123,12 +3148,7 @@ if (f.request === "HIDE_SELECTED") {
 if (f.request === "ORBIT" || f.request === "NEW_VIEW") {
   const focus = currentTaskGraph ? getTaskGraphFocus(currentTaskGraph) : null;
   const activeEntityKey = focus?.activeEntityId ?? lastSelectedId ?? lastHighlightedIds[0] ?? "__run__";
-  const stats = entityEvidenceStats.get(activeEntityKey) ?? {
-    steps: 0,
-    uncertainSteps: 0,
-    repeatedWorkflowStreak: 0,
-    orbitFollowUps: 0,
-  };
+  const stats = entityEvidenceStats.get(activeEntityKey) ?? makeDefaultEntityEvidenceStat();
 
   if (stats.orbitFollowUps >= MAX_ORBIT_FOLLOW_UPS_PER_ENTITY) {
     return { didSomething: false, reason: "orbit-limit-reached" as const, nav: previousNav };
@@ -1439,7 +3459,9 @@ if (f.request === "SHOW_IDS") {
     // Create a new compliance run id (DB is “decisions only” for now)
     activeRunId = makeRunId();
     navigationBookmarks = [];
+    navigationActionLog = [];
     entityEvidenceStats = new Map<string, EntityEvidenceStat>();
+    entitySemanticTrackers = new Map<string, EntitySemanticEvidenceTracker>();
 
     let lastActionReason: string | null = null;
     let pendingNav: NavMetrics | undefined = undefined;
@@ -1484,8 +3506,12 @@ if (f.request === "SHOW_IDS") {
       evidence.push(item);
     }
 
-    function getEvidenceWindow() {
-      const slice = evidence.slice(Math.max(0, evidence.length - evidenceWindow));
+    function getEvidenceWindow(activeEntityId?: string) {
+      const sameEntityEvidence = activeEntityId
+        ? evidence.filter((item) => item.context?.activeEntityId === activeEntityId)
+        : [];
+      const source = sameEntityEvidence.length ? sameEntityEvidence : evidence;
+      const slice = source.slice(Math.max(0, source.length - evidenceWindow));
       return {
         artifacts: slice.map(s => s.artifact),
         evidenceViews: slice.map(s => ({
@@ -1497,6 +3523,101 @@ if (f.request === "SHOW_IDS") {
         })),
 
       };
+    }
+
+    function buildNavigationControlPromptSection(args: {
+      activeEntityId?: string;
+      currentStep: number;
+    }): string {
+      const { activeEntityId, currentStep } = args;
+      if (!activeEntityId) return "";
+
+      const tracker = entitySemanticTrackers.get(activeEntityId);
+      const recentAction = [...navigationActionLog]
+        .reverse()
+        .find((entry) => entry.activeEntityId === activeEntityId && entry.step < currentStep);
+      const recentEvidence = [...evidence]
+        .reverse()
+        .find(
+          (item) =>
+            item.context?.activeEntityId === activeEntityId &&
+            typeof item.context?.step === "number" &&
+            item.context.step < currentStep
+        );
+      const recentSemanticProgress =
+        recentAction?.semanticEvidenceProgress ?? recentEvidence?.context?.semanticEvidenceProgress;
+      const recentVisualNovelty =
+        recentAction?.snapshotNoveltyBeforeAction ?? recentEvidence?.context?.snapshotNovelty;
+      const suppressedFollowUp =
+        recentAction?.suppressedFollowUp ??
+        recentSemanticProgress?.suppressedFollowUp ??
+        tracker?.suppressedFollowUp;
+      const finalizationReason =
+        recentAction?.finalizationReason ??
+        recentSemanticProgress?.finalizationReason ??
+        tracker?.finalizationReason;
+      const exhaustedFamilies = Object.entries(tracker?.triedActionFamilyCounts ?? {})
+        .filter(([family, count]) => {
+          const budget =
+            SEMANTIC_FOLLOW_UP_FAMILY_BUDGETS[
+              family as keyof typeof SEMANTIC_FOLLOW_UP_FAMILY_BUDGETS
+            ];
+          return typeof budget === "number" && Number(count ?? 0) >= budget;
+        })
+        .map(([family]) => family as FollowUpActionFamily)
+        .sort();
+      const stagnatedFamilies = [...(tracker?.stagnatedActionFamilies ?? [])].sort();
+      const shouldInclude = Boolean(
+        suppressedFollowUp ||
+          finalizationReason ||
+          exhaustedFamilies.length ||
+          stagnatedFamilies.length ||
+          recentSemanticProgress?.semanticStagnationWarning ||
+          recentSemanticProgress?.sameEntityRecurrenceWarning
+      );
+      if (!shouldInclude) return "";
+
+      const lines = [
+        "NAVIGATION_CONTROL:",
+        `activeEntity=${activeEntityId}`,
+      ];
+
+      if (suppressedFollowUp) {
+        lines.push(`lastSuppressedFollowUp=${suppressedFollowUp.request}`);
+        if (suppressedFollowUp.family) {
+          lines.push(`suppressedFamily=${suppressedFollowUp.family}`);
+        }
+        lines.push(`suppressionReason=${suppressedFollowUp.reason}`);
+      }
+      if (typeof recentVisualNovelty?.approximateNoveltyScore === "number") {
+        lines.push(`lastVisualNovelty=${recentVisualNovelty.approximateNoveltyScore.toFixed(2)}`);
+      }
+      if (typeof recentSemanticProgress?.semanticProgressScore === "number") {
+        lines.push(`lastSemanticProgress=${recentSemanticProgress.semanticProgressScore.toFixed(2)}`);
+      }
+      if (typeof recentSemanticProgress?.sameEntityRecurrenceScore === "number") {
+        lines.push(`lastSameEntityRecurrence=${recentSemanticProgress.sameEntityRecurrenceScore.toFixed(2)}`);
+      }
+      if (recentSemanticProgress?.sameEntityRecurrenceWarning) {
+        lines.push("sameEntityRecurrenceWarning=true");
+      }
+      if (recentSemanticProgress?.semanticStagnationWarning) {
+        lines.push("semanticStagnationWarning=true");
+      }
+      if (exhaustedFamilies.length) {
+        lines.push(`exhaustedFamilies=${exhaustedFamilies.join(",")}`);
+      }
+      if (stagnatedFamilies.length) {
+        lines.push(`stagnatedFamilies=${stagnatedFamilies.join(",")}`);
+      }
+      if (finalizationReason) {
+        lines.push(`finalizationReason=${finalizationReason}`);
+      }
+      lines.push(
+        "instruction=Do not request suppressed, stagnated, or exhausted follow-ups again for this entity unless the missing evidence gaps materially changed."
+      );
+
+      return lines.join("\n");
     }
 const syncEntityTasks = () => {
   if (!lastHighlightedIds.length) return;
@@ -1589,6 +3710,10 @@ const currentEntityStatsForBudget = currentFocusForBudget.activeEntityId
   ? entityEvidenceStats.get(currentFocusForBudget.activeEntityId)
   : undefined;
 const orbitCallsForActiveEntity = currentEntityStatsForBudget?.orbitFollowUps ?? 0;
+const activeEntityIdForSnapshot =
+  currentFocusForBudget.activeEntityId ??
+  lastSelectedId ??
+  (lastHighlightedIds.length === 1 ? lastHighlightedIds[0] : undefined);
 
 // capture current evidence context
 const context: EvidenceContext = {
@@ -1596,6 +3721,7 @@ const context: EvidenceContext = {
   phase,
   viewPreset: lastViewPreset ?? undefined,
   cameraPose,
+  activeEntityId: activeEntityIdForSnapshot,
   scope: (lastScope.storeyId || lastScope.spaceId) ? lastScope : undefined,
   isolatedCategories: lastIsolatedCategories.length ? lastIsolatedCategories : undefined,
   isolatedIds: flattenModelIdMap(viewerApi.getCurrentIsolateSelection?.() ?? null),
@@ -1619,6 +3745,56 @@ const context: EvidenceContext = {
   navigationHistory: summarizeNavigationHistory(),
 };
 
+const previousEvidence = evidence.length ? evidence[evidence.length - 1] : undefined;
+const previousSameEntityEvidence = activeEntityIdForSnapshot
+  ? [...evidence]
+      .reverse()
+      .find((item) => item.context?.activeEntityId === activeEntityIdForSnapshot)
+  : undefined;
+const snapshotNovelty = computeSnapshotNoveltyMetrics({
+  current: {
+    snapshotId: artifact.id,
+    activeEntityId: activeEntityIdForSnapshot,
+    viewPreset: context.viewPreset,
+    cameraPose: context.cameraPose,
+    scope: context.scope,
+    highlightedIds: context.highlightedIds,
+    planCut: context.planCut,
+    nav: pendingNav,
+  },
+  previous: previousEvidence
+    ? {
+        snapshotId: previousEvidence.artifact.id,
+        activeEntityId: previousEvidence.context?.activeEntityId,
+        viewPreset: previousEvidence.context?.viewPreset,
+        cameraPose: previousEvidence.context?.cameraPose ?? previousEvidence.artifact.meta.camera,
+        scope: previousEvidence.context?.scope,
+        highlightedIds: previousEvidence.context?.highlightedIds,
+        planCut: previousEvidence.context?.planCut,
+        nav: previousEvidence.nav,
+      }
+    : undefined,
+  previousSameEntity: previousSameEntityEvidence
+    ? {
+        snapshotId: previousSameEntityEvidence.artifact.id,
+        activeEntityId: previousSameEntityEvidence.context?.activeEntityId,
+        viewPreset: previousSameEntityEvidence.context?.viewPreset,
+        cameraPose:
+          previousSameEntityEvidence.context?.cameraPose ?? previousSameEntityEvidence.artifact.meta.camera,
+        scope: previousSameEntityEvidence.context?.scope,
+        highlightedIds: previousSameEntityEvidence.context?.highlightedIds,
+        planCut: previousSameEntityEvidence.context?.planCut,
+        nav: previousSameEntityEvidence.nav,
+      }
+    : undefined,
+});
+context.snapshotNovelty = snapshotNovelty;
+context.evidenceRequirements = deriveRuntimeEvidenceRequirements({
+  context,
+  nav: pendingNav,
+  stats: currentEntityStatsForBudget,
+});
+
 // Keep the snapshot artifact self-contained for inspection-history replay.
 // The viewer snapshot only includes lightweight HUD metadata; this runner
 // context carries the actual restorable state: isolation, hidden IDs,
@@ -1641,11 +3817,18 @@ pushEvidence({ artifact, nav: pendingNav, context });
 pendingNav = undefined;
 syncEntityTasks();
 
-
-
-
-      const windowed = getEvidenceWindow();
-      const promptWithChecklist = `${prompt}\n\n${buildTaskGraphPromptSection(taskGraph)}`;
+      const windowed = getEvidenceWindow(activeEntityIdForSnapshot);
+      const navigationControlPrompt = buildNavigationControlPromptSection({
+        activeEntityId: activeEntityIdForSnapshot,
+        currentStep: step,
+      });
+      const promptWithChecklist = [
+        prompt,
+        buildTaskGraphPromptSection(taskGraph),
+        navigationControlPrompt,
+      ]
+        .filter(Boolean)
+        .join("\n\n");
       const decision = await vlmChecker.check({
         prompt: promptWithChecklist,
         artifacts: windowed.artifacts,
@@ -1705,6 +3888,25 @@ syncEntityTasks();
         };
       }
 
+      let followUpPlan = chooseFollowUpFromEvidenceRequirements({
+        decision,
+        context,
+        lastViewPreset,
+        nav: lastEvidenceNav,
+        sameEntityHistory: activeEntityIdForSnapshot
+          ? evidence.filter((item) => item.context?.activeEntityId === activeEntityIdForSnapshot)
+          : undefined,
+      });
+      let guardedFollowUp = followUpPlan.followUp;
+      let followUpDecisionSource: FollowUpDecisionSource = followUpPlan.source;
+      let followUpDecisionReason = followUpPlan.reason;
+      let evidenceRequirementsBeforeAction = mergeEvidenceRequirements(
+        context.evidenceRequirements,
+        followUpPlan.evidenceRequirements
+      );
+      let semanticEvidenceProgress: SemanticEvidenceProgress | undefined;
+      let semanticSuppressedFollowUp: SuppressedFollowUpTrace | undefined;
+      let lowNoveltyControlNote: string | undefined;
       if (activeEntityBeforeDecision) {
         const workflowSignature = buildWorkflowSignature({
           entityId: activeEntityBeforeDecision,
@@ -1716,10 +3918,7 @@ syncEntityTasks();
           lastActionReason,
         });
         const stats = entityEvidenceStats.get(activeEntityBeforeDecision) ?? {
-          steps: 0,
-          uncertainSteps: 0,
-          repeatedWorkflowStreak: 0,
-          orbitFollowUps: 0,
+          ...makeDefaultEntityEvidenceStat(),
         };
         stats.topMeasurementReady =
           stats.topMeasurementReady || Boolean(doorClearanceReadiness?.evidenceBundle?.topMeasurementViewReady);
@@ -1732,15 +3931,242 @@ syncEntityTasks();
             ? stats.repeatedWorkflowStreak + 1
             : 1;
         stats.lastWorkflowSignature = workflowSignature;
+        const noveltyThreshold = runtimeSettings.snapshotNoveltyRedundancyThreshold;
+        const latestNovelty = context.snapshotNovelty;
+        const latestLowNovelty = Boolean(
+          latestNovelty &&
+            (latestNovelty.redundancyWarning || latestNovelty.approximateNoveltyScore < noveltyThreshold)
+        );
+        if (latestLowNovelty) {
+          stats.recentLowNoveltyCount += 1;
+          stats.recentRedundancyWarnings = latestNovelty?.redundancyWarning
+            ? stats.recentRedundancyWarnings + 1
+            : 0;
+          stats.lastLowNoveltyAction = getLatestSuccessfulActionForEntity(activeEntityBeforeDecision);
+        } else if (latestNovelty) {
+          stats.recentLowNoveltyCount = 0;
+          stats.recentRedundancyWarnings = 0;
+          stats.lastLowNoveltyAction = undefined;
+          stats.lastUsefulNoveltyScore = latestNovelty.approximateNoveltyScore;
+        }
         entityEvidenceStats.set(activeEntityBeforeDecision, stats);
         const entityStepBudgetReached = stats.steps >= runtimeSettings.entityUncertainTerminationSteps;
         const hasConfidentFinalVerdict =
           (decision.verdict === "PASS" || decision.verdict === "FAIL") && decision.confidence >= minConfidence;
+        const semanticTracker =
+          entitySemanticTrackers.get(activeEntityBeforeDecision) ??
+          makeDefaultSemanticTracker(activeEntityBeforeDecision);
+        const currentDecisionEvidenceRequirements = deriveRuntimeEvidenceRequirements({
+          context,
+          decision,
+          nav: lastEvidenceNav,
+          stats,
+        });
+        const recurrenceMetrics = computeSameEntityRecurrenceMetrics({
+          currentStep: step,
+          current: {
+            snapshotId: artifact.id,
+            activeEntityId: activeEntityBeforeDecision,
+            viewPreset: context.viewPreset,
+            cameraPose: context.cameraPose,
+            scope: context.scope,
+            highlightedIds: context.highlightedIds,
+            planCut: context.planCut,
+            nav: lastEvidenceNav,
+          },
+          history: evidence,
+        });
+        semanticEvidenceProgress = assessSemanticEvidenceProgress({
+          activeEntityId: activeEntityBeforeDecision,
+          tracker: semanticTracker,
+          missingEvidence: normalizeMissingEvidenceGaps([
+            ...(decision.missingEvidence ?? []),
+            ...(decision.visibility?.missingEvidence ?? []),
+          ]),
+          evidenceRequirementsStatus: currentDecisionEvidenceRequirements.status,
+          recurrenceMetrics,
+        });
+        const updatedSemanticTracker = updateSemanticTrackerFromDecision({
+          tracker: semanticTracker,
+          progress: semanticEvidenceProgress,
+          evidenceRequirementsStatus: currentDecisionEvidenceRequirements.status,
+        });
+        entitySemanticTrackers.set(activeEntityBeforeDecision, updatedSemanticTracker);
+        context.normalizedEvidenceGaps = [...semanticEvidenceProgress.normalizedEvidenceGaps];
+        context.semanticEvidenceProgress = {
+          ...semanticEvidenceProgress,
+          triedActionFamilies: [...updatedSemanticTracker.triedActionFamilies],
+          triedActionFamilyCounts: { ...updatedSemanticTracker.triedActionFamilyCounts },
+          lastActionFamily: updatedSemanticTracker.lastActionFamily,
+          lastEvidenceProgressSummary: updatedSemanticTracker.lastEvidenceProgressSummary,
+        };
+        context.triedActionFamilies = [...updatedSemanticTracker.triedActionFamilies];
+        artifact.meta.context = {
+          ...(artifact.meta.context ?? {}),
+          ...context,
+        };
+        followUpPlan = chooseFollowUpFromEvidenceRequirements({
+          decision,
+          context,
+          lastViewPreset,
+          nav: lastEvidenceNav,
+          stats,
+          evidenceRequirements: currentDecisionEvidenceRequirements,
+          semanticTracker: updatedSemanticTracker,
+          semanticProgress: semanticEvidenceProgress,
+          sameEntityHistory: evidence.filter(
+            (item) => item.context?.activeEntityId === activeEntityBeforeDecision
+          ),
+        });
+        guardedFollowUp = followUpPlan.followUp;
+        followUpDecisionSource = followUpPlan.source;
+        followUpDecisionReason = followUpPlan.reason;
+        evidenceRequirementsBeforeAction = mergeEvidenceRequirements(
+          context.evidenceRequirements,
+          followUpPlan.evidenceRequirements
+        );
+        semanticSuppressedFollowUp = followUpPlan.suppressedFollowUp;
+        if (semanticEvidenceProgress) {
+          context.semanticEvidenceProgress = {
+            ...context.semanticEvidenceProgress,
+            ...semanticEvidenceProgress,
+            triedActionFamilies: [...updatedSemanticTracker.triedActionFamilies],
+            triedActionFamilyCounts: { ...updatedSemanticTracker.triedActionFamilyCounts },
+            lastActionFamily: updatedSemanticTracker.lastActionFamily,
+            lastEvidenceProgressSummary: updatedSemanticTracker.lastEvidenceProgressSummary,
+            suppressedFollowUp: cloneSuppressedFollowUp(semanticSuppressedFollowUp),
+            finalizationReason: followUpPlan.finalizationReason,
+          };
+          context.suppressedFollowUp = cloneSuppressedFollowUp(semanticSuppressedFollowUp);
+          context.finalizationReason = followUpPlan.finalizationReason;
+          artifact.meta.context = {
+            ...(artifact.meta.context ?? {}),
+            ...context,
+          };
+        }
+
+        if (
+          decision.verdict === "UNCERTAIN" &&
+          followUpPlan.finalizationReason &&
+          (semanticEvidenceProgress?.semanticStagnationWarning ||
+            semanticEvidenceProgress?.sameEntityRecurrenceWarning)
+        ) {
+          const finalizationReason = followUpPlan.finalizationReason;
+          const trackerForFinalization = entitySemanticTrackers.get(activeEntityBeforeDecision);
+          if (trackerForFinalization) {
+            trackerForFinalization.finalizationReason = finalizationReason;
+            trackerForFinalization.suppressedFollowUp = cloneSuppressedFollowUp(semanticSuppressedFollowUp);
+            entitySemanticTrackers.set(activeEntityBeforeDecision, trackerForFinalization);
+          }
+          await recordNavigationControlEvent({
+            step,
+            requestedFollowUp: decision.followUp,
+            activeEntityId: activeEntityBeforeDecision,
+            activeStoreyId:
+              context.scope?.storeyId ?? context.planCut?.storeyId ?? context.taskGraph?.activeStoreyId,
+            note: finalizationReason,
+            evidenceRequirementsBeforeAction,
+            decisionSource: "anti_repeat",
+            snapshotNoveltyBeforeAction: context.snapshotNovelty,
+            semanticEvidenceProgress,
+            suppressedFollowUp: semanticSuppressedFollowUp,
+            finalizationReason,
+          });
+          markActiveEntityInconclusive(taskGraph, finalizationReason);
+          const advanceResult = await advanceToNextEntity(taskGraph, activeEntityBeforeDecision);
+          lastActionReason = advanceResult.restoredPreparedView
+            ? "restore-storey-plan-cut-view"
+            : "semantic-evidence-stagnation";
+          params.onProgress?.({
+            stage: "followup",
+            step,
+            summary: advanceResult.advanced
+              ? "Repeated navigation strategies did not reduce the same missing evidence gaps, so the runner finalized the current entity as inconclusive and advanced."
+              : "Repeated navigation strategies did not reduce the same missing evidence gaps, so the current entity was finalized as inconclusive.",
+            taskGraph: summarizeTaskGraph(taskGraph),
+            lastActionReason,
+            verdict: decision.verdict,
+            confidence: decision.confidence,
+            thinking: decision.rationale,
+            followUpSummary: "Stopped because repeated views did not reduce missing evidence gaps.",
+          });
+          if (advanceResult.advanced) {
+            await (viewerApi as any).stabilizeForSnapshot?.();
+            continue;
+          }
+          return {
+            ok: true as const,
+            runId: activeRunId,
+            final: decision,
+            decisions: allDecisions,
+            snapshots: evidence.length,
+          };
+        }
+
+        const lowNoveltyGuard =
+          decision.verdict === "UNCERTAIN" || decision.followUp
+            ? await applyLowNoveltyFollowUpGuard({
+                step,
+                decision,
+                context,
+                activeEntityId: activeEntityBeforeDecision,
+                activeStoreyId:
+                  context.scope?.storeyId ?? context.planCut?.storeyId ?? context.taskGraph?.activeStoreyId,
+                stats,
+                lastViewPreset,
+              })
+            : { kind: "continue" as const, followUp: decision.followUp };
+
+        if (lowNoveltyGuard.kind === "finalize") {
+          markActiveEntityInconclusive(
+            taskGraph,
+            "Additional navigation produced low-novelty/redundant evidence; required measurement could not be grounded."
+          );
+          const advanceResult = await advanceToNextEntity(taskGraph, activeEntityBeforeDecision);
+          lastActionReason = advanceResult.restoredPreparedView
+            ? "restore-storey-plan-cut-view"
+            : "low-novelty-entity-finalized";
+          params.onProgress?.({
+            stage: "followup",
+            step,
+            summary: advanceResult.advanced
+              ? "Additional navigation stayed low-novelty for the current entity, so the runner finalized it as inconclusive and advanced."
+              : "Additional navigation stayed low-novelty for the current entity, so it was finalized as inconclusive.",
+            taskGraph: summarizeTaskGraph(taskGraph),
+            lastActionReason,
+            verdict: decision.verdict,
+            confidence: decision.confidence,
+            thinking: decision.rationale,
+            followUpSummary: lowNoveltyGuard.note,
+          });
+          if (advanceResult.advanced) {
+            await (viewerApi as any).stabilizeForSnapshot?.();
+            continue;
+          }
+          return {
+            ok: true as const,
+            runId: activeRunId,
+            final: decision,
+            decisions: allDecisions,
+            snapshots: evidence.length,
+          };
+        }
+
+        guardedFollowUp = lowNoveltyGuard.followUp;
+        lowNoveltyControlNote = lowNoveltyGuard.controlNote;
+        if (
+          lowNoveltyGuard.controlNote &&
+          lowNoveltyGuard.followUp &&
+          followUpKey(lowNoveltyGuard.followUp) !== followUpKey(followUpPlan.followUp)
+        ) {
+          followUpDecisionSource = "anti_repeat";
+          followUpDecisionReason = lowNoveltyGuard.controlNote;
+        }
 
         if (
           decision.verdict === "UNCERTAIN" &&
           lastEvidenceNav?.zoomPotentialExhausted &&
-          (!decision.followUp || decision.followUp.request === "ZOOM_IN")
+          (!guardedFollowUp || guardedFollowUp.request === "ZOOM_IN")
         ) {
           markActiveEntityInconclusive(
             taskGraph,
@@ -1875,7 +4301,7 @@ syncEntityTasks();
           doorClearanceReadiness?.measurableLikely &&
           stats.topMeasurementReady &&
           stats.contextConfirmReady &&
-          !decision.followUp
+          !guardedFollowUp
         ) {
           markActiveEntityInconclusive(
             taskGraph,
@@ -1913,7 +4339,7 @@ syncEntityTasks();
           };
         }
 
-        if (!decision.followUp) {
+        if (!guardedFollowUp) {
           if (decision.verdict === "UNCERTAIN") {
             markActiveEntityInconclusive(
               taskGraph,
@@ -2004,21 +4430,38 @@ syncEntityTasks();
       }
 
       if ((decision.verdict === "PASS" || decision.verdict === "FAIL") && !confident) {
-const fuKey = followUpKey(decision.followUp);
+const fuKey = followUpKey(guardedFollowUp);
 if (fuKey && fuKey === lastFollowUpKey) repeatedFollowUpCount++;
 else repeatedFollowUpCount = 0;
 lastFollowUpKey = fuKey;
 
-let followUpToRun = decision.followUp;
+let followUpToRun = guardedFollowUp;
+let executionDecisionSource = followUpDecisionSource;
+let executionDecisionReason = followUpDecisionReason;
 
 // If same followUp repeats, escalate instead of resetting
 if (repeatedFollowUpCount >= REPEATED_FOLLOW_UPS_BEFORE_ESCALATION) {
-  console.warn("[Compliance] repeating same followUp, escalating", decision.followUp);
-  followUpToRun = escalateFollowUp(decision.followUp);
+  console.warn("[Compliance] repeating same followUp, escalating", guardedFollowUp);
+  followUpToRun = escalateFollowUp(guardedFollowUp);
+  executionDecisionSource = "anti_repeat";
+  executionDecisionReason = `Repeated advisory follow-up ${guardedFollowUp?.request ?? "unknown"} was escalated to ${followUpToRun?.request ?? "none"} to avoid a loop.`;
   repeatedFollowUpCount = 0; // reset after escalation so we don't immediately loop
 }
 
-const acted = await executeFollowUp(followUpToRun, lastActionReason, lastEvidenceNav);
+const acted = await executeFollowUpWithEvaluation({
+  step,
+  requestedFollowUp: guardedFollowUp,
+  executedFollowUp: followUpToRun,
+  previousActionReason: lastActionReason,
+  previousNav: lastEvidenceNav,
+  controlNote: lowNoveltyControlNote,
+  evidenceRequirementsBeforeAction,
+  decisionSource: executionDecisionSource,
+  decisionReason: executionDecisionReason,
+  snapshotNoveltyBeforeAction: context.snapshotNovelty,
+  semanticEvidenceProgress,
+  suppressedFollowUp: semanticSuppressedFollowUp,
+});
 lastActionReason = acted.reason;
 pendingNav = (acted as any).nav ?? undefined;
 updateTaskGraphFromFollowUpResult(taskGraph, followUpToRun, acted.didSomething, acted.reason);
@@ -2027,14 +4470,14 @@ params.onProgress?.({
   stage: "followup",
   step,
   summary: acted.didSomething
-    ? `Executed follow-up ${followUpToRun?.request ?? "none"} to gather better evidence.`
-    : `Follow-up ${followUpToRun?.request ?? "none"} could not improve the current evidence.`,
+    ? `Executed follow-up ${followUpToRun?.request ?? "none"} to gather better evidence.${lowNoveltyControlNote ? ` ${lowNoveltyControlNote}` : ""}`
+    : `Follow-up ${followUpToRun?.request ?? "none"} could not improve the current evidence.${lowNoveltyControlNote ? ` ${lowNoveltyControlNote}` : ""}`,
   taskGraph: summarizeTaskGraph(taskGraph),
   lastActionReason,
   thinking: decision.rationale,
   followUpSummary: acted.didSomething
-    ? `Executed ${followUpToRun?.request ?? "no"} follow-up to gather better evidence.`
-    : `The ${followUpToRun?.request ?? "requested"} follow-up did not improve the current evidence.`,
+    ? `Executed ${followUpToRun?.request ?? "no"} follow-up to gather better evidence.${lowNoveltyControlNote ? ` ${lowNoveltyControlNote}` : ""}`
+    : `The ${followUpToRun?.request ?? "requested"} follow-up did not improve the current evidence.${lowNoveltyControlNote ? ` ${lowNoveltyControlNote}` : ""}`,
 });
 
 if (acted.didSomething) {
@@ -2068,21 +4511,38 @@ toast?.(`Low-confidence ${decision.verdict} with no actionable follow-up. Stoppi
     // Do not early-stop on UNCERTAIN, even if confidence is high.
     // Continue gathering evidence and applying follow-ups so reports include full step history.
 
-const fuKey = followUpKey(decision.followUp);
+const fuKey = followUpKey(guardedFollowUp);
 if (fuKey && fuKey === lastFollowUpKey) repeatedFollowUpCount++;
 else repeatedFollowUpCount = 0;
 lastFollowUpKey = fuKey;
 
-let followUpToRun = decision.followUp;
+let followUpToRun = guardedFollowUp;
+let executionDecisionSource = followUpDecisionSource;
+let executionDecisionReason = followUpDecisionReason;
 
 // If same followUp repeats, escalate instead of resetting
 if (repeatedFollowUpCount >= REPEATED_FOLLOW_UPS_BEFORE_ESCALATION) {
-  console.warn("[Compliance] repeating same followUp, escalating", decision.followUp);
-  followUpToRun = escalateFollowUp(decision.followUp);
+  console.warn("[Compliance] repeating same followUp, escalating", guardedFollowUp);
+  followUpToRun = escalateFollowUp(guardedFollowUp);
+  executionDecisionSource = "anti_repeat";
+  executionDecisionReason = `Repeated advisory follow-up ${guardedFollowUp?.request ?? "unknown"} was escalated to ${followUpToRun?.request ?? "none"} to avoid a loop.`;
   repeatedFollowUpCount = 0; // reset after escalation so we don't immediately loop
 }
 
-const acted = await executeFollowUp(followUpToRun, lastActionReason, lastEvidenceNav);
+const acted = await executeFollowUpWithEvaluation({
+  step,
+  requestedFollowUp: guardedFollowUp,
+  executedFollowUp: followUpToRun,
+  previousActionReason: lastActionReason,
+  previousNav: lastEvidenceNav,
+  controlNote: lowNoveltyControlNote,
+  evidenceRequirementsBeforeAction,
+  decisionSource: executionDecisionSource,
+  decisionReason: executionDecisionReason,
+  snapshotNoveltyBeforeAction: context.snapshotNovelty,
+  semanticEvidenceProgress,
+  suppressedFollowUp: semanticSuppressedFollowUp,
+});
 lastActionReason = acted.reason;
 pendingNav = (acted as any).nav ?? undefined;
 updateTaskGraphFromFollowUpResult(taskGraph, followUpToRun, acted.didSomething, acted.reason);
@@ -2091,14 +4551,14 @@ params.onProgress?.({
   stage: "followup",
   step,
   summary: acted.didSomething
-    ? `Executed follow-up ${followUpToRun?.request ?? "none"} to refine the current task.`
-    : `Follow-up ${followUpToRun?.request ?? "none"} did not change the current state.`,
+    ? `Executed follow-up ${followUpToRun?.request ?? "none"} to refine the current task.${lowNoveltyControlNote ? ` ${lowNoveltyControlNote}` : ""}`
+    : `Follow-up ${followUpToRun?.request ?? "none"} did not change the current state.${lowNoveltyControlNote ? ` ${lowNoveltyControlNote}` : ""}`,
   taskGraph: summarizeTaskGraph(taskGraph),
   lastActionReason,
   thinking: decision.rationale,
   followUpSummary: acted.didSomething
-    ? `Executed ${followUpToRun?.request ?? "no"} follow-up to refine the current task.`
-    : `The ${followUpToRun?.request ?? "requested"} follow-up did not change the current state.`,
+    ? `Executed ${followUpToRun?.request ?? "no"} follow-up to refine the current task.${lowNoveltyControlNote ? ` ${lowNoveltyControlNote}` : ""}`
+    : `The ${followUpToRun?.request ?? "requested"} follow-up did not change the current state.${lowNoveltyControlNote ? ` ${lowNoveltyControlNote}` : ""}`,
 });
 
 if (acted.didSomething) {
@@ -2120,4 +4580,73 @@ toast?.("UNCERTAIN with no actionable follow-up. Stopping.");
     const lastDec = allDecisions.length > 0 ? allDecisions[allDecisions.length - 1] : undefined;
     return { ok: false as const, reason: "max-steps-reached" as const, final: lastDec, decisions: allDecisions, snapshots: evidence.length };
   }
-return { start, getActiveRunId: () => activeRunId, parseCustomPose, }; }
+return {
+  start,
+  getActiveRunId: () => activeRunId,
+  getNavigationActions: () => navigationActionLog.map((entry) => ({
+    ...entry,
+    params: entry.params ? { ...entry.params } : undefined,
+    requestedParams: entry.requestedParams ? { ...entry.requestedParams } : undefined,
+    beforeState: entry.beforeState
+      ? {
+          cameraPose: entry.beforeState.cameraPose
+            ? {
+                eye: { ...entry.beforeState.cameraPose.eye },
+                target: { ...entry.beforeState.cameraPose.target },
+              }
+            : undefined,
+          highlightedIds: [...(entry.beforeState.highlightedIds ?? [])],
+          planCut: entry.beforeState.planCut ? { ...entry.beforeState.planCut } : undefined,
+        }
+      : undefined,
+    afterState: entry.afterState
+      ? {
+          cameraPose: entry.afterState.cameraPose
+            ? {
+                eye: { ...entry.afterState.cameraPose.eye },
+                target: { ...entry.afterState.cameraPose.target },
+              }
+            : undefined,
+          highlightedIds: [...(entry.afterState.highlightedIds ?? [])],
+          planCut: entry.afterState.planCut ? { ...entry.afterState.planCut } : undefined,
+        }
+      : undefined,
+    navigationMetrics: entry.navigationMetrics ? { ...entry.navigationMetrics } : undefined,
+    evidenceRequirementsBeforeAction: entry.evidenceRequirementsBeforeAction
+      ? {
+          status: { ...entry.evidenceRequirementsBeforeAction.status },
+          reasons: entry.evidenceRequirementsBeforeAction.reasons
+            ? { ...entry.evidenceRequirementsBeforeAction.reasons }
+            : undefined,
+        }
+      : undefined,
+    chosenFollowUp: entry.chosenFollowUp
+      ? {
+          request: entry.chosenFollowUp.request,
+          params: entry.chosenFollowUp.params ? { ...entry.chosenFollowUp.params } : undefined,
+        }
+      : undefined,
+    snapshotNoveltyBeforeAction: entry.snapshotNoveltyBeforeAction
+      ? { ...entry.snapshotNoveltyBeforeAction }
+      : undefined,
+    semanticEvidenceProgress: entry.semanticEvidenceProgress
+      ? {
+          ...entry.semanticEvidenceProgress,
+          normalizedEvidenceGaps: [...entry.semanticEvidenceProgress.normalizedEvidenceGaps],
+          previousEvidenceRequirementsStatus: entry.semanticEvidenceProgress.previousEvidenceRequirementsStatus
+            ? { ...entry.semanticEvidenceProgress.previousEvidenceRequirementsStatus }
+            : undefined,
+          currentEvidenceRequirementsStatus: entry.semanticEvidenceProgress.currentEvidenceRequirementsStatus
+            ? { ...entry.semanticEvidenceProgress.currentEvidenceRequirementsStatus }
+            : undefined,
+          triedActionFamilies: [...(entry.semanticEvidenceProgress.triedActionFamilies ?? [])],
+          triedActionFamilyCounts: entry.semanticEvidenceProgress.triedActionFamilyCounts
+            ? { ...entry.semanticEvidenceProgress.triedActionFamilyCounts }
+            : undefined,
+          suppressedFollowUp: cloneSuppressedFollowUp(entry.semanticEvidenceProgress.suppressedFollowUp),
+        }
+      : undefined,
+    suppressedFollowUp: cloneSuppressedFollowUp(entry.suppressedFollowUp),
+  })),
+  parseCustomPose,
+}; }

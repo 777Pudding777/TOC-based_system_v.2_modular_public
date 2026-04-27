@@ -8,7 +8,51 @@
 
 import type { VlmDecision, VlmFollowUp, VlmVerdict } from "../modules/vlmChecker";
 import type { SnapshotArtifact } from "../modules/snapshotCollector";
+import type { EvidenceRequirementsSnapshot } from "./evidenceRequirements.types";
 import type { ComplianceRule } from "./rule.types";
+
+export type FollowUpActionFamily =
+  | "plan_measurement"
+  | "context_angle"
+  | "focus"
+  | "scope"
+  | "occlusion_or_context_cleanup"
+  | "regulatory_grounding"
+  | "property_measurement"
+  | "restore"
+  | "reset";
+
+export interface SuppressedFollowUpTrace {
+  request: VlmFollowUp["request"];
+  family?: FollowUpActionFamily;
+  reason: string;
+}
+
+export interface SemanticEvidenceProgressTrace {
+  normalizedEvidenceGaps: string[];
+  evidenceGapsChanged: boolean;
+  resolvedGapCount: number;
+  newGapCount: number;
+  unchangedGapCount: number;
+  semanticProgressScore: number;
+  semanticStagnationWarning: boolean;
+  sameEntityRecurrenceScore?: number;
+  sameEntityRecurrenceWarning?: boolean;
+  sameEntityRecurrenceComparedSnapshotId?: string;
+  sameEntityRecurrenceStepDelta?: number;
+  sameEntityRecurrenceViewSimilarity?: number;
+  sameEntityRecurrenceDecayWeight?: number;
+  sameEntityRecurrenceFailureWeight?: number;
+  repeatedEvidenceGapCount: number;
+  previousEvidenceRequirementsStatus?: Record<string, boolean>;
+  currentEvidenceRequirementsStatus?: Record<string, boolean>;
+  triedActionFamilies?: FollowUpActionFamily[];
+  triedActionFamilyCounts?: Partial<Record<FollowUpActionFamily, number>>;
+  lastActionFamily?: FollowUpActionFamily;
+  lastEvidenceProgressSummary?: string;
+  suppressedFollowUp?: SuppressedFollowUpTrace;
+  finalizationReason?: string;
+}
 
 /**
  * Camera pose for snapshot context
@@ -19,6 +63,28 @@ export interface CameraPoseTrace {
 }
 
 /**
+ * Plan-cut state captured for audit and replay traces
+ */
+export interface PlanCutStateTrace {
+  enabled?: boolean;
+  height?: number;
+  absoluteHeight?: number;
+  thickness?: number;
+  mode?: string;
+  source?: string;
+  storeyId?: string;
+}
+
+/**
+ * Lightweight navigation state snapshot captured before/after deterministic follow-ups.
+ */
+export interface NavigationStateTrace {
+  cameraPose?: CameraPoseTrace;
+  highlightedIds?: string[];
+  planCut?: PlanCutStateTrace;
+}
+
+/**
  * Navigation action executed during inspection
  */
 export interface NavigationAction {
@@ -26,8 +92,16 @@ export interface NavigationAction {
   step: number;
   /** Action type from VlmFollowUp */
   action: VlmFollowUp["request"];
+  /** Original follow-up type requested by the VLM before normalization/escalation */
+  requestedAction?: VlmFollowUp["request"];
+  /** Active entity under inspection when the follow-up ran */
+  activeEntityId?: string;
+  /** Active storey under inspection when available */
+  activeStoreyId?: string;
   /** Action parameters */
   params?: Record<string, unknown>;
+  /** Original parameters before normalization/escalation */
+  requestedParams?: Record<string, unknown>;
   /** Reason for this action */
   reason?: string;
   /** Timestamp of action */
@@ -36,6 +110,80 @@ export interface NavigationAction {
   success: boolean;
   /** Error message if failed */
   error?: string;
+  /** Deterministic no-op/failure cause from the runner */
+  noOpReason?: string;
+  /** Viewer state before executing the follow-up */
+  beforeState?: NavigationStateTrace;
+  /** Viewer state after executing the follow-up */
+  afterState?: NavigationStateTrace;
+  /** Deterministic navigation metrics from the action result */
+  navigationMetrics?: {
+    targetAreaRatio?: number;
+    projectedAreaRatio?: number;
+    occlusionRatio?: number;
+    convergenceScore?: number;
+    targetAreaGoal?: number;
+    zoomExhausted?: boolean;
+    success?: boolean;
+    reason?: string;
+  };
+  /** Generalized evidence-requirement state before the action was chosen */
+  evidenceRequirementsBeforeAction?: EvidenceRequirementsSnapshot;
+  /** Explicit follow-up that the runtime ultimately chose */
+  chosenFollowUp?: {
+    request: VlmFollowUp["request"];
+    params?: Record<string, unknown>;
+  };
+  /** Which layer decided the follow-up that was logged */
+  decisionSource?: "runtime_planner" | "vlm_advisory" | "provider_override" | "anti_repeat";
+  /** Human-readable explanation for the chosen follow-up */
+  decisionReason?: string;
+  /** Paper-inspired deterministic evaluation summary for navigation auditability */
+  evaluationSummary?: string;
+  /** Local visual novelty state at the moment the action was chosen */
+  snapshotNoveltyBeforeAction?: SnapshotNoveltyMetrics;
+  /** Semantic evidence stagnation / anti-cycle metadata */
+  semanticEvidenceProgress?: SemanticEvidenceProgressTrace;
+  /** Classified family of the executed or suppressed follow-up */
+  actionFamily?: FollowUpActionFamily;
+  /** Advisory/runtime follow-up suppressed by semantic anti-cycle logic */
+  suppressedFollowUp?: SuppressedFollowUpTrace;
+  /** Reason the entity was finalized without another follow-up */
+  finalizationReason?: string;
+}
+
+/**
+ * Lightweight, deterministic snapshot novelty heuristic.
+ * This is intentionally conservative and paper-inspired rather than a full
+ * next-best-view or reconstruction metric.
+ */
+export interface SnapshotNoveltyMetrics {
+  /** Snapshot used as the baseline for comparison, when available */
+  comparedToSnapshotId?: string;
+  /** Active entity used for the baseline comparison, when available */
+  comparedEntityId?: string;
+  /** Whether the immediately previous snapshot was already focused on the same entity */
+  sameEntityAsPrevious: boolean;
+  /** Whether the stored view preset changed relative to the comparison snapshot */
+  viewPresetChanged: boolean;
+  /** Whether the camera pose changed beyond a conservative threshold */
+  cameraMoved: boolean;
+  /** Whether yaw/pitch changed enough to suggest a meaningful reorientation */
+  yawPitchChanged: boolean;
+  /** Whether plan-cut state changed */
+  planCutChanged: boolean;
+  /** Whether highlighted IDs changed */
+  highlightedIdsChanged: boolean;
+  /** Whether scoped storey/space changed */
+  scopeChanged: boolean;
+  /** Whether projected target area changed materially, if available */
+  projectedAreaChanged?: boolean;
+  /** Whether occlusion changed materially, if available */
+  occlusionChanged?: boolean;
+  /** Approximate deterministic novelty score in the range [0, 1] */
+  approximateNoveltyScore: number;
+  /** Warning that the snapshot is likely redundant for the current entity */
+  redundancyWarning: boolean;
 }
 
 /**
@@ -58,6 +206,12 @@ export interface SnapshotTrace {
   hiddenElements?: string[];
   /** Plan cut applied */
   planCut?: { height: number; thickness?: number };
+  /** Active entity under inspection when the snapshot was captured */
+  activeEntityId?: string;
+  /** Lightweight novelty / redundancy heuristic */
+  novelty?: SnapshotNoveltyMetrics;
+  /** Semantic evidence progress derived from this snapshot's decision */
+  semanticEvidenceProgress?: SemanticEvidenceProgressTrace;
   /** Base64 image data (embedded in trace for export) */
   imageBase64?: string;
 }
@@ -239,15 +393,13 @@ export interface SceneState {
   /** Highlighted element IDs */
   highlightedIds?: string[];
   /** Plan cut state */
-  planCut?: {
-    enabled?: boolean;
-    height?: number;
-    absoluteHeight?: number;
-    thickness?: number;
-    mode?: string;
-    source?: string;
-    storeyId?: string;
-  };
+  planCut?: PlanCutStateTrace;
+  /** Active entity under inspection when available */
+  activeEntityId?: string;
+  /** Lightweight novelty / redundancy heuristic */
+  novelty?: SnapshotNoveltyMetrics;
+  /** Semantic evidence progress derived from the step decision */
+  semanticEvidenceProgress?: SemanticEvidenceProgressTrace;
 }
 
 /**

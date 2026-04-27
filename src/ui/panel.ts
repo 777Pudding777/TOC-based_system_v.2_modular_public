@@ -3,7 +3,12 @@ import * as BUI from "@thatopen/ui";
 import type { CameraPose } from "../viewer/api";
 import type { VlmDecision, VlmVerdict } from "../modules/vlmChecker";
 import type { ComplianceRule } from "../types/rule.types";
-import type { ConversationTrace, SceneState, WebEvidenceRecord } from "../types/trace.types";
+import type {
+  ConversationTrace,
+  SceneState,
+  SnapshotNoveltyMetrics,
+  WebEvidenceRecord,
+} from "../types/trace.types";
 import type { RuleDb } from "../storage/ruleDb";
 import type { TraceDb } from "../storage/traceDb";
 import { downloadHtmlReport } from "../reporting/reportGenerator";
@@ -20,6 +25,12 @@ import type { CompactTaskGraphState } from "../modules/taskGraph";
 import { runJudgeAgent } from "../modules/judgeAgent";
 
 type ToastFn = (msg: string, ms?: number) => void;
+
+function readSnapshotNoveltyMetrics(value: unknown): SnapshotNoveltyMetrics | undefined {
+  return value && typeof value === "object" && "approximateNoveltyScore" in value
+    ? (value as SnapshotNoveltyMetrics)
+    : undefined;
+}
 
 type ComplianceDeterministicConfig =
   | { enabled: false }
@@ -135,6 +146,7 @@ vlmChecker: {
         followUpSummary?: string;
       }) => void;
     }) => Promise<any>;
+    getNavigationActions?: () => ConversationTrace["navigationActions"];
     parseCustomPose: (text: string) => CameraPose | null;
   };
 
@@ -616,12 +628,12 @@ vlmChecker: {
     if (!state) return;
 
     try {
+      await viewerApi.resetVisibility();
+
       if (state.isolatedIds?.length && viewerApi.isolate) {
         const isolateMap = buildModelIdMapFromObjectIds(state.isolatedIds);
         if (Object.keys(isolateMap).length) {
           await viewerApi.isolate(isolateMap);
-        } else {
-          await viewerApi.resetVisibility();
         }
       } else if (state.isolatedStorey && viewerApi.isolateStorey) {
         await viewerApi.isolateStorey(state.isolatedStorey);
@@ -629,8 +641,6 @@ vlmChecker: {
         await viewerApi.isolateSpace(state.isolatedSpace);
       } else if (state.isolatedCategories?.length && viewerApi.isolateCategory) {
         await viewerApi.isolateCategory(state.isolatedCategories[0]);
-      } else {
-        await viewerApi.resetVisibility();
       }
 
       if (state.hiddenIds?.length && viewerApi.hideIds) {
@@ -971,6 +981,8 @@ vlmChecker: {
         const endTime = Date.now();
         const startTime = inspectionStartTime ?? endTime;
         const decisions: VlmDecision[] = res?.decisions ?? inspectionDecisions;
+        const navigationActions =
+          typeof complianceRunner.getNavigationActions === "function" ? complianceRunner.getNavigationActions() : [];
         const webEvidenceRecords = [...(vlmChecker.getRunWebEvidence() ?? [])].sort(
           (a, b) => new Date(a.fetchedAt).getTime() - new Date(b.fetchedAt).getTime()
         );
@@ -1033,10 +1045,21 @@ vlmChecker: {
                 thickness: artifact.meta.context.planCut.thickness,
               }
             : undefined,
+          activeEntityId:
+            typeof artifact.meta?.context?.activeEntityId === "string"
+              ? artifact.meta.context.activeEntityId
+              : undefined,
+          novelty: readSnapshotNoveltyMetrics(artifact.meta?.context?.snapshotNovelty),
+          semanticEvidenceProgress:
+            artifact.meta?.context?.semanticEvidenceProgress &&
+            typeof artifact.meta.context.semanticEvidenceProgress === "object"
+              ? artifact.meta.context.semanticEvidenceProgress
+              : undefined,
           imageBase64: artifact.images?.[0]?.imageBase64Png,
         }));
         const sceneStates: SceneState[] = artifacts.map((artifact: any, index: number) => {
           const context = artifact.meta?.context ?? {};
+          const novelty = readSnapshotNoveltyMetrics(context.snapshotNovelty);
           const planCut = context.planCut && typeof context.planCut === "object"
             ? {
                 enabled: typeof context.planCut.enabled === "boolean" ? context.planCut.enabled : undefined,
@@ -1069,6 +1092,12 @@ vlmChecker: {
             hiddenIds: Array.isArray(context.hiddenIds) ? context.hiddenIds : undefined,
             highlightedIds: Array.isArray(context.highlightedIds) ? context.highlightedIds : undefined,
             planCut,
+            activeEntityId: typeof context.activeEntityId === "string" ? context.activeEntityId : undefined,
+            novelty,
+            semanticEvidenceProgress:
+              context.semanticEvidenceProgress && typeof context.semanticEvidenceProgress === "object"
+                ? context.semanticEvidenceProgress
+                : undefined,
           };
         });
         const stepBySnapshotId = new Map(
@@ -1123,7 +1152,7 @@ vlmChecker: {
                 ruleSnapshot?.visualEvidence ??
                 { lookFor: [], passIndicators: [], failIndicators: [], uncertainIndicators: [] },
             },
-            snapshotIds: d.evidence?.snapshotIds ?? [],
+            snapshotIds: d.meta?.inputSnapshotIds ?? d.evidence?.snapshotIds ?? [],
             timestamp: d.timestampIso,
             modelId,
           })),
@@ -1134,7 +1163,7 @@ vlmChecker: {
             timestamp: d.timestampIso,
           })),
           snapshots,
-          navigationActions: [],
+          navigationActions,
           sceneStates,
           stepMetrics: [],
           stressedFindings: [],
@@ -1144,7 +1173,7 @@ vlmChecker: {
           metrics: {
             totalSnapshots: snapshots.length,
             totalVlmCalls: decisions.length,
-            totalNavigationSteps: 0,
+            totalNavigationSteps: navigationActions.length,
             totalDurationMs: endTime - startTime,
             avgVlmResponseTimeMs: 0,
             avgConfidence: decisions.length > 0 ? decisions.reduce((s: number, d: VlmDecision) => s + d.confidence, 0) / decisions.length : 0,
@@ -1541,6 +1570,14 @@ vlmChecker: {
                   </span>
                   <input class="hud-settings-range" type="range" min="0" max="1" step="0.05" ?disabled=${inspectionStatus === "running"} .value=${String(prototypeRuntimeSettings.orbitMaxHighlightOcclusionRatio)}
                     @input=${(e: any) => updatePrototypeSetting("orbitMaxHighlightOcclusionRatio", e.target.value)} />
+                </label>
+                <label class="hud-setting-row">
+                  <span class="hud-setting-row-header">
+                    <span>SNAPSHOT_NOVELTY_REDUNDANCY_THRESHOLD</span>
+                    <span class="hud-setting-value">${prototypeRuntimeSettings.snapshotNoveltyRedundancyThreshold.toFixed(2)}</span>
+                  </span>
+                  <input class="hud-settings-range" type="range" min="0" max="1" step="0.05" ?disabled=${inspectionStatus === "running"} .value=${String(prototypeRuntimeSettings.snapshotNoveltyRedundancyThreshold)}
+                    @input=${(e: any) => updatePrototypeSetting("snapshotNoveltyRedundancyThreshold", e.target.value)} />
                 </label>
                 <bim-button label="Reset to file defaults" ?disabled=${inspectionStatus === "running"} @click=${resetPrototypeSettings}></bim-button>
               </div>

@@ -10,6 +10,7 @@
 import type { SnapshotArtifact } from "../snapshotCollector";
 import type { EvidenceView, VlmAdapter, VlmCheckInput, VlmFollowUp, VlmVerdict } from "../vlmChecker";
 import { DEFAULT_MAX_SNAPSHOTS_PER_REQUEST } from "../../config/prototypeSettings";
+import type { EvidenceRequirementsStatus } from "../../types/evidenceRequirements.types";
 import { wrapPromptBase, wrapPromptEnhanced } from "./prompts/promptWrappers";
 
 export type OpenRouterAdapterConfig = {
@@ -42,6 +43,8 @@ type DecisionCore = {
   verdict: VlmVerdict;
   confidence: number;
   rationale: string;
+  missingEvidence?: string[];
+  evidenceRequirementsStatus?: EvidenceRequirementsStatus;
 
   visibility: {
     isRuleTargetVisible: boolean;
@@ -61,6 +64,7 @@ type DecisionCore = {
     modelId: string | null;
     promptHash?: string;
     provider: string;
+    followUpSource?: "model" | "provider_override" | "default_fallback";
     adapterPromptText?: string;
     tokenUsage?: {
       inputTokens?: number;
@@ -602,6 +606,7 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
       } as const;
 
 let followUp = isFollowUp(parsed?.followUp) ? parsed.followUp : undefined;
+let followUpSource: DecisionCore["meta"]["followUpSource"] = followUp ? "model" : undefined;
 const rationaleText = typeof parsed?.rationale === "string" ? parsed.rationale.toLowerCase() : "";
 const rationaleWantsPlanCut =
   rationaleText.includes("plan cut") ||
@@ -611,9 +616,11 @@ const rationaleWantsPlanCut =
   rationaleText.includes("true top down");
 if (followUp?.request === "ZOOM_IN" && getLastNav(input.evidenceViews as any[])?.zoomPotentialExhausted) {
   followUp = undefined;
+  followUpSource = undefined;
 }
 if (followUp?.request === "TOP_VIEW" && getLastContext(input.evidenceViews as any[])?.lastActionReason === "top") {
   followUp = undefined;
+  followUpSource = undefined;
 }
 
 // --- Deterministic guardrail: prevent infinite NEW_VIEW loops for PoC ---
@@ -670,6 +677,7 @@ if (verdict === "UNCERTAIN") {
     followUp?.request !== "TOP_VIEW"
   ) {
     followUp = { request: "TOP_VIEW" } as any;
+    followUpSource = "provider_override";
   } else if (
     isDoorTask &&
     wantedStorey &&
@@ -681,64 +689,81 @@ if (verdict === "UNCERTAIN") {
       request: "SET_STOREY_PLAN_CUT",
       params: { storeyId: wantedStorey, offsetFromFloor: 1.2, mode: "WORLD_UP" },
     } as any;
+    followUpSource = "provider_override";
   }
 
   // If model says NEW_VIEW but we have an obvious next action, override it.
   if (!followUp || followUpIsNewView) {
     if (isRampTask && wantedStorey && currentScopeStorey !== wantedStorey) {
       followUp = { request: "ISOLATE_STOREY", params: { storeyId: wantedStorey } } as any;
+      followUpSource = "provider_override";
     }
     else if (isRampTask && currentViewPreset !== "iso") {
       followUp = { request: "ISO_VIEW" } as any;
+      followUpSource = "provider_override";
     }
     else if (isRampTask && activeEntityId && !highlightedIds?.includes(activeEntityId)) {
       followUp = { request: "HIGHLIGHT_IDS", params: { ids: [activeEntityId], style: "primary" } } as any;
+      followUpSource = "provider_override";
     }
     else if (isRampTask && safeVisibility.occlusionAssessment === "HIGH" && canOrbit && !lastActionWasOrbit) {
       followUp = { request: "ORBIT", params: { yawDegrees: 25, pitchDegrees: 0, reason: "Need a side or less occluded view of the ramp run." } } as any;
+      followUpSource = "provider_override";
     }
     else if (isRampTask && accessibilityFocused && currentViewPreset !== "top" && canRequestTopAfterOrbit) {
       followUp = { request: "TOP_VIEW" } as any;
+      followUpSource = "provider_override";
     }
     else if (isRampTask && wantedStorey && !planCutEnabled && (accessibilityFocused || floorContextMissing || rationaleWantsPlanCut)) {
       followUp = {
         request: "SET_STOREY_PLAN_CUT",
         params: { storeyId: wantedStorey, offsetFromFloor: 1.2, mode: "WORLD_UP" },
       } as any;
+      followUpSource = "provider_override";
     }
     else if (isRampTask && !planCutEnabled && (floorContextMissing || rationaleWantsPlanCut) && lastActionReason !== "plan-cut") {
       followUp = { request: "SET_PLAN_CUT", params: { height: 1.2, mode: "CAMERA" } } as any;
+      followUpSource = "provider_override";
     }
     else if (isRampTask && !zoomPotentialExhausted && lastActionReason !== "zoom-to-highlighted-entity") {
       followUp = { request: "ZOOM_IN", params: { factor: 1.15 } } as any;
+      followUpSource = "provider_override";
     }
     else if (isStairTask && wantedStorey && currentScopeStorey !== wantedStorey) {
       followUp = { request: "ISOLATE_STOREY", params: { storeyId: wantedStorey } } as any;
+      followUpSource = "provider_override";
     }
     else if (isStairTask && currentViewPreset !== "iso") {
       followUp = { request: "ISO_VIEW" } as any;
+      followUpSource = "provider_override";
     }
     else if (isStairTask && activeEntityId && !highlightedIds?.includes(activeEntityId)) {
       followUp = { request: "HIGHLIGHT_IDS", params: { ids: [activeEntityId], style: "primary" } } as any;
+      followUpSource = "provider_override";
     }
     else if (isStairTask && safeVisibility.occlusionAssessment === "HIGH" && canOrbit && !lastActionWasOrbit) {
       followUp = { request: "ORBIT", params: { yawDegrees: 25, pitchDegrees: 0, reason: "Need a clearer side or landing view of the stair run." } } as any;
+      followUpSource = "provider_override";
     }
     else if (isStairTask && accessibilityFocused && currentViewPreset !== "top" && canRequestTopAfterOrbit) {
       followUp = { request: "TOP_VIEW" } as any;
+      followUpSource = "provider_override";
     }
     else if (isStairTask && wantedStorey && !planCutEnabled && (accessibilityFocused || floorContextMissing || rationaleWantsPlanCut)) {
       followUp = {
         request: "SET_STOREY_PLAN_CUT",
         params: { storeyId: wantedStorey, offsetFromFloor: 1.2, mode: "WORLD_UP" },
       } as any;
+      followUpSource = "provider_override";
     }
     else if (isStairTask && !zoomPotentialExhausted && lastActionReason !== "zoom-to-highlighted-entity") {
       followUp = { request: "ZOOM_IN", params: { factor: 1.15 } } as any;
+      followUpSource = "provider_override";
     }
     // 1) Go to TOP view for accessibility checks.
     else if (isDoorTask && currentViewPreset !== "top" && canRequestTopAfterOrbit) {
       followUp = { request: "TOP_VIEW" } as any;
+      followUpSource = "provider_override";
     }
     // 2) Then prepare a storey-aware plan cut for the active storey.
     else if (isDoorTask && wantedStorey && !planCutEnabled) {
@@ -746,14 +771,17 @@ if (verdict === "UNCERTAIN") {
         request: "SET_STOREY_PLAN_CUT",
         params: { storeyId: wantedStorey, offsetFromFloor: 1.2, mode: "WORLD_UP" },
       } as any;
+      followUpSource = "provider_override";
     }
     // 3) Then isolate the relevant category before tighter framing.
     else if (targetClass && (!isolatedCats || !isolatedCats.some((c) => normalize(c).includes(normalize(targetClass))))) {
       followUp = { request: "ISOLATE_CATEGORY", params: { category: targetClass } } as any;
+      followUpSource = "provider_override";
     }
     // 4) Then force the active door highlight inside the current storey cluster.
     else if (activeEntityId && !highlightedIds?.includes(activeEntityId)) {
       followUp = { request: "HIGHLIGHT_IDS", params: { ids: [activeEntityId], style: "primary" } } as any;
+      followUpSource = "provider_override";
     }
     // 5) If floor context is missing or the rationale explicitly wants plan cut, prefer storey plan cut.
     else if (isDoorTask && wantedStorey && (floorContextMissing || rationaleWantsPlanCut) && !planCutEnabled) {
@@ -761,6 +789,7 @@ if (verdict === "UNCERTAIN") {
         request: "SET_STOREY_PLAN_CUT",
         params: { storeyId: wantedStorey, offsetFromFloor: 1.2, mode: "WORLD_UP" },
       } as any;
+      followUpSource = "provider_override";
     }
     else if (isDoorTask && doorPrepReady && !planCutEnabled && lastActionReason === "zoom-to-highlighted-entity") {
       followUp = wantedStorey
@@ -772,10 +801,12 @@ if (verdict === "UNCERTAIN") {
             request: "SET_PLAN_CUT",
             params: { height: 1.2, mode: "WORLD_UP" },
           } as any);
+      followUpSource = "provider_override";
     }
     // 6) Only after top view + storey plan cut prep, allow a tighter entity-focused zoom.
     else if ((!highlightedIds?.length || lastActionReason !== "zoom-to-highlighted-entity") && !zoomPotentialExhausted) {
       followUp = { request: "ZOOM_IN", params: { factor: 2 } } as any;
+      followUpSource = "provider_override";
     }
     else if (zoomPotentialExhausted && highlightedIds?.length && canOrbit) {
       followUp = {
@@ -786,9 +817,11 @@ if (verdict === "UNCERTAIN") {
           reason: "Focused target is already zoomed/highlighted; gather one bounded confirmation angle.",
         },
       } as any;
+      followUpSource = "provider_override";
     }
     else if (zoomPotentialExhausted) {
       followUp = undefined;
+      followUpSource = undefined;
     }
     // 7) Keep the storey plan cut as the preferred prepared state for later doors on the same storey.
     else {
@@ -801,6 +834,7 @@ if (verdict === "UNCERTAIN") {
             request: "SET_PLAN_CUT",
             params: { height: 1.2, mode: "WORLD_UP" },
           } as any);
+      followUpSource = "provider_override";
     }
   }
 }
@@ -810,6 +844,15 @@ if (verdict === "UNCERTAIN") {
         verdict,
         confidence,
         rationale: typeof parsed?.rationale === "string" ? parsed.rationale : "",
+        missingEvidence: Array.isArray(parsed?.missingEvidence)
+          ? parsed.missingEvidence.map((x: any) => String(x))
+          : safeVisibility.missingEvidence,
+        evidenceRequirementsStatus:
+          parsed?.evidenceRequirementsStatus && typeof parsed.evidenceRequirementsStatus === "object"
+            ? Object.fromEntries(
+                Object.entries(parsed.evidenceRequirementsStatus).filter(([, value]) => typeof value === "boolean")
+              ) as EvidenceRequirementsStatus
+            : undefined,
         visibility: safeVisibility,
         evidence: {
           // Let checker filter/normalize; we provide a deterministic default:
@@ -828,6 +871,9 @@ if (verdict === "UNCERTAIN") {
         meta: {
           modelId: cfg.model ?? null,
           provider: "openrouter",
+          followUpSource:
+            followUpSource ??
+            (verdict === "UNCERTAIN" && !followUp ? "default_fallback" : undefined),
           adapterPromptText: userText,
           ...(tokenUsage ? { tokenUsage } : {}),
         },

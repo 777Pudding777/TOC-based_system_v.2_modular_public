@@ -13,6 +13,7 @@ import {
   DEFAULT_TAVILY_MAX_CHARS,
   getPrototypeRuntimeSettings,
 } from "../config/prototypeSettings";
+import type { EvidenceRequirementsStatus } from "../types/evidenceRequirements.types";
 
 const DEFAULT_ALLOWED_DOMAINS = ["codes.iccsafe.org"];
 const WEB_FETCH_PROXY_BASE_URL =
@@ -104,6 +105,14 @@ export type VlmDecision = {
   confidence: number; // 0..1
 
   rationale: string;
+  /** Explicit high-level evidence gaps reported by the VLM */
+  missingEvidence?: string[];
+  /**
+   * Generalized evidence-requirement status reported by the VLM.
+   * The runtime planner may combine this with deterministic viewer context
+   * before choosing the next follow-up action.
+   */
+  evidenceRequirementsStatus?: EvidenceRequirementsStatus;
 
   // VLM must not guess geometry; it must rely on nav metrics (if present)
   visibility: {
@@ -125,6 +134,7 @@ export type VlmDecision = {
     modelId: string | null;
     promptHash: string;
     provider: string; // "mock", "openai", "anthropic", ...
+    followUpSource?: "model" | "provider_override" | "default_fallback";
     /**
      * Prompt assembled in vlmChecker after regulatory-context injection.
      * This is the text passed into adapter.check(...).
@@ -135,6 +145,8 @@ export type VlmDecision = {
      * (e.g. OpenRouter wrapPromptBase with system rubric + evidence index).
      */
     adapterPromptText?: string;
+    /** Exact snapshot ids passed into this VLM call before the model responded */
+    inputSnapshotIds?: string[];
     tokenUsage?: {
       inputTokens?: number;
       outputTokens?: number;
@@ -480,6 +492,19 @@ function finalizeDecision(
     verdict,
     confidence,
     rationale: String(core.rationale ?? ""),
+    missingEvidence: Array.isArray((core as any).missingEvidence)
+      ? (core as any).missingEvidence.map((x: unknown) => String(x))
+      : Array.isArray(visibility.missingEvidence)
+        ? visibility.missingEvidence.map((x) => String(x))
+        : undefined,
+    evidenceRequirementsStatus:
+      core && typeof (core as any).evidenceRequirementsStatus === "object" && (core as any).evidenceRequirementsStatus
+        ? Object.fromEntries(
+            Object.entries((core as any).evidenceRequirementsStatus).filter(
+              ([, value]) => typeof value === "boolean"
+            )
+          ) as EvidenceRequirementsStatus
+        : undefined,
     visibility: {
       isRuleTargetVisible: Boolean(visibility.isRuleTargetVisible),
       occlusionAssessment:
@@ -503,8 +528,15 @@ followUp: isFollowUp(core.followUp) ? core.followUp : undefined,
       modelId: core.meta?.modelId ?? input.artifacts[input.artifacts.length - 1]?.meta.modelId ?? null,
       promptHash: core.meta?.promptHash ?? hashPrompt(input.prompt),
       provider: core.meta?.provider ?? provider,
+      followUpSource:
+        core.meta?.followUpSource === "model" ||
+        core.meta?.followUpSource === "provider_override" ||
+        core.meta?.followUpSource === "default_fallback"
+          ? core.meta.followUpSource
+          : undefined,
       composedPromptText: input.prompt,
       adapterPromptText: core.meta?.adapterPromptText,
+      inputSnapshotIds: input.artifacts.map((artifact) => artifact.id),
       ...(tokenUsage && Object.keys(tokenUsage).length > 0 ? { tokenUsage } : {}),
     },
   };
