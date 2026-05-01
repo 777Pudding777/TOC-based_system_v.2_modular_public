@@ -38,6 +38,7 @@ import {
   ZOOM_IN_EXHAUSTION_AREA_FACTOR,
 } from "../config/prototypeSettings";
 import { findModelById } from "../config/openRouterModels";
+import { summarizePromptRegulatoryGrounding } from "../modules/regulatoryContext";
 /**
  * Report generation options
  */
@@ -1437,6 +1438,26 @@ function renderAppendixSubsection(title: string, content: string): string {
   `;
 }
 
+function renderJudgeEvidenceCritique(trace: ConversationTrace): string {
+  const judge = trace.judgeReport;
+  if (!judge) return `<p style="color: #6b7280;">No evidence critique was recorded for this run.</p>`;
+
+  const badge = (label: string, value: string) =>
+    `<span class="tag" style="font-size:12px;">${escapeHtml(label)}: ${escapeHtml(value)}</span>`;
+
+  return `
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;">
+      ${badge("Evidence support", judge.evidenceSupport)}
+      ${badge("Confidence assessment", judge.confidenceAssessment)}
+      ${judge.recommendedCorrection ? badge("Recommended correction", judge.recommendedCorrection) : ""}
+    </div>
+    <div style="color:#374151;">
+      <strong>Contradiction flags:</strong>
+      ${renderListItems(judge.contradictionFlags)}
+    </div>
+  `;
+}
+
 function stepsOverlap(aStart?: number, aEnd?: number, bStart?: number, bEnd?: number): boolean {
   if (aStart == null || aEnd == null || bStart == null || bEnd == null) return false;
   return aStart <= bEnd && bStart <= aEnd;
@@ -1514,6 +1535,7 @@ function generateJudgeAppendixSection(trace: ConversationTrace): string {
 
   return `
     ${renderAppendixSubsection("Suggestions for the User", renderListItems(judge.suggestionsForUser))}
+    ${renderAppendixSubsection("Evidence Critique", renderJudgeEvidenceCritique(trace))}
     ${renderAppendixSubsection("Possible Mistakes and Debugging suggestions", `
       <p style="color:#374151;margin-bottom:10px;">${escapeHtml(judge.debuggingAndSuggestions.primaryDecisionAssessment)}</p>
       <div style="margin-bottom:10px;"><strong>Possible mistakes:</strong>${renderListItems(judge.debuggingAndSuggestions.possibleMistakes)}</div>
@@ -1919,13 +1941,21 @@ function renderTraceStepItem(
       : "";
 
   const promptHtml = prompt?.promptText
-    ? `
+    ? (() => {
+        const regulatorySummary = summarizePromptRegulatoryGrounding({
+          promptText: prompt.promptText,
+          promptSource: prompt.promptSource,
+          hasExternalWebEvidence: Array.isArray(prompt.webSourcesUsed) && prompt.webSourcesUsed.length > 0,
+        });
+        return `
     <details class="step-prompt">
       <summary>Prompt Text</summary>
       ${prompt.promptSource
         ? `<div style="padding: 0 12px 10px; color: #6b7280; font-size: 12px;">
         Source: ${escapeHtml(prompt.promptSource === "rule_library" ? "Rule Library" : "Custom User Prompt")}
         ${prompt.promptSourceLabel ? ` | Label: ${escapeHtml(prompt.promptSourceLabel)}` : ""}
+        <br>Regulatory basis: ${escapeHtml(regulatorySummary.regulatoryBasisLabel)}
+        <br>Web evidence: ${escapeHtml(regulatorySummary.webEvidenceLabel)}
       </div>`
         : ""}
       ${Array.isArray(prompt.webSourcesUsed) && prompt.webSourcesUsed.length > 0
@@ -1944,6 +1974,7 @@ function renderTraceStepItem(
       <pre>${escapeHtml(prompt.promptText)}</pre>
     </details>
   `
+      })()
     : "";
 
   return `

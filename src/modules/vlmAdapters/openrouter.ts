@@ -9,7 +9,10 @@
 
 import type { SnapshotArtifact } from "../snapshotCollector";
 import type { EvidenceView, VlmAdapter, VlmCheckInput, VlmFollowUp, VlmVerdict } from "../vlmChecker";
-import { DEFAULT_MAX_SNAPSHOTS_PER_REQUEST } from "../../config/prototypeSettings";
+import {
+  clampMaxSnapshotsPerRequest,
+  DEFAULT_MAX_SNAPSHOTS_PER_REQUEST,
+} from "../../config/prototypeSettings";
 import type { EvidenceRequirementsStatus } from "../../types/evidenceRequirements.types";
 import { wrapPromptBase, wrapPromptEnhanced } from "./prompts/promptWrappers";
 
@@ -197,9 +200,14 @@ function stableEvidenceJson(evidenceViews: EvidenceView[]): string {
   return JSON.stringify(evidenceViews, null, 2);
 }
 
-function getLastContext(evidenceViews: any[]): any | undefined {
-  const last = evidenceViews?.[evidenceViews.length - 1];
+function getLastPromptContext(input: VlmCheckInput): any | undefined {
+  const last = input.evidenceViews?.[input.evidenceViews.length - 1];
   return last?.context;
+}
+
+function getLastFullTraceContext(input: VlmCheckInput): any | undefined {
+  const lastArtifact = input.artifacts?.[input.artifacts.length - 1] as any;
+  return lastArtifact?.meta?.context ?? getLastPromptContext(input);
 }
 
 function getLastNav(evidenceViews: any[]): any | undefined {
@@ -417,7 +425,9 @@ export function createOpenRouterVlmAdapter(cfg: OpenRouterAdapterConfig): VlmAda
         }
       }
 
-            const maxImages = Math.max(1, Math.min(16, cfg.maxImages ?? DEFAULT_MAX_SNAPSHOTS_PER_REQUEST));
+            const maxImages = clampMaxSnapshotsPerRequest(
+              cfg.maxImages ?? DEFAULT_MAX_SNAPSHOTS_PER_REQUEST
+            );
       const imageInputsCapped = imageInputs.slice(Math.max(0, imageInputs.length - maxImages));
 
             const imageIndex = imageInputsCapped.map((x, i) => ({
@@ -618,14 +628,14 @@ if (followUp?.request === "ZOOM_IN" && getLastNav(input.evidenceViews as any[])?
   followUp = undefined;
   followUpSource = undefined;
 }
-if (followUp?.request === "TOP_VIEW" && getLastContext(input.evidenceViews as any[])?.lastActionReason === "top") {
+if (followUp?.request === "TOP_VIEW" && getLastFullTraceContext(input)?.lastActionReason === "top") {
   followUp = undefined;
   followUpSource = undefined;
 }
 
 // --- Deterministic guardrail: prevent infinite NEW_VIEW loops for PoC ---
 if (verdict === "UNCERTAIN") {
-  const ctxAny = getLastContext(input.evidenceViews as any[]);
+  const ctxAny = getLastFullTraceContext(input);
   const navAny = getLastNav(input.evidenceViews as any[]);
   const availableStoreys: string[] | undefined = ctxAny?.availableStoreys;
   const currentScopeStorey: string | undefined = ctxAny?.scope?.storeyId;

@@ -14,6 +14,12 @@ import {
   getPrototypeRuntimeSettings,
 } from "../config/prototypeSettings";
 import type { EvidenceRequirementsStatus } from "../types/evidenceRequirements.types";
+import {
+  assessPromptRegulatoryGrounding,
+  buildRegulatoryContextBlock,
+  hasExplicitRegulatoryGapText,
+  inferPromptSource,
+} from "./regulatoryContext";
 
 const DEFAULT_ALLOWED_DOMAINS = ["codes.iccsafe.org"];
 const WEB_FETCH_PROXY_BASE_URL =
@@ -23,7 +29,6 @@ import { webFetchViaProxy } from "./vlmAdapters/tools/webFetch";
 import {
   isTavilyAvailable,
   searchRuleContext,
-  formatResultsForPrompt,
   webFetchViaTavily,
 } from "./vlmAdapters/tools/tavilySearch";
 import type { WebEvidenceRecord } from "../types/trace.types";
@@ -152,6 +157,17 @@ export type VlmDecision = {
       outputTokens?: number;
       totalTokens?: number;
     };
+    promptContextStats?: {
+      fullContextChars: number;
+      compactContextChars: number;
+      snapshotCount: number;
+      compactModeEnabled: boolean;
+      usedCompactContext: boolean;
+      fullFallbackSnapshotIds?: string[];
+    };
+    /** Exact evidence views sent to the VLM for this decision (compact or full, depending on runtime mode). */
+    promptEvidenceViews?: EvidenceView[];
+    taskPromptMode?: "full_rule_text" | "compact_follow_up_summary";
   };
 };
 
@@ -355,9 +371,24 @@ function composePromptWithRegulatoryContext(args: {
   userIntent: string;
   regulatoryContext: string;
   allowedDomains: string[];
+  promptSource: "rule_library" | "custom_user_prompt" | "unknown";
   }): string {
   const allowedLines = args.allowedDomains.map((d) => `- https://${d}`).join("\n");
-  const ctx = args.regulatoryContext.trim();
+  const regulatoryBlock = buildRegulatoryContextBlock({
+    prompt: args.userIntent,
+    regulatoryContext: args.regulatoryContext,
+  });
+
+  if (
+    import.meta.env.DEV &&
+    args.promptSource === "rule_library" &&
+    assessPromptRegulatoryGrounding(args.userIntent).hasUsableLocalGrounding
+  ) {
+    console.assert(
+      !/\(none yet; fetch if needed\)/i.test(regulatoryBlock),
+      "[ruleLibrary] grounded predefined prompt should not emit REGULATORY_CONTEXT: none"
+    );
+  }
 
   return (
     "USER_INTENT:\n" +
@@ -367,17 +398,9 @@ function composePromptWithRegulatoryContext(args: {
     allowedLines +
     "\n\n" +
     "REGULATORY_CONTEXT:\n" +
-    (ctx.length ? ctx : "(none yet; fetch if needed)") +
+    regulatoryBlock +
     "\n"
   );
-}
-
-function isVagueCompliancePrompt(p: string): boolean {
-  const s = (p ?? "").toLowerCase();
-  const hasNumber = /\b\d+(\.\d+)?\b/.test(s);            // any numeric threshold or clause
-  const hasClauseWord = /\b(section|sec\.|clause|chapter)\b/.test(s);
-  const hasEdition = /\b(20\d{2})\b/.test(s);
-  return !(hasNumber || hasClauseWord) || !hasEdition;
 }
 
 function guessIccEntrypointUrl(userIntent: string, allowedDomains: string[]): string | null {
@@ -622,13 +645,6 @@ export function createVlmChecker(
     getProviderConfig?: () => ReducerProviderConfig;
   }
 ) {
-  function inferPromptSource(prompt: string): "rule_library" | "custom_user_prompt" | "unknown" {
-    const text = String(prompt ?? "");
-    if (/SOURCE:\s*RULE_LIBRARY/i.test(text)) return "rule_library";
-    if (/SOURCE:\s*CUSTOM_USER_PROMPT/i.test(text)) return "custom_user_prompt";
-    return "unknown";
-  }
-
         async function fetchRegulatoryContextDirect(args: {
         step: number;
         url: string;
@@ -829,7 +845,8 @@ export function createVlmChecker(
       // Keep original user prompt stable; accumulate regulatory context deterministically.
       const userIntent = norm0.prompt;
       const promptSource = inferPromptSource(userIntent);
-      const allowWebGrounding = promptSource !== "rule_library";
+      const promptGrounding = assessPromptRegulatoryGrounding(userIntent);
+      const allowGeneralWebGrounding = promptSource !== "rule_library";
       let regulatoryContext = "";
       const fetchedUrls = new Set<string>();
 
@@ -841,14 +858,15 @@ export function createVlmChecker(
           userIntent,
           regulatoryContext,
           allowedDomains,
+          promptSource,
         });
 
         // Deterministic prefetch: do not rely on the model to request WEB_FETCH first.
         if (
-          allowWebGrounding &&
+          promptGrounding.requiresExternalFetchByDefault &&
           step === 0 &&
           !regulatoryContext.trim() &&
-          isVagueCompliancePrompt(userIntent)
+          allowedDomains.length > 0
         ) {
           const prefetchUrl = guessIccEntrypointUrl(userIntent, allowedDomains);
 
@@ -886,6 +904,7 @@ export function createVlmChecker(
             userIntent,
             regulatoryContext,
             allowedDomains,
+            promptSource,
           });
         }
         const norm: VlmCheckInput = { ...norm0, prompt: composedPrompt };
@@ -897,13 +916,25 @@ export function createVlmChecker(
         // If model requests WEB_FETCH, execute it internally and re-run once.
                 const fu = isFollowUp(core.followUp) ? core.followUp : undefined;
         if (core.verdict === "UNCERTAIN" && fu?.request === "WEB_FETCH") {
-          if (!allowWebGrounding) {
+          const explicitSupplementalRegulatoryGap = hasExplicitRegulatoryGapText([
+            core.rationale,
+            ...(core.missingEvidence ?? []),
+            ...(core.visibility?.missingEvidence ?? []),
+          ]);
+          const allowRuleLibrarySupplementalWebGrounding =
+            promptSource === "rule_library" &&
+            (!promptGrounding.hasUsableLocalGrounding || explicitSupplementalRegulatoryGap);
+
+          if (!allowGeneralWebGrounding && !allowRuleLibrarySupplementalWebGrounding) {
             const patched = {
               ...core,
-              followUp: { request: "NEW_VIEW", params: { reason: "WEB_FETCH disabled for predefined rule mode." } } as VlmFollowUp,
+              followUp: {
+                request: "NEW_VIEW",
+                params: { reason: "Supplemental WEB_FETCH is not justified because local ruleLibrary context already grounds this predefined rule." },
+              } as VlmFollowUp,
               rationale:
                 (core.rationale ? core.rationale + " " : "") +
-                "Regulatory web-grounding is disabled for predefined rule mode; proceeding with model-view evidence only.",
+                "Local ruleLibrary context already provides regulatory grounding for this predefined rule, so no external web fetch was justified.",
             };
             return finalizeDecision(patched as any, norm, adapter.name);
           }
@@ -1101,6 +1132,7 @@ export function createVlmChecker(
       userIntent,
       regulatoryContext,
       allowedDomains,
+      promptSource,
     });
     const norm: VlmCheckInput = { ...norm0, prompt: composedPrompt };
     const fallbackCore = await adapter.check(norm);

@@ -1,5 +1,6 @@
 import type { ComplianceRule } from "../../../types/rule.types";
 import type { EvidenceRequirementKey } from "../../../types/evidenceRequirements.types";
+import { assessRuleRegulatoryGrounding } from "../../regulatoryContext";
 
 export type WrapPromptInput = {
   taskPrompt: string;
@@ -23,13 +24,15 @@ function buildPromptCore(args: {
           "2) Treat DYNAMIC_CHECKLIST as a compact runtime task brief inferred from prompt text, runtime evidence, and any grounded regulatory context. Use activeTask, activeEntity, activeStorey, and progress only; ignore completed or unrelated work.",
           "3) Focus on evidence requirements, not navigation recipes. Report what is still missing or not ready, especially visibility, measurement readiness, surrounding-context readiness, occlusion, and regulatory context.",
           "4) Treat evidenceViews.context.evidenceRequirements as the generalized runtime evidence state. If present, update or confirm that status instead of inventing a rule-specific action sequence.",
-          "5) For door-clearance checks, treat evidenceViews.context.highlightAnnotations.doorClearanceReadiness as an authoritative specialized readiness signal that should be expressed through generalized evidence-requirement status such as planMeasurementReady or contextViewReady.",
+          "5) Use evidenceViews.context.activeEntity, currentView, visualReference.targetMetadata, navigationQuality, semanticProgress, and runtimeNotice as the compact runtime evidence summary for the latest snapshot.",
           "6) If floor-based clearance cannot be grounded because local floor context is missing, describe that as a plan-measurement readiness gap rather than prescribing a specific tool unless a follow-up suggestion is still helpful.",
           "7) Use side or oblique views as confirmation evidence after a readable measurement-oriented view, not as the primary basis for plan-based measurements.",
           "8) When the user prompt mentions a storey, level, side, or specific inspection strategy, prioritize that hint if compatible with the visible evidence and available storeys.",
-          "9) If the task prompt is vague on thresholds or clause text, report regulatoryClauseNeeded before additional geometry-oriented follow-up.",
-          "10) If repeated targeted evidence is still insufficient for PASS or FAIL, it is acceptable to stay UNCERTAIN for the active entity rather than forcing more unproductive navigation.",
-          "11) followUp is only an advisory suggestion. Prefer reporting missingEvidence and evidenceRequirementsStatus clearly.",
+          "9) If SOURCE: RULE_LIBRARY is present, treat the injected ruleLibrary thresholds, references, dimensional notes, and evaluation criteria as authoritative local regulatory context for this predefined check.",
+          "10) Do not say that regulatory context is absent when local ruleLibrary context is present. Distinguish local ruleLibrary grounding from externally fetched web evidence.",
+          "11) Only report regulatoryClauseNeeded when thresholds, clause text, definitions, or exceptions are still missing after considering the local ruleLibrary context or prompt-provided grounding.",
+          "12) If repeated targeted evidence is still insufficient for PASS or FAIL, it is acceptable to stay UNCERTAIN for the active entity rather than forcing more unproductive navigation.",
+          "13) followUp is only an advisory suggestion. Prefer reporting missingEvidence and evidenceRequirementsStatus clearly.",
         ]
       : [
           "WORKFLOW:",
@@ -38,8 +41,11 @@ function buildPromptCore(args: {
           "3) Check whether the target is visible, focused, and measurable enough from the current evidence.",
           "4) If measurable, evaluate PASS or FAIL from visible evidence plus authoritative nav/context values.",
           "5) If not measurable, return UNCERTAIN and report missingEvidence plus evidenceRequirementsStatus.",
-          "6) followUp is optional and advisory. Prefer describing the evidence gap over prescribing a tool-specific sequence.",
-          "7) If multiple targeted attempts have already failed to make the active entity measurable, remain UNCERTAIN rather than repeating low-value navigation.",
+          "6) If SOURCE: RULE_LIBRARY is present, treat the injected ruleLibrary thresholds, references, and evaluation criteria as authoritative local regulatory context.",
+          "7) Absence of fetched web evidence does not mean absence of regulatory context when local ruleLibrary context is already provided.",
+          "8) Only report regulatoryClauseNeeded when clause text, thresholds, or definitions are still missing after considering local ruleLibrary or prompt-provided grounding.",
+          "9) followUp is optional and advisory. Prefer describing the evidence gap over prescribing a tool-specific sequence.",
+          "10) If multiple targeted attempts have already failed to make the active entity measurable, remain UNCERTAIN rather than repeating low-value navigation.",
         ];
 
   return [
@@ -50,8 +56,8 @@ function buildPromptCore(args: {
     "NON-NEGOTIABLES:",
     "- Do not guess geometry or dimensions.",
     "- Treat evidenceViews.nav and evidenceViews.context as authoritative runtime evidence.",
-    "- If evidenceViews.context.highlightAnnotations is present, use its legend as the authoritative explanation of overlay colors.",
-    "- If evidenceViews.context.highlightAnnotations.doorClearanceReadiness is present, use it as the authoritative summary of whether the highlighted door already has a decisive measurement-oriented view.",
+    "- If evidenceViews.context.visualReference.targetMetadata is present, use its dimensions and legend as the authoritative snapshot metadata for the active target.",
+    "- If compact context is unavailable because debug fallback used the full trace context, prefer the smallest directly relevant legacy fields and ignore unrelated debug internals.",
     "- If evidenceViews.nav.zoomPotentialExhausted is true for the latest step, do not request another generic ZOOM_IN for that entity. Work with the current evidence, request a different view type, or remain UNCERTAIN.",
     "- If a top HUD/info tab is visible, treat its IFC class, object id, dimensions, and color legend as explicit snapshot reference evidence.",
     "- Use the visible viewer grid as the primary dimensional reference whenever it is clearly visible: 1 primary cell = 1 m x 1 m, 1 major cell = 10 m x 10 m.",
@@ -62,9 +68,12 @@ function buildPromptCore(args: {
     ...workflow,
     "",
     "WEB / REFERENCE POLICY:",
+    "- Treat local ruleLibrary context as the default regulatory basis for predefined rule checks.",
+    "- Keep external web evidence separate from local ruleLibrary context in your reasoning and wording.",
     "- If AllowedSources or allowlisted domains are provided and clause text is needed, use WEB_FETCH from those sources.",
     "- If no allowlist is provided, do not browse; ask for the missing clause or definition in the rationale or follow-up.",
-    "- If the requirement is vague on thresholds, section number, or edition, prioritize WEB_FETCH before model navigation.",
+    "- If SOURCE: RULE_LIBRARY is present and local rule thresholds appear usable, do not request WEB_FETCH unless the local rule context is still insufficient.",
+    "- If the requirement is vague on thresholds, section number, or edition, prioritize WEB_FETCH before model navigation only when local grounding is still insufficient.",
     "- Prefer authoritative code repositories over summaries.",
     "",
     "FOLLOW-UP ADVISORY REFERENCE:",
@@ -103,7 +112,9 @@ function buildPromptCore(args: {
     "- confidence must be within [0,1].",
     "- Rationale must be short and evidence-grounded.",
     "- If you used WEB_EVIDENCE, mention the clause identifier or section briefly in the rationale.",
-    "- If evidenceViews.context.highlightAnnotations.sizeReference, hudContents, or a visible HUD provides highlighted-object class/id/dimensions/color legend, you may use those as explicit reference evidence from the snapshot.",
+    "- If local ruleLibrary context is present, you may say that no external web evidence was fetched, but you must not say that no regulatory context was provided.",
+    "- Use compact target metadata first: active entity identity, view state, target metadata dimensions/legend, evidence requirements, and semantic/runtime warnings.",
+    "- In debug fallback mode, legacy highlightAnnotations or HUD blocks may appear; use them only as reference evidence, not as a reason to discuss unrelated trace internals.",
     "- If the readiness signal says the highlighted door is measurableLikely, do not ask for another near-duplicate zoom or angle unless a specific missing evidence item still requires it.",
     "- Apply the same anti-repeat rule to every entity class: once focused zoom potential is exhausted, prefer another action or finish the entity as inconclusive rather than repeating ZOOM_IN.",
     "- Prefer one focused evidence statement over repeated broad navigation language.",
@@ -127,6 +138,108 @@ export function wrapPromptEnhanced(input: WrapPromptInput): string {
   return buildPromptCore({ ...input, mode: "enhanced" });
 }
 
+function parsePromptLineValue(text: string, key: string): string | undefined {
+  const match = String(text ?? "").match(new RegExp(`^${key}:\\s*(.+)$`, "m"));
+  return match?.[1]?.trim() || undefined;
+}
+
+function extractSourcePromptText(taskPrompt: string): string {
+  const marker = "SOURCE_PROMPT_TEXT:";
+  const markerIndex = taskPrompt.indexOf(marker);
+  if (markerIndex < 0) return taskPrompt.trim();
+  return taskPrompt.slice(markerIndex + marker.length).trim();
+}
+
+function extractPromptSummaryText(sourceText: string): string | undefined {
+  const description = parsePromptLineValue(sourceText, "DESCRIPTION");
+  if (description) return description;
+
+  const lines = sourceText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter(
+      (line) =>
+        !/^[A-Z][A-Z _-]+:?$/.test(line) &&
+        !line.startsWith("- ") &&
+        !/^SOURCE RULE:?$/i.test(line)
+    );
+
+  return lines.find((line) => !line.startsWith("COMPLIANCE RULE:") && !line.startsWith("INSPECTION_INPUT_CONTEXT:"));
+}
+
+function inferConcernKeywordsFromPrompt(text: string): string[] {
+  const normalized = text.toLowerCase();
+  const mappings: Array<{ key: string; match: RegExp }> = [
+    { key: "visibility", match: /\bvisible|visibility|focus(ed)?\b/ },
+    { key: "clearance", match: /\bclearance|maneuver|turning\b/ },
+    { key: "dimensions", match: /\bmeasure|dimension|width|height|depth|headroom\b/ },
+    { key: "landing", match: /\blanding|approach\b/ },
+    { key: "handrail", match: /\bhandrail\b/ },
+    { key: "slope", match: /\bslope|gradient|ramp\b/ },
+    { key: "accessibility", match: /\baccessible|accessibility|wheelchair|ada\b/ },
+    { key: "egress_width", match: /\begress\b/ },
+    { key: "regulatory_context", match: /\bsection|clause|standard|ibc|icc|a117\b/ },
+  ];
+
+  return mappings.filter((item) => item.match.test(normalized)).map((item) => item.key);
+}
+
+function extractDimensionalThresholds(text: string): string[] {
+  const matches = text.match(/\b\d+(?:\.\d+)?\s?(?:mm|cm|m|in|ft|%)\b/gi) ?? [];
+  return Array.from(new Set(matches.map((item) => item.trim()))).slice(0, 6);
+}
+
+/**
+ * Compact follow-up rule context builder.
+ * Keeps full source prompt text in trace exports while shrinking repeated rule
+ * text that gets sent back to the VLM on later steps.
+ */
+export function buildCompactFollowUpTaskPrompt(args: {
+  fullTaskPrompt: string;
+  activeTaskTitle?: string;
+  activeEntityId?: string;
+  activeEntityClass?: string;
+  activeStoreyId?: string;
+  activeConcerns?: string[];
+}): string {
+  const fullTaskPrompt = String(args.fullTaskPrompt ?? "").trim();
+  if (!fullTaskPrompt) return fullTaskPrompt;
+
+  const marker = "SOURCE_PROMPT_TEXT:";
+  const markerIndex = fullTaskPrompt.indexOf(marker);
+  const prefix =
+    markerIndex >= 0
+      ? fullTaskPrompt.slice(0, markerIndex + marker.length).trimEnd()
+      : `${fullTaskPrompt}\n\n${marker}`;
+
+  const sourceText = extractSourcePromptText(fullTaskPrompt);
+  const ruleId = parsePromptLineValue(fullTaskPrompt, "RULE_ID");
+  const ruleTitle =
+    parsePromptLineValue(fullTaskPrompt, "RULE_TITLE") ??
+    parsePromptLineValue(sourceText, "COMPLIANCE RULE") ??
+    "Inspection follow-up";
+  const summary = extractPromptSummaryText(sourceText);
+  const concerns = (args.activeConcerns?.length ? args.activeConcerns : inferConcernKeywordsFromPrompt(sourceText)).slice(0, 6);
+  const thresholds = extractDimensionalThresholds(sourceText);
+
+  const compactLines = [
+    "FOLLOW_UP_RULE_CONTEXT:",
+    `- ruleTitle: ${ruleTitle}`,
+    ...(ruleId ? [`- ruleId: ${ruleId}`] : []),
+    ...(summary ? [`- ruleSummary: ${summary}`] : []),
+    `- activeConcerns: ${concerns.join(", ") || "none"}`,
+    `- dimensionalThresholds: ${thresholds.join(", ") || "none stated"}`,
+    `- currentActiveTask: ${args.activeTaskTitle ?? "unspecified"}`,
+    `- activeEntity: ${args.activeEntityId ?? "unspecified"}`,
+    `- activeEntityClass: ${args.activeEntityClass ?? "unspecified"}`,
+    `- activeStorey: ${args.activeStoreyId ?? "unspecified"}`,
+    "- followUpRuleContextMode: compact_summary_after_step_1",
+  ];
+
+  return [prefix, ...compactLines].join("\n");
+}
+
 function formatList(items: string[] | undefined): string[] {
   return Array.isArray(items) ? items.filter(Boolean).map((item) => `- ${item}`) : [];
 }
@@ -143,6 +256,7 @@ function buildEvidenceRequirementList(keys: EvidenceRequirementKey[]): string[] 
 function inferEvidenceRequirements(rule: ComplianceRule): EvidenceRequirementKey[] {
   const text = collectRuleText(rule);
   const requirements = new Set<EvidenceRequirementKey>(["targetVisible", "targetFocused"]);
+  const regulatoryGrounding = assessRuleRegulatoryGrounding(rule);
 
   const mentionsPlan =
     text.includes("top view") ||
@@ -189,7 +303,12 @@ function inferEvidenceRequirements(rule: ComplianceRule): EvidenceRequirementKey
   if (mentionsContext) requirements.add("contextViewNeeded");
   if (mentionsDimensions) requirements.add("dimensionReferenceNeeded");
   if (mentionsOcclusion) requirements.add("obstructionContextNeeded");
-  if (mentionsRegulatory) requirements.add("regulatoryClauseNeeded");
+  // Rule-library context already carries the default regulatory grounding for
+  // predefined checks. Only pre-mark clause grounding as missing when the local
+  // rule itself does not provide usable criteria or references.
+  if (mentionsRegulatory && !regulatoryGrounding.hasUsableLocalGrounding) {
+    requirements.add("regulatoryClauseNeeded");
+  }
   if (mentionsBothSides) requirements.add("bothSidesOrSurroundingsNeeded");
 
   if (text.includes("door")) {
@@ -306,6 +425,13 @@ function inferGeneralizedEvidencePriorities(rule: ComplianceRule): string[] {
 
 export function buildPromptFromRule(rule: ComplianceRule): string {
   const evidenceRequirements = inferEvidenceRequirements(rule);
+  const regulatoryGrounding = assessRuleRegulatoryGrounding(rule);
+  if (import.meta.env.DEV && regulatoryGrounding.hasUsableLocalGrounding) {
+    console.assert(
+      !evidenceRequirements.includes("regulatoryClauseNeeded"),
+      `[ruleLibrary] grounded predefined rule should not default to regulatoryClauseNeeded: ${rule.id}`
+    );
+  }
   return [
     `COMPLIANCE RULE: ${rule.title}`,
     ``,
@@ -324,6 +450,24 @@ export function buildPromptFromRule(rule: ComplianceRule): string {
     `- Assess only the active target(s) relevant to this rule.`,
     `- Use the rule-specific evidence cues and dimensional references below before suggesting any follow-up.`,
     `- Separate what evidence is needed from which navigation action might obtain it.`,
+    `- Treat this predefined ruleLibrary entry as the authoritative local regulatory context unless it is explicitly insufficient.`,
+    ``,
+    `LOCAL REGULATORY CONTEXT:`,
+    `- LOCAL_RULE_CONTEXT: ${
+      regulatoryGrounding.hasUsableLocalGrounding
+        ? "provided_from_rule_library"
+        : "present_but_insufficient_for_complete_grounding"
+    }`,
+    `- WEB_FETCH_REQUIRED: ${
+      regulatoryGrounding.hasUsableLocalGrounding
+        ? "false unless local rule thresholds are insufficient"
+        : "true if local rule thresholds, definitions, or exceptions remain insufficient"
+    }`,
+    `- REGULATORY_BASIS: ${
+      regulatoryGrounding.hasUsableLocalGrounding
+        ? "local interpreted ruleLibrary entry"
+        : "ruleLibrary entry requires supplemental clause grounding"
+    }`,
     ``,
     `WHAT TO LOOK FOR:`,
     ...formatList(rule.visualEvidence.lookFor),

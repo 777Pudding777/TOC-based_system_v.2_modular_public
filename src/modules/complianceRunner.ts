@@ -3,6 +3,7 @@
 // capture snapshot(s), call VLM checker, store decisions, and optionally do follow-ups.
 
 import {
+  clampMaxSnapshotsPerRequest,
   ENTITY_REPEATED_WORKFLOW_TERMINATION_STEPS,
   HIGHLIGHT_NAVIGATION_DEFAULTS,
   HIGHLIGHT_TARGET_AREA_RATIO,
@@ -21,6 +22,11 @@ import {
 import type { CameraPose, StartPosePreset, ViewerGridReference } from "../viewer/api";
 import type { SnapshotArtifact } from "./snapshotCollector";
 import type { VlmDecision, VlmFollowUp } from "./vlmChecker";
+import { buildCompactFollowUpTaskPrompt } from "./vlmAdapters/prompts/promptWrappers";
+import {
+  assessPromptRegulatoryGrounding,
+  hasExplicitRegulatoryGapText,
+} from "./regulatoryContext";
 import {
   buildTaskGraphPromptSection,
   type CompactTaskGraphState,
@@ -200,6 +206,86 @@ type EvidenceContext = {
   finalizationReason?: string;
 };
 
+type FullTraceEvidenceContext = EvidenceContext;
+
+type CompactVlmEvidenceContext = {
+  contextMode: "compact_vlm_evidence";
+  snapshotId: string;
+  note?: string;
+  stepLabel?: string;
+  activeEntity: {
+    id: string;
+    class: string;
+    storeyId?: string;
+  };
+  taskBrief?: {
+    activeTaskTitle?: string;
+    activeStoreyId?: string;
+  };
+  currentView: {
+    viewPreset: "top" | "iso" | "angled" | "unknown";
+    viewLayout?: string;
+    targetHighlighted: boolean;
+    targetFocused?: boolean;
+    planCutEnabled: boolean;
+    scopeSummary: {
+      mode: "storey" | "category" | "space" | "none";
+      storeyId?: string;
+      spaceId?: string;
+      isolatedElements?: {
+        count: number;
+        containsActiveEntity: boolean;
+      };
+      hidden: {
+        count: number;
+        categories?: string[];
+      };
+      highlighted: {
+        count: number;
+        activeTargetHighlighted: boolean;
+      };
+      isolatedCategoryCount?: number;
+    };
+  };
+  visualReference?: {
+    gridCellSizeMeters?: number;
+    majorGridCellSizeMeters?: number;
+    targetMetadata?: {
+      dimensions?: string;
+      legend?: string[];
+    };
+  };
+  navigationQuality?: {
+    projectedAreaRatio?: number;
+    zoomPotentialExhausted?: boolean;
+    visualNoveltyScore?: number;
+    redundancyWarning?: string;
+  };
+  evidenceRequirements: {
+    resolved: string[];
+    missing: string[];
+    missingReasons?: Record<string, string>;
+  };
+  semanticProgress?: {
+    semanticProgressScore?: number;
+    semanticStagnationWarning?: boolean;
+    normalizedEvidenceGaps?: string[];
+  };
+  runtimeHints?: {
+    orbitRemainingForActiveEntity?: number;
+  };
+  runtimeNotice?: string;
+};
+
+type PromptContextStats = {
+  fullContextChars: number;
+  compactContextChars: number;
+  snapshotCount: number;
+  compactModeEnabled: boolean;
+  usedCompactContext: boolean;
+  fullFallbackSnapshotIds?: string[];
+};
+
 type SnapshotNoveltyComparable = {
   snapshotId: string;
   activeEntityId?: string;
@@ -230,6 +316,305 @@ function normalizeStringArray(values?: string[]): string[] {
         .slice()
         .sort()
     : [];
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function shortText(value: unknown, maxLength = 140): string | undefined {
+  const normalized = typeof value === "string" ? value.replace(/\s+/g, " ").trim() : "";
+  if (!normalized) return undefined;
+  return normalized.length > maxLength ? `${normalized.slice(0, Math.max(0, maxLength - 1)).trim()}…` : normalized;
+}
+
+function readHudDimensions(highlightAnnotations?: Record<string, unknown>): string | undefined {
+  const sizeReference = asRecord(highlightAnnotations?.sizeReference);
+  const hudContents = asRecord(highlightAnnotations?.hudContents);
+  const hudDimensions = shortText(hudContents?.dimensions, 80);
+  if (hudDimensions) return hudDimensions;
+
+  const width = typeof sizeReference?.width === "number" ? sizeReference.width : undefined;
+  const depth = typeof sizeReference?.depth === "number" ? sizeReference.depth : undefined;
+  const height = typeof sizeReference?.height === "number" ? sizeReference.height : undefined;
+  if ([width, depth, height].every((value) => typeof value === "number")) {
+    return `W ${width!.toFixed(3)} m D ${depth!.toFixed(3)} m H ${height!.toFixed(3)} m`;
+  }
+  return undefined;
+}
+
+function readCompactLegend(highlightAnnotations?: Record<string, unknown>): string[] | undefined {
+  const hudContents = asRecord(highlightAnnotations?.hudContents);
+  const hudLegend = Array.isArray(hudContents?.legend) ? hudContents.legend : undefined;
+  const highlightLegend = Array.isArray(highlightAnnotations?.legend) ? highlightAnnotations.legend : undefined;
+  const source = hudLegend?.length ? hudLegend : highlightLegend;
+  if (!source?.length) return undefined;
+
+  const labels = source
+    .map((entry) => {
+      if (typeof entry === "string") return shortText(entry, 30);
+      const record = asRecord(entry);
+      return shortText(record?.meaning ?? record?.label, 30);
+    })
+    .filter((value): value is string => Boolean(value));
+
+  return labels.length ? Array.from(new Set(labels)).slice(0, 4) : undefined;
+}
+
+function summarizeIsolationMode(context: FullTraceEvidenceContext): "storey" | "category" | "space" | "none" {
+  if (context.scope?.spaceId) return "space";
+  if (context.scope?.storeyId || context.planCut?.storeyId) return "storey";
+  if (context.isolatedCategories?.length) return "category";
+  return "none";
+}
+
+function inferCompactViewPreset(
+  context: FullTraceEvidenceContext,
+  highlightAnnotations?: Record<string, unknown>
+): "top" | "iso" | "angled" | "unknown" {
+  if (context.viewPreset === "top") return "top";
+  if (context.viewPreset === "iso") return "iso";
+  const viewLayout = shortText(highlightAnnotations?.viewLayout, 30);
+  if (viewLayout?.includes("angled")) return "angled";
+  if (viewLayout?.includes("top")) return "top";
+  return "unknown";
+}
+
+function buildEvidenceRequirementSummary(
+  evidenceRequirements?: EvidenceRequirementsSnapshot
+): CompactVlmEvidenceContext["evidenceRequirements"] {
+  const status = evidenceRequirements?.status ?? {};
+  const reasons = evidenceRequirements?.reasons ?? {};
+  const resolved = Object.entries(status)
+    .filter(([, value]) => value === true)
+    .map(([key]) => key);
+  const missing = Object.entries(status)
+    .filter(([, value]) => value === false)
+    .map(([key]) => key);
+  const missingReasons = Object.fromEntries(
+    missing
+      .map((key) => [key, shortText(reasons[key as keyof typeof reasons], 120)] as const)
+      .filter((entry): entry is [string, string] => Boolean(entry[1]))
+  );
+
+  if (!resolved.length && !missing.length) {
+    return {
+      resolved: [],
+      missing: ["unspecified_evidence_requirements"],
+      missingReasons: {
+        unspecified_evidence_requirements: "Runtime evidence requirements were not attached to this snapshot.",
+      },
+    };
+  }
+
+  return {
+    resolved,
+    missing,
+    ...(Object.keys(missingReasons).length ? { missingReasons } : {}),
+  };
+}
+
+function buildRuntimeNotice(context: FullTraceEvidenceContext): string | undefined {
+  const notices = [
+    context.snapshotNovelty?.redundancyWarning
+      ? "Recent view looks redundant for the active entity."
+      : undefined,
+    context.semanticEvidenceProgress?.semanticStagnationWarning
+      ? "Semantic evidence gaps are stagnating."
+      : undefined,
+    shortText(context.suppressedFollowUp?.reason, 120),
+    shortText(context.finalizationReason, 120),
+  ].filter((value): value is string => Boolean(value));
+
+  return notices.length ? notices.slice(0, 2).join(" ") : undefined;
+}
+
+/**
+ * Compact VLM evidence context logic:
+ * keep full trace context for audit/report export, but send a summarized,
+ * task-focused context to the VLM prompt.
+ */
+function buildCompactVlmEvidenceContext(args: {
+  snapshotId: string;
+  note?: string;
+  fullContext: FullTraceEvidenceContext;
+  nav?: NavMetrics;
+}): CompactVlmEvidenceContext {
+  const { snapshotId, note, fullContext, nav } = args;
+  const highlightAnnotations = asRecord(fullContext.highlightAnnotations);
+  const hudContents = asRecord(highlightAnnotations?.hudContents);
+  const taskGraph = fullContext.taskGraph;
+  const activeEntityId =
+    fullContext.activeEntityId ??
+    taskGraph?.activeEntity?.id ??
+    (typeof fullContext.selectedId === "string" ? fullContext.selectedId : undefined) ??
+    (fullContext.highlightedIds?.[0] || undefined) ??
+    "unknown_active_entity";
+  const activeEntityClass =
+    taskGraph?.activeEntity?.class ??
+    taskGraph?.primaryClass ??
+    shortText(highlightAnnotations?.primaryClass, 60) ??
+    shortText(hudContents?.title, 60)?.split(/\s+/)[0] ??
+    "unknown_class";
+  const activeStoreyId =
+    fullContext.scope?.storeyId ??
+    fullContext.planCut?.storeyId ??
+    taskGraph?.activeStoreyId ??
+    taskGraph?.activeEntity?.storeyId;
+  const targetHighlighted = Boolean(activeEntityId && fullContext.highlightedIds?.includes(activeEntityId));
+  const evidenceRequirements = buildEvidenceRequirementSummary(fullContext.evidenceRequirements);
+  const legend = readCompactLegend(highlightAnnotations);
+  const dimensions = readHudDimensions(highlightAnnotations);
+  const hiddenCategories = fullContext.hiddenIds?.length
+    ? Array.from(
+        new Set(
+          fullContext.hiddenIds
+            .map((id) => {
+              const prefix = id.split(":")[0]?.trim();
+              return prefix && /^Ifc/i.test(prefix) ? prefix : undefined;
+            })
+            .filter((value): value is string => Boolean(value))
+        )
+      ).slice(0, 4)
+    : undefined;
+
+  return {
+    contextMode: "compact_vlm_evidence",
+    snapshotId,
+    ...(note ? { note } : {}),
+    stepLabel: `step_${fullContext.step}_${fullContext.phase}`,
+    activeEntity: {
+      id: activeEntityId,
+      class: activeEntityClass,
+      ...(activeStoreyId ? { storeyId: activeStoreyId } : {}),
+    },
+    ...(taskGraph?.activeTask?.title || activeStoreyId
+      ? {
+          taskBrief: {
+            ...(taskGraph?.activeTask?.title ? { activeTaskTitle: taskGraph.activeTask.title } : {}),
+            ...(activeStoreyId ? { activeStoreyId } : {}),
+          },
+        }
+      : {}),
+    currentView: {
+      viewPreset: inferCompactViewPreset(fullContext, highlightAnnotations),
+      ...(shortText(highlightAnnotations?.viewLayout, 30)
+        ? { viewLayout: shortText(highlightAnnotations?.viewLayout, 30) }
+        : {}),
+      targetHighlighted,
+      ...(typeof fullContext.evidenceRequirements?.status?.targetFocused === "boolean"
+        ? { targetFocused: fullContext.evidenceRequirements.status.targetFocused }
+        : {}),
+      planCutEnabled: Boolean(fullContext.planCut?.enabled),
+      scopeSummary: {
+        mode: summarizeIsolationMode(fullContext),
+        ...(fullContext.scope?.storeyId ? { storeyId: fullContext.scope.storeyId } : {}),
+        ...(fullContext.scope?.spaceId ? { spaceId: fullContext.scope.spaceId } : {}),
+        ...(typeof fullContext.isolatedIds?.length === "number"
+          ? {
+              isolatedElements: {
+                count: fullContext.isolatedIds.length,
+                containsActiveEntity: Boolean(activeEntityId && fullContext.isolatedIds.includes(activeEntityId)),
+              },
+            }
+          : {}),
+        hidden: {
+          count: fullContext.hiddenIds?.length ?? 0,
+          ...(hiddenCategories?.length ? { categories: hiddenCategories } : {}),
+        },
+        highlighted: {
+          count: fullContext.highlightedIds?.length ?? 0,
+          activeTargetHighlighted: targetHighlighted,
+        },
+        ...(fullContext.isolatedCategories?.length
+          ? { isolatedCategoryCount: fullContext.isolatedCategories.length }
+          : {}),
+      },
+    },
+    ...(fullContext.viewerGrid || dimensions || legend
+      ? {
+          visualReference: {
+            ...(typeof fullContext.viewerGrid?.primaryCellSize === "number"
+              ? { gridCellSizeMeters: fullContext.viewerGrid.primaryCellSize }
+              : {}),
+            ...(typeof fullContext.viewerGrid?.secondaryCellSize === "number"
+              ? { majorGridCellSizeMeters: fullContext.viewerGrid.secondaryCellSize }
+              : {}),
+            ...(dimensions || legend
+              ? {
+                  targetMetadata: {
+                    ...(dimensions ? { dimensions } : {}),
+                    ...(legend?.length ? { legend } : {}),
+                  },
+                }
+              : {}),
+          },
+        }
+      : {}),
+    ...(nav?.projectedAreaRatio !== undefined ||
+    nav?.zoomPotentialExhausted ||
+    fullContext.snapshotNovelty?.approximateNoveltyScore !== undefined
+      ? {
+          navigationQuality: {
+            ...(typeof nav?.projectedAreaRatio === "number"
+              ? { projectedAreaRatio: nav.projectedAreaRatio }
+              : {}),
+            ...(nav?.zoomPotentialExhausted ? { zoomPotentialExhausted: true } : {}),
+            ...(typeof fullContext.snapshotNovelty?.approximateNoveltyScore === "number"
+              ? { visualNoveltyScore: Number(fullContext.snapshotNovelty.approximateNoveltyScore.toFixed(3)) }
+              : {}),
+            ...(fullContext.snapshotNovelty?.redundancyWarning
+              ? { redundancyWarning: "Current view appears visually redundant for this target." }
+              : {}),
+          },
+        }
+      : {}),
+    evidenceRequirements,
+    ...(fullContext.semanticEvidenceProgress
+      ? {
+          semanticProgress: {
+            ...(typeof fullContext.semanticEvidenceProgress.semanticProgressScore === "number"
+              ? {
+                  semanticProgressScore: Number(
+                    fullContext.semanticEvidenceProgress.semanticProgressScore.toFixed(3)
+                  ),
+                }
+              : {}),
+            ...(typeof fullContext.semanticEvidenceProgress.semanticStagnationWarning === "boolean"
+              ? {
+                  semanticStagnationWarning:
+                    fullContext.semanticEvidenceProgress.semanticStagnationWarning,
+                }
+              : {}),
+            ...(fullContext.normalizedEvidenceGaps?.length
+              ? { normalizedEvidenceGaps: fullContext.normalizedEvidenceGaps.slice(0, 5) }
+              : {}),
+          },
+        }
+      : {}),
+    ...(typeof fullContext.followUpBudget?.orbitRemainingForActiveEntity === "number"
+      ? {
+          runtimeHints: {
+            orbitRemainingForActiveEntity: fullContext.followUpBudget.orbitRemainingForActiveEntity,
+          },
+        }
+      : {}),
+    ...(buildRuntimeNotice(fullContext) ? { runtimeNotice: buildRuntimeNotice(fullContext) } : {}),
+  };
+}
+
+function shouldFallbackToFullContext(compact: CompactVlmEvidenceContext): boolean {
+  return (
+    !compact.snapshotId ||
+    !compact.activeEntity?.id ||
+    compact.activeEntity.id === "unknown_active_entity" ||
+    !compact.activeEntity?.class ||
+    compact.activeEntity.class === "unknown_class" ||
+    !compact.evidenceRequirements ||
+    (!compact.evidenceRequirements.resolved.length && !compact.evidenceRequirements.missing.length)
+  );
 }
 
 function sameStringArray(a?: string[], b?: string[]): boolean {
@@ -1062,6 +1447,7 @@ function deriveRuntimeEvidenceRequirements(args: {
         };
       }
     | undefined;
+  const promptGrounding = assessPromptRegulatoryGrounding(decision?.meta?.composedPromptText ?? "");
 
   const visibleFromDecision = decision?.visibility?.isRuleTargetVisible;
   const visibleFromHighlights = Boolean(activeEntityId && highlightIds.includes(activeEntityId));
@@ -1148,19 +1534,34 @@ function deriveRuntimeEvidenceRequirements(args: {
       boolFromRequirement(decision?.evidenceRequirementsStatus?.dimensionReferenceNeeded) === true
   );
 
-  status.regulatoryClauseNeeded = Boolean(
-    decision?.followUp?.request === "WEB_FETCH" ||
-      missingEvidence.some((item) =>
-        item.includes("clause") ||
-        item.includes("section") ||
-        item.includes("threshold") ||
-        item.includes("standard") ||
-        item.includes("edition")
-      ) ||
-      boolFromRequirement(decision?.evidenceRequirementsStatus?.regulatoryClauseNeeded) === true
-  );
+  const modelRequestedRegulatoryClause = boolFromRequirement(
+    decision?.evidenceRequirementsStatus?.regulatoryClauseNeeded
+  ) === true;
+  const textExplicitRegulatoryGap = hasExplicitRegulatoryGapText([
+    decision?.rationale,
+    ...(decision?.missingEvidence ?? []),
+    ...(decision?.visibility?.missingEvidence ?? []),
+  ]);
+  const customPromptMissingGrounding =
+    promptGrounding.promptSource === "custom_user_prompt" &&
+    !promptGrounding.hasUsableLocalGrounding &&
+    (hasConcern(context, "regulatory_context") ||
+      hasConcern(context, "accessibility") ||
+      modelRequestedRegulatoryClause ||
+      decision?.followUp?.request === "WEB_FETCH");
+  const predefinedRuleNeedsSupplementalGrounding =
+    promptGrounding.promptSource === "rule_library" &&
+    (!promptGrounding.hasUsableLocalGrounding || textExplicitRegulatoryGap);
+
+  // Distinguish rule-library grounding from supplemental clause fetching:
+  // predefined rules with usable local criteria are not "missing regulatory
+  // context" by default, even when no web evidence has been fetched.
+  status.regulatoryClauseNeeded = Boolean(customPromptMissingGrounding || predefinedRuleNeedsSupplementalGrounding);
   if (status.regulatoryClauseNeeded) {
-    reasons.regulatoryClauseNeeded = "The rule threshold or clause text is still missing or underspecified.";
+    reasons.regulatoryClauseNeeded =
+      promptGrounding.promptSource === "rule_library" && promptGrounding.hasUsableLocalGrounding
+        ? "The local ruleLibrary context exists, but an additional clause, threshold, definition, or exception is still missing."
+        : "The rule threshold or clause text is still missing or underspecified.";
   }
 
   status.lowNoveltyOrRepeatedView = Boolean(
@@ -1333,7 +1734,7 @@ function buildEvidenceRequirementFollowUpCandidates(args: {
     pushUniqueFollowUpCandidate(candidates, {
       followUp: advisory,
       source: followUpSourceFromDecision === "provider_override" ? "provider_override" : "vlm_advisory",
-      reason: "Regulatory clause text is still missing, so the advisory web fetch is retained.",
+      reason: "Supplemental regulatory clause text is still missing, so the advisory web fetch is retained.",
     });
   }
 
@@ -2231,6 +2632,7 @@ async function executeFollowUpWithEvaluation(params: {
 async function createNavigationBookmark(step: number, label: string, action: string): Promise<NavigationBookmark> {
   const pose = await viewerApi.getCameraPose();
   const planCut = (viewerApi as any).getPlanCutState ? await (viewerApi as any).getPlanCutState() : undefined;
+  const isolatedIds = flattenModelIdMap(viewerApi.getCurrentIsolateSelection?.() ?? null);
   return {
     id: crypto.randomUUID(),
     step,
@@ -2239,8 +2641,8 @@ async function createNavigationBookmark(step: number, label: string, action: str
     viewPreset: lastViewPreset ?? undefined,
     cameraPose: pose,
     scope: lastScope.storeyId || lastScope.spaceId ? { ...lastScope } : undefined,
-    isolatedIds: flattenModelIdMap(viewerApi.getCurrentIsolateSelection?.() ?? null),
-    isolatedCategories: [...lastIsolatedCategories],
+    isolatedIds,
+    isolatedCategories: isolatedIds.length ? [...lastIsolatedCategories] : [],
     hiddenIds: [...lastHiddenIds],
     highlightedIds: [...lastHighlightedIds],
     selectedId: lastSelectedId,
@@ -2404,7 +2806,9 @@ function findReusableStoreyBookmark(storeyId?: string) {
       (bookmark) =>
         bookmark.scope?.storeyId === storeyId &&
         bookmark.viewPreset === "top" &&
-        Boolean(bookmark.planCut?.enabled)
+        Boolean(bookmark.planCut?.enabled) &&
+        bookmark.isolatedIds.length === 0 &&
+        bookmark.hiddenIds.length === 0
     );
 }
 
@@ -2423,6 +2827,13 @@ async function restoreNavigationBookmark(params?: { step?: number; snapshotId?: 
   if (!target) {
     return { ok: false, reason: "navigation-bookmark-not-found" as const };
   }
+
+  const isScopedStoreyPlanCutBookmark = Boolean(
+    target.planCut?.enabled &&
+      target.scope?.storeyId &&
+      target.planCut.storeyId === target.scope.storeyId &&
+      target.isolatedIds.length === 0
+  );
 
   await viewerApi.resetVisibility();
 
@@ -2462,7 +2873,7 @@ async function restoreNavigationBookmark(params?: { step?: number; snapshotId?: 
     await viewerApi.clearPlanCut();
   }
 
-  if (target.hiddenIds.length && viewerApi.hideIds) {
+  if (!isScopedStoreyPlanCutBookmark && target.hiddenIds.length && viewerApi.hideIds) {
     await viewerApi.hideIds(target.hiddenIds);
   }
 
@@ -2473,8 +2884,8 @@ async function restoreNavigationBookmark(params?: { step?: number; snapshotId?: 
     await reapplyPersistentHighlight();
   }
 
-  lastHiddenIds = [...target.hiddenIds];
-  lastIsolatedCategories = [...target.isolatedCategories];
+  lastHiddenIds = isScopedStoreyPlanCutBookmark ? [] : [...target.hiddenIds];
+  lastIsolatedCategories = isScopedStoreyPlanCutBookmark ? [] : [...target.isolatedCategories];
   return { ok: true, reason: "navigation-bookmark-restored" as const, bookmark: target };
 }
 
@@ -3066,6 +3477,8 @@ if (f.request === "SET_STOREY_PLAN_CUT") {
   }
   await viewerApi.setStoreyPlanCut(f.params);
   lastScope = { storeyId: f.params.storeyId };
+  lastIsolatedCategories = [];
+  lastHiddenIds = [];
   await reapplyPersistentHighlight();
   const nav = await recenterOnActiveHighlight();
   return { didSomething: true, reason: "storey-plan-cut" as const, nav };
@@ -3494,7 +3907,9 @@ if (f.request === "SHOW_IDS") {
     toast?.(`Compliance started (${vlmChecker.adapterName})`);
 
     const minConfidence = Math.max(0, Math.min(1, params.minConfidence ?? 0.75));
-    const evidenceWindow = Math.max(1, Math.min(8, params.evidenceWindow ?? 3));
+    const evidenceWindow = clampMaxSnapshotsPerRequest(
+      params.evidenceWindow ?? runtimeSettings.maxSnapshotsPerRequest
+    );
 
     // Accumulate ALL decisions across steps so the caller can build a trace
     const allDecisions: VlmDecision[] = [];
@@ -3512,16 +3927,69 @@ if (f.request === "SHOW_IDS") {
         : [];
       const source = sameEntityEvidence.length ? sameEntityEvidence : evidence;
       const slice = source.slice(Math.max(0, source.length - evidenceWindow));
+      const fullEvidenceViews = slice.map((item) => ({
+        snapshotId: item.artifact.id,
+        mode: item.artifact.mode,
+        note: item.artifact.meta.note,
+        nav: item.nav,
+        context: item.context ?? (item.artifact.meta as any)?.context,
+      }));
+      const compactFallbackSnapshotIds: string[] = [];
+      const compactEvidenceViews = slice.map((item) => {
+        const fullContext =
+          item.context ??
+          ((item.artifact.meta as any)?.context as FullTraceEvidenceContext | undefined);
+        if (!fullContext) {
+          compactFallbackSnapshotIds.push(item.artifact.id);
+          return {
+            snapshotId: item.artifact.id,
+            mode: item.artifact.mode,
+            note: item.artifact.meta.note,
+            nav: item.nav,
+            context: undefined,
+          };
+        }
+        const compactContext = buildCompactVlmEvidenceContext({
+          snapshotId: item.artifact.id,
+          note: item.artifact.meta.note,
+          fullContext,
+          nav: item.nav,
+        });
+        if (shouldFallbackToFullContext(compactContext)) {
+          compactFallbackSnapshotIds.push(item.artifact.id);
+          return {
+            snapshotId: item.artifact.id,
+            mode: item.artifact.mode,
+            note: item.artifact.meta.note,
+            nav: item.nav,
+            context: fullContext,
+          };
+        }
+        return {
+          snapshotId: item.artifact.id,
+          mode: item.artifact.mode,
+          note: item.artifact.meta.note,
+          nav: item.nav,
+          context: compactContext,
+        };
+      });
+      const useCompactContext = runtimeSettings.useCompactVlmContext;
+      const promptEvidenceViews = useCompactContext ? compactEvidenceViews : fullEvidenceViews;
+      const fullContextChars = JSON.stringify(fullEvidenceViews).length;
+      const compactContextChars = JSON.stringify(compactEvidenceViews).length;
       return {
         artifacts: slice.map(s => s.artifact),
-        evidenceViews: slice.map(s => ({
-          snapshotId: s.artifact.id,
-          mode: s.artifact.mode,
-          note: s.artifact.meta.note,
-          nav: s.nav,
-          context: s.context,
-        })),
-
+        evidenceViews: promptEvidenceViews,
+        fullEvidenceViews,
+        compactEvidenceViews,
+        promptContextStats: {
+          fullContextChars,
+          compactContextChars,
+          snapshotCount: slice.length,
+          compactModeEnabled: runtimeSettings.useCompactVlmContext,
+          usedCompactContext: useCompactContext && compactFallbackSnapshotIds.length === 0,
+          ...(compactFallbackSnapshotIds.length ? { fullFallbackSnapshotIds: compactFallbackSnapshotIds } : {}),
+        } satisfies PromptContextStats,
       };
     }
 
@@ -3716,6 +4184,8 @@ const activeEntityIdForSnapshot =
   (lastHighlightedIds.length === 1 ? lastHighlightedIds[0] : undefined);
 
 // capture current evidence context
+const isolatedIds = flattenModelIdMap(viewerApi.getCurrentIsolateSelection?.() ?? null);
+
 const context: EvidenceContext = {
   step,
   phase,
@@ -3723,8 +4193,8 @@ const context: EvidenceContext = {
   cameraPose,
   activeEntityId: activeEntityIdForSnapshot,
   scope: (lastScope.storeyId || lastScope.spaceId) ? lastScope : undefined,
-  isolatedCategories: lastIsolatedCategories.length ? lastIsolatedCategories : undefined,
-  isolatedIds: flattenModelIdMap(viewerApi.getCurrentIsolateSelection?.() ?? null),
+  isolatedCategories: isolatedIds.length && lastIsolatedCategories.length ? lastIsolatedCategories : undefined,
+  isolatedIds,
   hiddenIds: lastHiddenIds.length ? lastHiddenIds : undefined,
   highlightedIds: lastHighlightedIds.length ? lastHighlightedIds : undefined,
   selectedId: lastSelectedId ?? undefined,
@@ -3818,22 +4288,46 @@ pendingNav = undefined;
 syncEntityTasks();
 
       const windowed = getEvidenceWindow(activeEntityIdForSnapshot);
+      const promptTaskState = summarizeTaskGraph(taskGraph);
+      const rulePromptForStep =
+        step <= 1
+          ? prompt
+          : buildCompactFollowUpTaskPrompt({
+              fullTaskPrompt: prompt,
+              activeTaskTitle: promptTaskState.activeTask?.title,
+              activeEntityId: promptTaskState.activeEntity?.id,
+              activeEntityClass: promptTaskState.activeEntity?.class,
+              activeStoreyId: promptTaskState.activeStoreyId,
+              activeConcerns: promptTaskState.concerns,
+            });
       const navigationControlPrompt = buildNavigationControlPromptSection({
         activeEntityId: activeEntityIdForSnapshot,
         currentStep: step,
       });
       const promptWithChecklist = [
-        prompt,
+        rulePromptForStep,
         buildTaskGraphPromptSection(taskGraph),
         navigationControlPrompt,
       ]
         .filter(Boolean)
         .join("\n\n");
+      console.info("[VLM Prompt Context]", {
+        step,
+        fullContextChars: windowed.promptContextStats.fullContextChars,
+        compactContextChars: windowed.promptContextStats.compactContextChars,
+        snapshots: windowed.promptContextStats.snapshotCount,
+        compactModeEnabled: windowed.promptContextStats.compactModeEnabled,
+        usedCompactContext: windowed.promptContextStats.usedCompactContext,
+        fullFallbackSnapshotIds: windowed.promptContextStats.fullFallbackSnapshotIds ?? [],
+      });
       const decision = await vlmChecker.check({
         prompt: promptWithChecklist,
         artifacts: windowed.artifacts,
         evidenceViews: windowed.evidenceViews,
       });
+      decision.meta.promptContextStats = windowed.promptContextStats;
+      decision.meta.promptEvidenceViews = windowed.evidenceViews;
+      decision.meta.taskPromptMode = step <= 1 ? "full_rule_text" : "compact_follow_up_summary";
       const decisionFocus = getTaskGraphFocus(taskGraph);
       const activeEntityBeforeDecision = decisionFocus.activeEntityId;
       const doorClearanceReadiness = (context.highlightAnnotations as any)?.doorClearanceReadiness as
@@ -3848,7 +4342,7 @@ syncEntityTasks();
       const enrichmentText = [
         decision.meta?.composedPromptText,
         decision.rationale,
-        decision.followUp?.request === "WEB_FETCH" ? "web fetch requested for missing regulatory context" : "",
+        decision.followUp?.request === "WEB_FETCH" ? "supplemental web regulatory evidence requested" : "",
       ]
         .filter(Boolean)
         .join("\n\n");

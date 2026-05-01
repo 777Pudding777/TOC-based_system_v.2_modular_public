@@ -336,6 +336,15 @@ export interface JudgeTaskVerdict {
   evidenceSnapshotIds: string[];
 }
 
+/** CRITIC-inspired evidence support classification for the judge audit pass. */
+export type JudgeEvidenceSupport = "SUPPORTED" | "PARTIALLY_SUPPORTED" | "UNSUPPORTED";
+
+/** Whether the primary model confidence matched the available trace evidence. */
+export type JudgeConfidenceAssessment = "JUSTIFIED" | "OVERCONFIDENT" | "UNDERCONFIDENT";
+
+/** Suggested correction after the judge critiques the primary evidence support. */
+export type JudgeRecommendedCorrection = "KEEP" | "DOWNGRADE_TO_UNCERTAIN" | "REVIEW_REQUIRED";
+
 export interface JudgeReport {
   /** Time the judge pass was created */
   createdAtIso: string;
@@ -360,6 +369,14 @@ export interface JudgeReport {
     capabilityNotes: string[];
     improvementSuggestions: string[];
   };
+  /** CRITIC-inspired verification of whether the primary verdict is supported by the trace bundle. */
+  evidenceSupport: JudgeEvidenceSupport;
+  /** CRITIC-inspired verification of whether the primary confidence matches the available evidence. */
+  confidenceAssessment: JudgeConfidenceAssessment;
+  /** Concrete contradictions the judge found between the primary claim and the trace evidence. */
+  contradictionFlags: string[];
+  /** Recommended correction after the evidence critique pass. */
+  recommendedCorrection?: JudgeRecommendedCorrection;
   /** Non-fatal judge error if the secondary call failed */
   error?: string;
 }

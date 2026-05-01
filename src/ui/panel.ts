@@ -15,6 +15,7 @@ import { downloadHtmlReport } from "../reporting/reportGenerator";
 import { OPENROUTER_VISION_MODELS, getDefaultModel, findModelById } from "../config/openRouterModels";
 import {
   getPrototypeRuntimeSettings,
+  MAX_SNAPSHOTS_PER_REQUEST_RANGE,
   resetPrototypeRuntimeSettings,
   type PrototypeRuntimeSettings,
   updatePrototypeRuntimeSettings,
@@ -629,21 +630,30 @@ vlmChecker: {
 
     try {
       await viewerApi.resetVisibility();
+      const explicitIsolatedIds = state.isolatedIds ?? [];
+      const hasExplicitIsolation = Boolean(state.isolatedIds?.length);
+      const isPlanCutScopedView = Boolean(state.planCut?.enabled && (state.planCut.storeyId || state.isolatedStorey || state.isolatedSpace));
+      const isScopedStoreyPlanCutView = Boolean(
+        state.planCut?.enabled &&
+          state.isolatedStorey &&
+          state.planCut.storeyId === state.isolatedStorey &&
+          !hasExplicitIsolation
+      );
 
-      if (state.isolatedIds?.length && viewerApi.isolate) {
-        const isolateMap = buildModelIdMapFromObjectIds(state.isolatedIds);
+      if (hasExplicitIsolation && viewerApi.isolate) {
+        const isolateMap = buildModelIdMapFromObjectIds(explicitIsolatedIds);
         if (Object.keys(isolateMap).length) {
           await viewerApi.isolate(isolateMap);
         }
-      } else if (state.isolatedStorey && viewerApi.isolateStorey) {
+      } else if (!isPlanCutScopedView && state.isolatedStorey && viewerApi.isolateStorey) {
         await viewerApi.isolateStorey(state.isolatedStorey);
-      } else if (state.isolatedSpace && viewerApi.isolateSpace) {
+      } else if (!isPlanCutScopedView && state.isolatedSpace && viewerApi.isolateSpace) {
         await viewerApi.isolateSpace(state.isolatedSpace);
       } else if (state.isolatedCategories?.length && viewerApi.isolateCategory) {
         await viewerApi.isolateCategory(state.isolatedCategories[0]);
       }
 
-      if (state.hiddenIds?.length && viewerApi.hideIds) {
+      if (!isScopedStoreyPlanCutView && state.hiddenIds?.length && viewerApi.hideIds) {
         await viewerApi.hideIds(state.hiddenIds);
       }
 
@@ -1214,6 +1224,10 @@ vlmChecker: {
               capabilityNotes: ["No independent judge analysis is available for this run."],
               improvementSuggestions: ["Check provider credentials, model support for images/JSON output, and request timeout settings."],
             },
+            evidenceSupport: "PARTIALLY_SUPPORTED",
+            confidenceAssessment: "JUSTIFIED",
+            contradictionFlags: ["Secondary judge call failed before evidence critique could be completed."],
+            recommendedCorrection: "REVIEW_REQUIRED",
             error: judgeError?.message ?? "Judge agent failed.",
           };
         }
@@ -1552,7 +1566,7 @@ vlmChecker: {
                     <span>DEFAULT_MAX_SNAPSHOTS_PER_REQUEST</span>
                     <span class="hud-setting-value">${prototypeRuntimeSettings.maxSnapshotsPerRequest}</span>
                   </span>
-                  <input class="hud-settings-range" type="range" min="1" max="10" step="1" ?disabled=${inspectionStatus === "running"} .value=${String(prototypeRuntimeSettings.maxSnapshotsPerRequest)}
+                  <input class="hud-settings-range" type="range" min=${String(MAX_SNAPSHOTS_PER_REQUEST_RANGE.min)} max=${String(MAX_SNAPSHOTS_PER_REQUEST_RANGE.max)} step="1" ?disabled=${inspectionStatus === "running"} .value=${String(prototypeRuntimeSettings.maxSnapshotsPerRequest)}
                     @input=${(e: any) => { updatePrototypeSetting("maxSnapshotsPerRequest", e.target.value); syncRuntimeSettingsToVlmConfig(); }} />
                 </label>
                 <label class="hud-setting-row">

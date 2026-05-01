@@ -1,7 +1,15 @@
 // src/modules/judgeAgent.ts
+import { summarizePromptRegulatoryGrounding } from "./regulatoryContext";
 // Fresh secondary judge pass over the completed primary VLM evidence bundle.
 
-import type { ConversationTrace, JudgeReport, JudgeTaskVerdict } from "../types/trace.types";
+import type {
+  ConversationTrace,
+  JudgeConfidenceAssessment,
+  JudgeEvidenceSupport,
+  JudgeRecommendedCorrection,
+  JudgeReport,
+  JudgeTaskVerdict,
+} from "../types/trace.types";
 
 type JudgeProviderConfig =
   | { provider: "mock" }
@@ -44,6 +52,24 @@ function normalizeVerdict(value: unknown): "PASS" | "FAIL" | "UNCERTAIN" {
   return value === "PASS" || value === "FAIL" || value === "UNCERTAIN" ? value : "UNCERTAIN";
 }
 
+function normalizeEvidenceSupport(value: unknown): JudgeEvidenceSupport {
+  return value === "SUPPORTED" || value === "PARTIALLY_SUPPORTED" || value === "UNSUPPORTED"
+    ? value
+    : "PARTIALLY_SUPPORTED";
+}
+
+function normalizeConfidenceAssessment(value: unknown): JudgeConfidenceAssessment {
+  return value === "JUSTIFIED" || value === "OVERCONFIDENT" || value === "UNDERCONFIDENT"
+    ? value
+    : "JUSTIFIED";
+}
+
+function normalizeRecommendedCorrection(value: unknown): JudgeRecommendedCorrection | undefined {
+  return value === "KEEP" || value === "DOWNGRADE_TO_UNCERTAIN" || value === "REVIEW_REQUIRED"
+    ? value
+    : undefined;
+}
+
 function normalizeStringArray(value: unknown, maxItems = 4, maxChars = 220): string[] {
   return Array.isArray(value)
     ? value.map((item) => truncateText(item, maxChars)).filter(Boolean).slice(0, maxItems)
@@ -64,7 +90,119 @@ function normalizeTaskVerdicts(value: unknown): JudgeTaskVerdict[] {
   }));
 }
 
-function normalizeJudgeReport(parsed: any, fallback: Pick<JudgeReport, "provider" | "modelId">): JudgeReport {
+function getLatestPrimaryDecision(trace: ConversationTrace) {
+  return trace.responses[trace.responses.length - 1]?.decision;
+}
+
+function getDecisionMissingEvidence(trace: ConversationTrace): string[] {
+  const decision = getLatestPrimaryDecision(trace);
+  return Array.from(
+    new Set([...(decision?.missingEvidence ?? []), ...(decision?.visibility?.missingEvidence ?? [])].map(String))
+  );
+}
+
+function hasRegulatoryEvidence(trace: ConversationTrace): boolean {
+  return (trace.webEvidence ?? []).some((entry) => entry.ok && Boolean(entry.reducedText ?? entry.text));
+}
+
+function listPendingEvidenceRequirements(trace: ConversationTrace): string[] {
+  const status = getLatestPrimaryDecision(trace)?.evidenceRequirementsStatus ?? {};
+  const pending: string[] = [];
+  const latestPrompt = trace.prompts[trace.prompts.length - 1];
+  const regulatoryGrounding = summarizePromptRegulatoryGrounding({
+    promptText: latestPrompt?.promptText ?? "",
+    promptSource: latestPrompt?.promptSource,
+    hasExternalWebEvidence: hasRegulatoryEvidence(trace),
+  });
+
+  if (status.contextViewNeeded === true && status.contextViewReady === false) pending.push("Context view required but not ready.");
+  if (status.planMeasurementNeeded === true && status.planMeasurementReady === false) {
+    pending.push("Plan measurement evidence required but not ready.");
+  }
+  if (status.regulatoryClauseNeeded === true && !hasRegulatoryEvidence(trace)) {
+    pending.push(
+      regulatoryGrounding.hasUsableLocalGrounding
+        ? "Supplemental external regulatory clause evidence was required but absent."
+        : "Authoritative regulatory grounding was required but absent."
+    );
+  }
+  if (status.dimensionReferenceNeeded === true) pending.push("Dimension reference evidence is still required.");
+  if (status.obstructionContextNeeded === true && status.occlusionProblem === true) {
+    pending.push("Occlusion or obstruction context remains unresolved.");
+  }
+  if (status.bothSidesOrSurroundingsNeeded === true) pending.push("Both sides or surrounding context are still required.");
+  if (status.targetVisible === false) pending.push("Primary target was not clearly visible.");
+  if (status.targetFocused === false) pending.push("Primary target was not sufficiently focused.");
+
+  return pending.slice(0, 6);
+}
+
+function buildFallbackEvidenceCritique(trace: ConversationTrace): Pick<
+  JudgeReport,
+  "evidenceSupport" | "confidenceAssessment" | "contradictionFlags" | "recommendedCorrection"
+> {
+  const decision = getLatestPrimaryDecision(trace);
+  const verdict = decision?.verdict ?? trace.finalVerdict ?? "UNCERTAIN";
+  const confidence = clamp01(decision?.confidence ?? trace.finalConfidence ?? 0.5);
+  const missingEvidence = getDecisionMissingEvidence(trace);
+  const citedSnapshotIds = decision?.evidence?.snapshotIds ?? [];
+  const availableSnapshotIds = new Set(trace.snapshots.map((snapshot) => snapshot.snapshotId));
+  const missingCitations = citedSnapshotIds.filter((id) => !availableSnapshotIds.has(id));
+  const contradictionFlags: string[] = [];
+
+  // CRITIC-inspired verification fallback: verify the primary claim directly
+  // against the recorded trace evidence bundle when structured judge output is incomplete.
+  if (verdict !== "UNCERTAIN" && citedSnapshotIds.length === 0) {
+    contradictionFlags.push("Primary verdict cites no supporting snapshot IDs.");
+  }
+  if (missingCitations.length) {
+    contradictionFlags.push(`Primary verdict cites snapshot IDs missing from trace: ${missingCitations.join(", ")}.`);
+  }
+  if (verdict !== "UNCERTAIN" && missingEvidence.length) {
+    contradictionFlags.push(`Primary verdict leaves unresolved missing evidence: ${missingEvidence.slice(0, 3).join(", ")}.`);
+  }
+  contradictionFlags.push(...listPendingEvidenceRequirements(trace));
+
+  const uniqueFlags = Array.from(new Set(contradictionFlags)).slice(0, 6);
+
+  let evidenceSupport: JudgeEvidenceSupport = "SUPPORTED";
+  if (!decision || (verdict !== "UNCERTAIN" && citedSnapshotIds.length === 0) || missingCitations.length) {
+    evidenceSupport = "UNSUPPORTED";
+  } else if (uniqueFlags.length || missingEvidence.length || verdict === "UNCERTAIN") {
+    evidenceSupport = "PARTIALLY_SUPPORTED";
+  }
+
+  let confidenceAssessment: JudgeConfidenceAssessment = "JUSTIFIED";
+  if (
+    confidence >= 0.75 &&
+    (evidenceSupport !== "SUPPORTED" || missingEvidence.length > 0 || uniqueFlags.length > 0)
+  ) {
+    confidenceAssessment = "OVERCONFIDENT";
+  } else if (confidence <= 0.35 && evidenceSupport === "SUPPORTED" && uniqueFlags.length === 0) {
+    confidenceAssessment = "UNDERCONFIDENT";
+  }
+
+  let recommendedCorrection: JudgeRecommendedCorrection = "KEEP";
+  if (verdict !== "UNCERTAIN" && (evidenceSupport === "UNSUPPORTED" || confidenceAssessment === "OVERCONFIDENT")) {
+    recommendedCorrection = "DOWNGRADE_TO_UNCERTAIN";
+  } else if (uniqueFlags.length) {
+    recommendedCorrection = "REVIEW_REQUIRED";
+  }
+
+  return {
+    evidenceSupport,
+    confidenceAssessment,
+    contradictionFlags: uniqueFlags,
+    recommendedCorrection,
+  };
+}
+
+function normalizeJudgeReport(
+  parsed: any,
+  trace: ConversationTrace,
+  fallback: Pick<JudgeReport, "provider" | "modelId">
+): JudgeReport {
+  const critiqueFallback = buildFallbackEvidenceCritique(trace);
   return {
     createdAtIso: new Date().toISOString(),
     provider: fallback.provider,
@@ -80,6 +218,14 @@ function normalizeJudgeReport(parsed: any, fallback: Pick<JudgeReport, "provider
       capabilityNotes: normalizeStringArray(parsed?.debuggingAndSuggestions?.capabilityNotes, 3, 220),
       improvementSuggestions: normalizeStringArray(parsed?.debuggingAndSuggestions?.improvementSuggestions, 4, 220),
     },
+    evidenceSupport: normalizeEvidenceSupport(parsed?.evidenceSupport ?? critiqueFallback.evidenceSupport),
+    confidenceAssessment: normalizeConfidenceAssessment(
+      parsed?.confidenceAssessment ?? critiqueFallback.confidenceAssessment
+    ),
+    contradictionFlags: normalizeStringArray(parsed?.contradictionFlags ?? critiqueFallback.contradictionFlags, 6, 220),
+    recommendedCorrection: normalizeRecommendedCorrection(
+      parsed?.recommendedCorrection ?? critiqueFallback.recommendedCorrection
+    ),
   };
 }
 
@@ -138,6 +284,13 @@ function compactTraceForJudge(trace: ConversationTrace) {
   const judgeImages = collectImages(trace);
   const judgeImageIds = new Set(judgeImages.map((image) => image.snapshotId));
   const latestPrompt = trace.prompts[trace.prompts.length - 1];
+  const latestDecision = getLatestPrimaryDecision(trace);
+  const latestMissingEvidence = getDecisionMissingEvidence(trace);
+  const regulatoryGrounding = summarizePromptRegulatoryGrounding({
+    promptText: latestPrompt?.promptText ?? "",
+    promptSource: latestPrompt?.promptSource,
+    hasExternalWebEvidence: hasRegulatoryEvidence(trace),
+  });
 
   return {
     reviewInstructions: {
@@ -152,10 +305,22 @@ function compactTraceForJudge(trace: ConversationTrace) {
       category: trace.rule.category,
     },
     ruleExcerpt: latestPrompt ? promptExcerpt(latestPrompt.promptText) : "",
+    regulatoryGrounding: {
+      basis: regulatoryGrounding.regulatoryBasisLabel,
+      webEvidence: regulatoryGrounding.webEvidenceLabel,
+      promptSource: regulatoryGrounding.promptSource,
+      hasUsableLocalGrounding: regulatoryGrounding.hasUsableLocalGrounding,
+      missingRegulatoryContext: regulatoryGrounding.missingRegulatoryContext,
+      distinction:
+        "Local ruleLibrary context counts as regulatory grounding for predefined checks even when no external web evidence was fetched.",
+    },
     primaryClaimsToAudit: {
-      verdict: trace.finalVerdict,
-      confidence: trace.finalConfidence,
-      rationale: truncateText(trace.finalRationale),
+      verdict: latestDecision?.verdict ?? trace.finalVerdict,
+      confidence: latestDecision?.confidence ?? trace.finalConfidence,
+      rationale: truncateText(latestDecision?.rationale ?? trace.finalRationale),
+      citedSnapshotIds: latestDecision?.evidence?.snapshotIds ?? [],
+      missingEvidence: latestMissingEvidence.slice(0, 5),
+      evidenceRequirementsStatus: latestDecision?.evidenceRequirementsStatus ?? {},
     },
     decisionClaims: trace.responses.slice(-6).map((response) => {
       const prompt = promptByStep.get(response.step);
@@ -167,7 +332,13 @@ function compactTraceForJudge(trace: ConversationTrace) {
         activeStorey: parseChecklistValue(prompt?.promptText ?? "", "activeStorey"),
         primaryClaim: `${decision.verdict} (${Math.round((decision.confidence ?? 0) * 100)}%)`,
         primaryRationale: truncateText(decision.rationale, 350),
-        missingEvidence: decision.visibility?.missingEvidence?.map((item) => truncateText(item, 220)).slice(0, 3),
+        missingEvidence: Array.from(
+          new Set([...(decision.missingEvidence ?? []), ...(decision.visibility?.missingEvidence ?? [])])
+        )
+          .map((item) => truncateText(item, 220))
+          .slice(0, 4),
+        evidenceRequirementsStatus: decision.evidenceRequirementsStatus ?? {},
+        webSourcesUsed: (prompt?.webSourcesUsed ?? []).slice(0, 3),
         evidence: {
           snapshotIds: decision.evidence?.snapshotIds ?? [],
           note: truncateText(decision.evidence?.note, 320),
@@ -187,6 +358,11 @@ function compactTraceForJudge(trace: ConversationTrace) {
         url: entry.url,
         excerpt: truncateText(entry.reducedText ?? entry.text, MAX_WEB_EVIDENCE_CHARS),
       })),
+    regulatoryEvidenceSummary: {
+      requiredByPrimary: latestDecision?.evidenceRequirementsStatus?.regulatoryClauseNeeded === true,
+      availableCount: (trace.webEvidence ?? []).filter((entry) => entry.ok).length,
+      pendingEvidenceRequirements: listPendingEvidenceRequirements(trace),
+    },
   };
 }
 
@@ -212,16 +388,33 @@ function buildCompactJudgePrompt(trace: ConversationTrace): string {
       capabilityNotes: [],
       improvementSuggestions: [],
     },
+    evidenceSupport: "PARTIALLY_SUPPORTED",
+    confidenceAssessment: "JUSTIFIED",
+    contradictionFlags: ["Short evidence contradiction or unresolved requirement."],
+    recommendedCorrection: "KEEP",
   };
 
   return [
     "You are the secondary JUDGE agent for a BIM compliance inspection.",
     "Source of truth: attached snapshots, rule/regulatory excerpt, snapshot notes, and concrete evidence notes.",
     "Primary VLM verdicts are CLAIMS TO AUDIT, not facts. Re-evaluate them from evidence and disagree when needed.",
+    "CRITIC-inspired verification logic: explicitly verify whether the primary claim is actually supported by the trace bundle before accepting it.",
     "You may estimate measurements from visible references: each primary viewer grid cell is 1 m x 1 m, and visible HUD/object dimensions are explicit measurement evidence. Use pixel proportions against those references when helpful, and state uncertainty if the view is too distorted.",
     "Ignore missing low-level viewer data: camera coordinates, target positions, navigation metrics, scene states, and raw prompts were intentionally removed as noise.",
+    "Distinguish three regulatory states: local ruleLibrary context, fetched external web evidence, and genuinely missing regulatory context.",
+    "For SOURCE: RULE_LIBRARY checks, absence of web evidence does not mean absence of regulatory grounding if local ruleLibrary context was already provided.",
     "Return ONLY one valid minified JSON object. No markdown, no code fences, no prose outside JSON.",
     "Keep it concise: rationale <= 90 words; max 4 taskVerdicts; each reasoning <= 35 words; max 3 suggestions; max 3 possibleMistakes.",
+    "EVIDENCE_CRITIQUE:",
+    "1) Check whether the primary verdict is supported by the cited snapshot IDs and attached images.",
+    "2) Check whether missingEvidence or evidenceRequirementsStatus contradict the primary verdict.",
+    "3) Check whether regulatory grounding was genuinely missing, or whether local ruleLibrary context already covered the requirement without fetched web evidence.",
+    "4) Check whether the primary confidence is justified by the actual evidence strength.",
+    "5) Set evidenceSupport to SUPPORTED, PARTIALLY_SUPPORTED, or UNSUPPORTED.",
+    "6) Set confidenceAssessment to JUSTIFIED, OVERCONFIDENT, or UNDERCONFIDENT.",
+    "7) Fill contradictionFlags with short concrete contradictions or unresolved evidence gaps.",
+    "8) Set recommendedCorrection to KEEP, DOWNGRADE_TO_UNCERTAIN, or REVIEW_REQUIRED.",
+    "9) If evidence is weak or contradictory, prefer UNCERTAIN over preserving a confident PASS or FAIL.",
     "JSON_SHAPE:",
     JSON.stringify(outputShape),
     "EVIDENCE_PACKET_JSON:",
@@ -417,6 +610,7 @@ function synthesizeJudgeReportFromText(args: {
   const text = coerceAssistantText(args.content).trim();
   const primaryLast = args.trace.responses[args.trace.responses.length - 1]?.decision;
   const rationale = summarizeFallbackRationale(text, args.trace);
+  const critique = buildFallbackEvidenceCritique(args.trace);
 
   return {
     createdAtIso: new Date().toISOString(),
@@ -454,6 +648,10 @@ function synthesizeJudgeReportFromText(args: {
         "Use a model with stronger JSON-mode compliance for the judge pass or reduce the evidence bundle size if responses are being truncated.",
       ],
     },
+    evidenceSupport: critique.evidenceSupport,
+    confidenceAssessment: critique.confidenceAssessment,
+    contradictionFlags: critique.contradictionFlags,
+    recommendedCorrection: critique.recommendedCorrection,
   };
 }
 
@@ -522,7 +720,7 @@ async function repairJudgeJsonWithOpenRouter(args: {
         content:
           "The previous judge response was not parseable as JSON. Convert it into the required judge JSON structure. If a field is missing, infer it only from the provided response and evidence prompt; otherwise use an empty array/string or UNCERTAIN.\n\n" +
           "REQUIRED STRUCTURE:\n" +
-          '{"verdict":"UNCERTAIN","confidence":0.5,"rationale":"","taskVerdicts":[],"suggestionsForUser":[],"debuggingAndSuggestions":{"primaryDecisionAssessment":"","possibleMistakes":[],"capabilityNotes":[],"improvementSuggestions":[]}}\n\n' +
+          '{"verdict":"UNCERTAIN","confidence":0.5,"rationale":"","taskVerdicts":[],"suggestionsForUser":[],"debuggingAndSuggestions":{"primaryDecisionAssessment":"","possibleMistakes":[],"capabilityNotes":[],"improvementSuggestions":[]},"evidenceSupport":"PARTIALLY_SUPPORTED","confidenceAssessment":"JUSTIFIED","contradictionFlags":[],"recommendedCorrection":"KEEP"}\n\n' +
           "ORIGINAL JUDGE PROMPT:\n" +
           args.prompt.slice(0, 40_000) +
           "\n\nINVALID RESPONSE:\n" +
@@ -612,7 +810,7 @@ async function judgeWithOpenRouter(config: JudgeProviderConfig & { provider: "op
       });
     }
   }
-  return normalizeJudgeReport(parsed, { provider: "openrouter", modelId: cfg.model });
+  return normalizeJudgeReport(parsed, trace, { provider: "openrouter", modelId: cfg.model });
 }
 
 async function judgeWithOpenAi(config: JudgeProviderConfig & { provider: "openai" }, trace: ConversationTrace) {
@@ -675,10 +873,11 @@ async function judgeWithOpenAi(config: JudgeProviderConfig & { provider: "openai
       content,
     });
   }
-  return normalizeJudgeReport(parsed, { provider: "openai", modelId: cfg.model });
+  return normalizeJudgeReport(parsed, trace, { provider: "openai", modelId: cfg.model });
 }
 
 function judgeWithMock(trace: ConversationTrace): JudgeReport {
+  const critique = buildFallbackEvidenceCritique(trace);
   return {
     createdAtIso: new Date().toISOString(),
     provider: "mock",
@@ -694,6 +893,10 @@ function judgeWithMock(trace: ConversationTrace): JudgeReport {
       capabilityNotes: ["Mock mode does not perform a real secondary model call."],
       improvementSuggestions: ["Use OpenRouter or OpenAI mode to enable an independent judge pass."],
     },
+    evidenceSupport: critique.evidenceSupport,
+    confidenceAssessment: critique.confidenceAssessment,
+    contradictionFlags: critique.contradictionFlags,
+    recommendedCorrection: critique.recommendedCorrection,
   };
 }
 
@@ -812,6 +1015,25 @@ function combineEntityJudgeReports(args: {
       ),
     };
   });
+  const evidenceSupport: JudgeEvidenceSupport = args.reports.some((report) => report.evidenceSupport === "UNSUPPORTED")
+    ? "UNSUPPORTED"
+    : args.reports.some((report) => report.evidenceSupport === "PARTIALLY_SUPPORTED")
+      ? "PARTIALLY_SUPPORTED"
+      : "SUPPORTED";
+  const confidenceAssessment: JudgeConfidenceAssessment = args.reports.some(
+    (report) => report.confidenceAssessment === "OVERCONFIDENT"
+  )
+    ? "OVERCONFIDENT"
+    : args.reports.some((report) => report.confidenceAssessment === "UNDERCONFIDENT")
+      ? "UNDERCONFIDENT"
+      : "JUSTIFIED";
+  const contradictionFlags = Array.from(new Set(args.reports.flatMap((report) => report.contradictionFlags))).slice(0, 8);
+  const recommendedCorrection: JudgeRecommendedCorrection =
+    args.reports.some((report) => report.recommendedCorrection === "DOWNGRADE_TO_UNCERTAIN")
+      ? "DOWNGRADE_TO_UNCERTAIN"
+      : args.reports.some((report) => report.recommendedCorrection === "REVIEW_REQUIRED")
+        ? "REVIEW_REQUIRED"
+        : "KEEP";
 
   return {
     createdAtIso: new Date().toISOString(),
@@ -835,6 +1057,10 @@ function combineEntityJudgeReports(args: {
         new Set(args.reports.flatMap((report) => report.debuggingAndSuggestions.improvementSuggestions))
       ).slice(0, 6),
     },
+    evidenceSupport,
+    confidenceAssessment,
+    contradictionFlags,
+    recommendedCorrection,
   };
 }
 

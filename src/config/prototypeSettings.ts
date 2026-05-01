@@ -56,6 +56,7 @@ export type PrototypeRuntimeSettings = {
   reducedTavilyMaxChars: number;
   orbitMaxHighlightOcclusionRatio: number;
   snapshotNoveltyRedundancyThreshold: number;
+  useCompactVlmContext: boolean;
 };
 
 export const DEFAULT_PROTOTYPE_RUNTIME_SETTINGS: PrototypeRuntimeSettings = {
@@ -66,6 +67,7 @@ export const DEFAULT_PROTOTYPE_RUNTIME_SETTINGS: PrototypeRuntimeSettings = {
   reducedTavilyMaxChars: DEFAULT_REDUCED_TAVILY_MAX_CHARS,
   orbitMaxHighlightOcclusionRatio: 0.2,
   snapshotNoveltyRedundancyThreshold: 0.2,
+  useCompactVlmContext: true,
 };
 
 const PROTOTYPE_RUNTIME_SETTING_RANGES = {
@@ -79,13 +81,24 @@ const PROTOTYPE_RUNTIME_SETTING_RANGES = {
 } as const;
 
 let runtimeSettings: PrototypeRuntimeSettings = { ...DEFAULT_PROTOTYPE_RUNTIME_SETTINGS };
+type NumericPrototypeRuntimeSettingKey = Exclude<keyof PrototypeRuntimeSettings, "useCompactVlmContext">;
+
+export const MAX_SNAPSHOTS_PER_REQUEST_RANGE =
+  PROTOTYPE_RUNTIME_SETTING_RANGES.maxSnapshotsPerRequest;
 
 function clampSetting<K extends keyof PrototypeRuntimeSettings>(
   key: K,
   value: PrototypeRuntimeSettings[K]
 ): PrototypeRuntimeSettings[K] {
-  const range = PROTOTYPE_RUNTIME_SETTING_RANGES[key];
-  const numericValue = typeof value === "number" && Number.isFinite(value) ? value : DEFAULT_PROTOTYPE_RUNTIME_SETTINGS[key];
+  if (key === "useCompactVlmContext") {
+    return Boolean(value) as PrototypeRuntimeSettings[K];
+  }
+
+  const numericKey = key as NumericPrototypeRuntimeSettingKey;
+  const range = PROTOTYPE_RUNTIME_SETTING_RANGES[numericKey];
+  const fallbackValue = DEFAULT_PROTOTYPE_RUNTIME_SETTINGS[numericKey];
+  const numericValue =
+    typeof value === "number" && Number.isFinite(value) ? value : fallbackValue;
   const clamped = Math.max(range.min, Math.min(range.max, numericValue));
   return (
     key === "entityUncertainTerminationConfidence" ||
@@ -106,7 +119,12 @@ export function updatePrototypeRuntimeSettings(
   const next = { ...runtimeSettings };
   for (const [key, value] of Object.entries(updates)) {
     const typedKey = key as keyof PrototypeRuntimeSettings;
-    next[typedKey] = clampSetting(typedKey, value as number);
+    if (typedKey === "useCompactVlmContext") {
+      next.useCompactVlmContext = clampSetting("useCompactVlmContext", value as boolean);
+      continue;
+    }
+    const numericKey = typedKey as NumericPrototypeRuntimeSettingKey;
+    next[numericKey] = clampSetting(numericKey, value as PrototypeRuntimeSettings[typeof numericKey]);
   }
   runtimeSettings = next;
   return getPrototypeRuntimeSettings();
@@ -115,6 +133,13 @@ export function updatePrototypeRuntimeSettings(
 export function resetPrototypeRuntimeSettings(): PrototypeRuntimeSettings {
   runtimeSettings = { ...DEFAULT_PROTOTYPE_RUNTIME_SETTINGS };
   return getPrototypeRuntimeSettings();
+}
+
+export function clampMaxSnapshotsPerRequest(value?: number): number {
+  return clampSetting(
+    "maxSnapshotsPerRequest",
+    value ?? DEFAULT_MAX_SNAPSHOTS_PER_REQUEST
+  );
 }
 
 export type HighlightAnnotationMode = "worded" | "color_legend";
